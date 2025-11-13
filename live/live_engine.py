@@ -37,6 +37,9 @@ class LiveStrategyContext:
         self.logger = logger or (lambda msg: print(f"[LiveContext] {msg}"))
         self._vars: Dict[str, Any] = {}
         self._orders: List[LiveOrderLog] = []
+        info = self.broker.get_account_info()
+        self.cash: float = float(info.get("cash", 0.0))
+        self.equity: float = float(info.get("equity", self.cash))
 
     def get_position(self, ts_code: str) -> float:
         pos_list = self.broker.get_positions()
@@ -47,8 +50,7 @@ class LiveStrategyContext:
         return qty
 
     def get_cash(self) -> float:
-        info = self.broker.get_account_info()
-        return float(info.get("cash", 0.0))
+        return float(self.cash)
 
     def log(self, msg: str) -> None:
         self.logger(msg)
@@ -70,6 +72,9 @@ class LiveStrategyContext:
             self.log(f"[Risk] reject order: {decision.reason}")
             return
         order_id = self.broker.place_order(ts_code=ts_code, side=side, price=float(price), qty=int(qty), order_type="limit", remark=reason)
+        info = self.broker.get_account_info()
+        self.cash = float(info.get("cash", 0.0))
+        self.equity = float(info.get("equity", self.cash))
         self._orders.append(LiveOrderLog(ts_code=ts_code, dt=dt, side=side, price=float(price), qty=int(qty), reason=reason, meta=meta, broker_order_id=order_id))
         self.log(f"[Order] ts={ts_code} side={side} price={price} qty={qty} reason={reason} broker_order_id={order_id}")
 
@@ -132,4 +137,3 @@ if __name__ == "__main__":
     df_orders = engine.run_replay(ts_code, trade_dates)
     print("[selftest] orders from replay:")
     print(df_orders)
-

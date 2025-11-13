@@ -161,7 +161,13 @@ class AbuKeyLevelStrategy:
             risk_per_share = stop_price - price
         if risk_per_share <= 1e-6:
             return
-        equity = float(getattr(ctx, "equity", getattr(ctx, "cash", 0.0)))
+        equity = 0.0
+        if hasattr(ctx, "get_cash"):
+            equity = float(ctx.get_cash())
+        if hasattr(ctx, "equity"):
+            equity = float(getattr(ctx, "equity"))
+        elif hasattr(ctx, "cash"):
+            equity = float(getattr(ctx, "cash"))
         max_risk_amount = equity * risk_pct
         raw_qty = max_risk_amount / risk_per_share
         lots = int(raw_qty // lot_size)

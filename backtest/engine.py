@@ -44,7 +44,7 @@ class BacktestResult:
 
 
 class BacktestContext:
-    def __init__(self, initial_cash: float = 100_000.0) -> None:
+    def __init__(self, initial_cash: float = 100_000.0, risk_config: Optional[Dict[str, Any]] = None) -> None:
         self.initial_cash = float(initial_cash)
         self.cash = float(initial_cash)
         self.equity = float(initial_cash)
@@ -53,11 +53,31 @@ class BacktestContext:
         self.position_price: float = 0.0
         self.position_open_dt: Optional[pd.Timestamp] = None
         self.trades: List[TradeRecord] = []
+        self._logs: List[str] = []
+        from strategy.risk_manager import RiskManager
+        self.risk_manager = RiskManager(risk_config)
+
+    def get_cash(self) -> float:
+        return float(self.cash)
+
+    def get_position(self, ts_code: str) -> float:
+        return float(self.position_qty if self.position_side is not None else 0.0)
+
+    def log(self, msg: str) -> None:
+        print(f"[BacktestContext] {msg}")
+        self._logs.append(msg)
+
+    def get_config(self) -> Dict[str, Any]:
+        return {}
 
     def send_order(self, ts_code: str, side: str, price: float, qty: int, reason: str, meta: Dict[str, Any]) -> None:
         price = float(price)
         qty = int(qty)
         dt = meta.get("dt", pd.Timestamp.now())
+        decision = self.risk_manager.check_order(ts_code=ts_code, side=side, price=price, qty=qty, trade_dt=dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt, ctx=self)
+        if not decision.allowed:
+            self.log(f"[Risk] reject order: {decision.reason}")
+            return
         if side == "buy":
             if self.position_side is None:
                 cost = price * qty
@@ -109,14 +129,15 @@ class BacktestContext:
 
 
 class TickBacktester:
-    def __init__(self, ts_code: str, price_level_provider: Optional[PriceLevelProvider] = None, initial_cash: float = 100_000.0) -> None:
+    def __init__(self, ts_code: str, price_level_provider: Optional[PriceLevelProvider] = None, initial_cash: float = 100_000.0, risk_config: Optional[Dict[str, Any]] = None) -> None:
         self.ts_code = ts_code
         self.price_level_provider = price_level_provider or AbuPriceLevelProvider()
         self.initial_cash = float(initial_cash)
         self.tick_store = TickStore()
+        self.risk_config = risk_config
 
     def run(self, trade_dates: List[date], strategy_config: Optional[Dict[str, Any]] = None) -> BacktestResult:
-        ctx = BacktestContext(initial_cash=self.initial_cash)
+        ctx = BacktestContext(initial_cash=self.initial_cash, risk_config=self.risk_config)
         strat = AbuKeyLevelStrategy(ts_code=self.ts_code, price_level_provider=self.price_level_provider, config=strategy_config)
         first_date = trade_dates[0]
         last_date = trade_dates[-1]
