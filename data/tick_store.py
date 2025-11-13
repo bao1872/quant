@@ -11,19 +11,20 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 
-from config import TICK_BASE_DIR
+from config import TICK_BASE_DIR, Settings
 from sqlalchemy import text
 from db.connection import get_session, get_engine, DummySession
 from db.models import TickFileIndex
 
 
 class TickStore:
-    def __init__(self, base_dir: Optional[str] = None):
-        self.base_dir = Path(base_dir or TICK_BASE_DIR)
+    def __init__(self, base_dir: Optional[str] = None, settings: Optional[Settings] = None):
+        base = base_dir or (settings.tick_base_dir if settings is not None else TICK_BASE_DIR)
+        self.base_dir = Path(base)
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _file_path(self, ts_code: str, trade_date: date) -> Path:
@@ -38,6 +39,7 @@ class TickStore:
         ts_code: str,
         trade_date: date,
         df: pd.DataFrame,
+        already_sorted: bool = False,
     ) -> None:
         """
         将指定日期的 tick DataFrame 写入 parquet 文件，并更新 TickFileIndex。
@@ -45,15 +47,14 @@ class TickStore:
         file_path = self._file_path(ts_code, trade_date)
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        df.to_parquet(file_path)
+        df.to_parquet(file_path, engine="pyarrow", compression="snappy")
 
         if df.empty:
             record_cnt = 0
             time_start = ""
             time_end = ""
         else:
-            # 假设 df 有 datetime 字段
-            dt_sorted = df.sort_values("datetime")
+            dt_sorted = df if already_sorted else df.sort_values("datetime")
             record_cnt = len(dt_sorted)
             time_start = dt_sorted["datetime"].iloc[0].strftime("%H:%M:%S")
             time_end = dt_sorted["datetime"].iloc[-1].strftime("%H:%M:%S")
@@ -108,6 +109,41 @@ class TickStore:
         if not file_path.exists():
             return pd.DataFrame()
         return pd.read_parquet(file_path)
+
+    def list_tick_files(self, ts_code: str, start_date: date, end_date: date) -> List[TickFileIndex]:
+        eng = get_engine()
+        if eng is None:
+            return []
+        def _table_exists(table_name: str) -> bool:
+            q = (
+                "select 1 from information_schema.tables where table_schema='public' and table_name='"
+                + table_name
+                + "'"
+            )
+            df_chk = pd.read_sql(q, eng)
+            return len(df_chk) > 0
+        if not _table_exists("tick_file_index"):
+            return []
+        q = text(
+            "select ts_code, trade_date, market, file_path, record_cnt, time_start, time_end, checksum "
+            "from tick_file_index where ts_code=:ts and trade_date>=:d1 and trade_date<=:d2 order by trade_date"
+        )
+        df = pd.read_sql(q, eng, params={"ts": ts_code, "d1": start_date, "d2": end_date})
+        rows: List[TickFileIndex] = []
+        for _, r in df.iterrows():
+            rows.append(
+                TickFileIndex(
+                    ts_code=str(r["ts_code"]),
+                    trade_date=r["trade_date"],
+                    market=str(r["market"]),
+                    file_path=str(r["file_path"]),
+                    record_cnt=int(r["record_cnt"] or 0),
+                    time_start=str(r.get("time_start", "")),
+                    time_end=str(r.get("time_end", "")),
+                    checksum=None,
+                )
+            )
+        return rows
 
 
 if __name__ == "__main__":

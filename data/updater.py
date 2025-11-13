@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import pandas as pd
 from tqdm import tqdm
@@ -26,20 +26,22 @@ from db.models import StockBasic
 from db.connection import get_session
 from .pytdx_source import PytdxDataSource
 from . import repository
-from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT
+from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT, Settings
 
 
-def _get_all_stock_codes() -> List[str]:
+def _get_all_stock_codes(settings: Optional[Settings] = None) -> List[str]:
     basics = repository.get_all_stock_basics()
     codes = [s.ts_code for s in basics]
-    if STOCK_POOL_LIMIT is not None:
-        return codes[:STOCK_POOL_LIMIT]
+    limit = settings.stock_pool_limit if settings is not None else STOCK_POOL_LIMIT
+    if limit is not None:
+        return codes[:limit]
     return codes
 
 
 def update_daily_bars(
     trade_date: date,
     count: int = 240,
+    settings: Optional[Settings] = None,
 ) -> None:
     """
     更新所有股票的日线数据。
@@ -50,7 +52,7 @@ def update_daily_bars(
       - 判断其中哪些日期晚于 DB 中已有的最后日期；
       - 将这部分数据 upsert 到 StockDaily。
     """
-    ts_codes = _get_all_stock_codes()
+    ts_codes = _get_all_stock_codes(settings)
     if not ts_codes:
         print("[update_daily_bars] No stock_basic records found.")
         return
@@ -76,13 +78,14 @@ def update_minute_bars(
     trade_date: date,
     freq: str = "1m",
     count: int = 240,
+    settings: Optional[Settings] = None,
 ) -> None:
     """
     更新所有股票的分钟线（如 1 分钟）。
 
     简化逻辑与日线类似，注意分钟线量大，可按需限制股票池。
     """
-    ts_codes = _get_all_stock_codes()
+    ts_codes = _get_all_stock_codes(settings)
     if not ts_codes:
         print("[update_minute_bars] No stock_basic records found.")
         return
@@ -106,6 +109,7 @@ def collect_intraday_ticks(
     trade_date: date,
     ts_codes: List[str],
     count: int = 2000,
+    settings: Optional[Settings] = None,
 ) -> None:
     """
     盘中 tick 收集框架（当前只是简化版一次拉取）：
@@ -122,7 +126,8 @@ def collect_intraday_ticks(
 
     with PytdxDataSource() as ds:
         for ts_code in tqdm(ts_codes, desc="ticks"):
-            df_tick = ds.get_ticks(ts_code, trade_date=trade_date, count=TICK_COUNT_LIMIT or count)
+            tick_limit = (settings.tick_count_limit if settings is not None else TICK_COUNT_LIMIT) or count
+            df_tick = ds.get_ticks(ts_code, trade_date=trade_date, count=tick_limit)
             if df_tick.empty:
                 continue
             store.save_ticks(ts_code, trade_date, df_tick)
