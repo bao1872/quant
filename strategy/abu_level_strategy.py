@@ -70,7 +70,6 @@ class AbuKeyLevelStrategy:
     def _on_new_day(self, trade_date: date) -> None:
         self._current_trade_date = trade_date
         self._tick_buffer = []
-        self._position = None
         self._daily_levels = self.price_level_provider.get_levels(self.ts_code, trade_date)
 
     def _append_tick(self, dt: datetime, price: float, volume: int, side: str) -> None:
@@ -203,4 +202,3 @@ if __name__ == "__main__":
         tick = {"ts_code": "000001.SZ", "datetime": dt, "price": 10.0 + (i - 50) * 0.001, "volume": 200, "side": "B" if i > 30 else "S"}
         strat.on_tick(tick, ctx)
     print("Total orders:", len(ctx.orders))
-

@@ -69,8 +69,10 @@ class BacktestContext:
                 self.position_price = price
                 self.position_open_dt = pd.Timestamp(dt)
             elif self.position_side == "short":
+                if qty != self.position_qty:
+                    return
                 pnl = (self.position_price - price) * self.position_qty
-                self.cash += self.position_qty * self.position_price + pnl
+                self.cash -= price * self.position_qty
                 self.trades.append(TradeRecord(ts_code=ts_code, open_dt=self.position_open_dt or pd.Timestamp(dt), close_dt=pd.Timestamp(dt), side="short", qty=self.position_qty, entry_price=self.position_price, exit_price=price, pnl=pnl, reason=reason))
                 self.position_side = None
                 self.position_qty = 0
@@ -85,8 +87,10 @@ class BacktestContext:
                 self.position_price = price
                 self.position_open_dt = pd.Timestamp(dt)
             elif self.position_side == "long":
+                if qty != self.position_qty:
+                    return
                 pnl = (price - self.position_price) * self.position_qty
-                self.cash += self.position_qty * self.position_price + pnl
+                self.cash += price * self.position_qty
                 self.trades.append(TradeRecord(ts_code=ts_code, open_dt=self.position_open_dt or pd.Timestamp(dt), close_dt=pd.Timestamp(dt), side="long", qty=self.position_qty, entry_price=self.position_price, exit_price=price, pnl=pnl, reason=reason))
                 self.position_side = None
                 self.position_qty = 0
@@ -99,8 +103,8 @@ class BacktestContext:
         if self.position_side is not None and self.position_qty > 0:
             if self.position_side == "long":
                 pos_value = current_price * self.position_qty
-            else:
-                pos_value = self.position_price * self.position_qty
+            elif self.position_side == "short":
+                pos_value = -current_price * self.position_qty
         self.equity = self.cash + pos_value
 
 
@@ -143,4 +147,3 @@ if __name__ == "__main__":
     print("Final equity:", result.final_equity)
     for tr in result.trades:
         print(tr)
-
