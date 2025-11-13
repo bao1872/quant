@@ -1,0 +1,453 @@
+一、开发任务清单（新版）
+阶段 0：总体架构 & 抽象设计
+
+定义“策略层”的抽象接口（确保可复用）
+
+ 在 strategy/base.py 里定义几个关键抽象：
+
+BaseStrategy：统一约定：
+
+on_bar(bar, context) 日/分钟 bar 回调（给 Backtrader 用）
+
+on_tick(tick, context) tick 回调（给 tick 回测/实盘用）
+
+on_signal(...) 或统一的信号对象结构
+
+PriceLevelProvider 抽象：
+
+get_levels(ts_code, trade_date) 返回关键位列表
+
+任何价格理论/缠论/别的玩法，都实现这个接口即可换策略
+
+MicrostructureProvider 抽象：
+
+analyze_window(ts_code, trade_date, start_time, end_time) → 微观结构特征
+
+ 约束：
+
+Backtest、Live、Streamlit 等上层模块，只依赖这些抽象，不依赖“阿布”具体实现。
+
+定义策略配置与“选择器”
+
+ 建立 strategy/registry.py：
+
+根据配置（比如 STRATEGY_NAME = "abu_price"）返回对应：
+
+strategy_impl（BaseStrategy 实现）
+
+price_level_provider_impl
+
+microstructure_impl
+
+ 确保未来新增其他策略，只要在 registry 注册即可复用整条流水线。
+
+每个模块文件增加 main 自测规范
+
+ 约定：
+
+除纯配置文件（如 config.py）外，每个模块文件底部必须有：
+
+if __name__ == "__main__":
+    # 调用本文件的关键函数，跑一个最小测试
+    ...
+
+
+ 后面各阶段任务都要在对应文件中补上这个自测块。
+
+阶段 1：数据层（pytdx + Postgres + tick 文件）——带 main 自测
+
+思路仍是“借鉴 chanlun-pro 的数据抽象与增量模式”，但要加上可自测 main。
+
+DataSource 抽象 + pytdx 实现
+
+ 在 data/base_source.py：
+
+定义 class DataSource 抽象：
+
+get_daily_bars(ts_code, start_date, end_date)
+
+get_minute_bars(ts_code, start_date, end_date, freq)
+
+get_ticks(ts_code, trade_date, start_seq, end_seq or count)
+
+加 if __name__ == "__main__":，用一个 dummy 实现或简单 print 验证接口。
+
+ 在 data/pytdx_source.py：
+
+实现 PytdxDataSource(DataSource)，封装：
+
+pytdx 连接/重连
+
+A 股 ts_code <-> (market, code)
+
+数据转换为标准 DataFrame（统一字段名）
+
+main 自测：
+
+连一台 pytdx 服务器，拉一只股票最近 10 日 K 线，打印前几行。
+
+数据库写入与增量更新
+
+ 在 data/repository.py：
+
+封装对 Postgres 的读写操作（DAO 层），比如：
+
+save_daily_bars(df)、get_last_trade_date(ts_code) 等
+
+main 自测：
+
+构造一段虚拟 df，调用 save，再查回一条验证。
+
+ 在 data/updater.py：
+
+实现：
+
+update_daily_bars(trade_date)
+
+update_minute_bars(trade_date)
+
+增量逻辑：取 DB 中最新日期 → 用 pytdx 拉最近 N 日 → 覆盖/插入
+
+main 自测：
+
+读出某只股票最后日期，执行一次更新，看日志 & DB 数据是否增加/覆盖正确。
+
+tick 文件管理
+
+ 在 data/tick_store.py：
+
+定义 TickStore：
+
+save_ticks(ts_code, trade_date, df) → parquet + 更新 TickFileIndex
+
+append_ticks(...)（盘中追加写临时文件，可选）
+
+load_ticks(ts_code, trade_date) → DF
+
+main 自测：
+
+构造一小段虚拟 tick df → 保存再读出，比较 row 数和字段。
+
+定时任务入口
+
+ 在 data/jobs.py：
+
+封装：
+
+job_update_ohlc(trade_date)
+
+job_collect_intraday_ticks(trade_date)（暂留框架）
+
+job_finalize_ticks(trade_date)（临时文件合并为正式文件）
+
+main 自测：
+
+用今天/昨天日期跑一次 job_update_ohlc 并打印日志。
+
+阶段 2：阿布价格理论关键位模块（完整版 & 可替换）
+
+这块 不能是简化版，要按“实盘级”思路设计，并保证以后可替换为“别的价格理论/缠论”。
+
+阿布价格理论设计文档（先写清规则，再写代码）
+
+ 在 docs/abu_price_levels.md（或同类文档）中描述：
+
+使用哪些价位构造关键位：
+
+摆动高低（多周期：日/周，支持不同 swing 阈值）
+
+趋势线/通道线（自动拟合 & 外推）
+
+缺口（大小、多次测试情况）
+
+黄金分割回撤/扩展位
+
+明显形态（头肩顶/底、三角形、楔形等）的目标价
+
+重要均线价、昨日高低等“公共价位”
+
+强度评分体系：
+
+触碰次数、反转幅度、持续时间
+
+多重共振（某价位同时满足多个来源）
+
+最近性权重
+
+历史在该价位附近交易信号胜率（以后可加入）
+
+ 确保 Abu 模块按这个文档实现，不得随意简化。
+
+PriceLevelProvider 抽象实现
+
+ 在 factors/price_levels_base.py：
+
+定义 class BasePriceLevelProvider(PriceLevelProvider) 抽象：
+
+get_levels(ts_code, trade_date)
+
+precompute(trade_date)（盘后批量计算接口）
+
+main 自测：
+
+写一个 dummy Provider 返回两条假关键位，打印输出结构。
+
+阿布实现：AubPriceLevelProvider
+
+ 在 factors/abu_price_levels.py：
+
+实现 AbuPriceLevelProvider(BasePriceLevelProvider)，内部结构分层：
+
+extract_swings(df)：多周期摆动高低检测
+
+build_trend_channels(swings)：拟合趋势线/通道线
+
+detect_gaps(df)：识别跳空缺口 +作用强度
+
+calc_fibo_levels(trend_segment)：关键趋势段的黄金分割位
+
+detect_patterns(df)：头肩顶/底、三角形等形态目标价
+
+merge_levels(...)：合并不同来源价位
+
+score_level(...)：按文档打分生成 strength + direction + source_flags
+
+提供：
+
+precompute(trade_date)：
+
+从 DB 拉所有股票 T 日前 N 日 K 线 → 计算关键位 → 写入 price_levels_daily
+
+get_levels(ts_code, trade_date)：
+
+从 price_levels_daily 读取记录返回标准结构
+
+main 自测：
+
+对 1–2 只股票、某日期：
+
+读取历史 K
+
+运行 precompute(trade_date) 或 compute_for_single(ts_code, trade_date)
+
+打印全部关键位（价位、type、strength）
+
+关键位模块可替换性
+
+ 在 strategy/registry.py 中：
+
+注册 'abu_price_levels' 对应 AbuPriceLevelProvider。
+
+未来可以注册 'chan_price_levels' 等其他 Provider。
+
+ 确保 backtest、live 只拿 PriceLevelProvider 抽象，不关心是不是 Abu。
+
+阶段 3：策略层 & 微观结构（可插拔）
+
+MicrostructureProvider 抽象
+
+ 在 strategy/microstructure_base.py：
+
+抽象类：
+
+analyze_window(ts_code, trade_date, start_time, end_time) -> Features
+
+main 自测：
+
+返回一个固定的 dummy Features，打印出来。
+
+阿布策略用的微观结构实现
+
+ 在 strategy/microstructure_abu.py：
+
+实现基于 tick 数据的特征计算：
+
+主动买卖量、Imbalance、大单金额、价格冲击等
+
+main 自测：
+
+用某日某股的 tick 文件跑一个窗口，打印 Features。
+
+BaseStrategy & AbuStrategy
+
+ 在 strategy/base.py（延续阶段 0 的抽象）：
+
+定义 on_bar / on_tick / generate_signals() 接口规范。
+
+ 在 strategy/abu_strategy.py：
+
+实现 AbuStrategy(BaseStrategy)：
+
+在 bar 级别：基于趋势/关键位判断大方向（不含微观结构）
+
+在 tick 级别：当价格打到关键位区间，调用 MicrostructureProvider 生成/过滤信号
+
+输出统一的 TradeSignal 对象（包含 ts_code、direction、price、level 信息等）
+
+main 自测：
+
+用虚拟或少量真实数据，模拟调用 on_bar/on_tick 一段序列，打印信号。
+
+策略注册 & 切换
+
+ strategy/registry.py：
+
+注册 'abu' 策略：
+
+get_strategy("abu") -> AbuStrategy
+
+get_price_level_provider("abu") -> AbuPriceLevelProvider
+
+get_microstructure_provider("abu") -> AbuMicrostructureProvider
+
+main 自测：
+
+配置 'abu'，获取对象，调用一两个简单函数，确保无循环依赖。
+
+阶段 4：回测 —— Backtrader（日线/分钟）+ Tick 引擎
+
+Backtrader 集成（策略无关）
+
+ 在 backtest/bt_engine.py：
+
+封装一个 BtEngine：
+
+负责：
+
+给定策略实现（BaseStrategy）
+
+给定 PriceLevelProvider
+
+初始化 Backtrader Cerebro
+
+装载 DataFeed（来自 Postgres）
+
+运行回测，收集结果
+
+main 自测：
+
+创建一个简单的 DummyStrategy，跑一小段历史数据，打印策略作图/简单统计。
+
+以 AbuStrategy 作为一个 Backtrader 策略实例
+
+ 在 backtest/bt_abu_adapter.py：
+
+写一个 Backtrader Strategy 子类，内部调用 AbuStrategy
+
+处理好 Backtrader 的调度（next 里转发到 AbuStrategy.on_bar）
+
+main 自测：
+
+仅对某只股票跑 1 个月的日线回测，打印交易点信息。
+
+TickBacktestEngine（策略无关）
+
+ 在 backtest/tick_engine.py：
+
+实现：
+
+TickBacktestEngine(strategy: BaseStrategy, price_levels: PriceLevelProvider, micro: MicrostructureProvider)
+
+run(ts_code, start_date, end_date)：
+
+从 TickFileIndex & 文件中按日读 tick
+
+按时间推进，触发 strategy.on_tick
+
+当天结束计算账户净值、交易统计
+
+main 自测：
+
+先用一个 DummyStrategy（比如：每次价格上涨就买，随便卖）跑一天 tick，打印交易结果。
+
+写回回测结果
+
+ 在 backtest/results.py：
+
+提供统一函数，把 Backtrader 和 TickEngine 的结果写入 DB 的 backtest_runs / backtest_trades 等表
+
+main 自测：
+
+用一个伪造回测结果对象调用写入，再查回一条验证。
+
+阶段 5：实盘引擎（可换策略）+ qmtmini
+
+Broker 抽象 & qmt 实现
+
+ 在 live/broker_base.py：
+
+定义抽象接口：place_order, cancel_order, get_positions, get_account_info
+
+main 自测：
+
+dummy 实现打印下单参数即可。
+
+ 在 live/broker_qmt.py：
+
+使用 easytrader.use('miniqmt') 或 xtquant.xttrader 实现真实 broker
+
+负责 ts_code → 券商代码映射
+
+main 自测：
+
+用 dry-run 模式登录、查询一次资金/持仓（不给真实账号的话就留 TODO）。
+
+LiveEngine（策略无关）
+
+ 在 live/live_engine.py：
+
+LiveEngine(strategy: BaseStrategy, price_levels: PriceLevelProvider, micro: MicrostructureProvider, broker: BrokerBase)
+
+盘中逻辑：
+
+读 Universe/关键位
+
+用 pytdx 获取实时价格/分钟 K
+
+当价格触碰关键位 ± 容差 → 拉近窗口 tick → strategy.on_tick → 信号
+
+调用风控模块 → 下单 broker
+
+记录信号/订单/持仓到 DB
+
+main 自测：
+
+用 DummyStrategy + DummyBroker，模拟一个小循环（用历史数据假装实时），打印下单请求。
+
+风控模块（与策略解耦）
+
+ 在 strategy/risk_manager.py：
+
+实现 RiskContext & RiskManager（之前设计的可以复用，但抽象出来）
+
+main 自测：
+
+模拟不同总资金/止损距离，打印仓位结果。
+
+阶段 6：Streamlit 前端（策略无关）
+
+抽象 API 层
+
+ 在 webapp/api.py：
+
+提供只读接口：
+
+get_positions(), get_signals(date), get_price_levels(ts_code, date)
+
+get_backtest_results(strategy_name, run_id) 等
+
+main 自测：
+
+连接 DB，随便查几条数据打印。
+
+Dashboard 页面
+
+ webapp/dashboard.py：
+
+tabs：实盘监控 / 回测结果 / 个股+关键位 / 系统状态
+
+使用 Plotly 画 K 线 + 关键位线
+
+main/if __name__ == "__main__":：
+
+streamlit run dashboard.py 入口（保留 CLI 提示）。

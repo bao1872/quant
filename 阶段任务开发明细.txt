@@ -1,0 +1,1157 @@
+整体新增 5 个文件：
+
+microstructure/abu_microstructure.py —— 微观结构分析（Tick 层）
+
+microstructure/__init__.py
+
+strategy/abu_level_strategy.py —— 阿布“关键位 + 微观结构”单标的交易策略
+
+strategy/registry.py —— 策略注册表（后面扩展别的策略用）
+
+backtest/engine.py + backtest/__init__.py —— 简单回测引擎（支持 tick 回测，保证和实盘逻辑一致）
+
+我按文件逐个给。
+
+1. microstructure/abu_microstructure.py
+
+Tick 微观结构模块：
+只用逐笔成交（price / volume / side / datetime），在关键价位附近判断：
+
+是否有主动买盘/卖盘明显占优
+
+价格有没有“假跌破/假突破”
+用一个 MicroSignal 来表达“在某个关键位附近，此时适合买/卖还是观望”。
+
+# microstructure/abu_microstructure.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, date
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from strategy.base import PriceLevel
+
+
+DEFAULT_MICRO_CONFIG: Dict[str, Any] = {
+    # 回看窗口长度（秒）
+    "window_seconds": 60,
+    # 最小总成交量要求（窗口里）
+    "min_total_volume": 1000,
+    # 主动买卖盘的最小占优倍数
+    "min_bs_ratio": 1.5,
+    # 对关键位允许的最大“刺穿幅度”（假跌破/假突破），例如 0.003 ≈ 0.3%
+    "max_penetration_pct": 0.003,
+    # 认定“触及关键位”的价格容忍度，例如 0.002 ≈ 0.2%
+    "level_tolerance_pct": 0.002,
+}
+
+
+@dataclass
+class MicroSignal:
+    """
+    微观结构给出的交易信号（不下单，只是“建议”）。
+    """
+    ts_code: str
+    trade_date: date
+    dt: datetime
+    side: str             # "long" / "short"
+    level_price: float
+    level_type: str
+    score: float          # 0 ~ 100
+    reason: str
+    meta: Dict[str, Any]
+
+
+class AbuMicrostructureAnalyzer:
+    """
+    阿布风格的微观结构分析器：
+
+    典型用法：
+        analyzer = AbuMicrostructureAnalyzer()
+        sig = analyzer.analyze_near_level(
+            ts_code, trade_date, ticks_df, level, now_dt
+        )
+        if sig is not None and sig.score >= 某个阈值:
+            # 可以考虑下单
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        self.config = DEFAULT_MICRO_CONFIG.copy()
+        if config:
+            self.config.update(config)
+
+    # ------------------- 主接口 -------------------
+
+    def analyze_near_level(
+        self,
+        ts_code: str,
+        trade_date: date,
+        ticks: pd.DataFrame,
+        level: PriceLevel,
+        now_dt: datetime,
+    ) -> Optional[MicroSignal]:
+        """
+        在给定“当前时刻 now_dt”下，查看过去一段 window_seconds 内的逐笔成交，
+        判断在某个关键位 level 附近是否存在“可交易”的微观结构。
+
+        ticks: 必须至少包含列：
+            - "datetime" (datetime64[ns])
+            - "price" (float)
+            - "volume" (int)
+            - "side" (str, 'B'/'S'/'N')
+        """
+        if ticks.empty:
+            return None
+
+        cfg = self.config
+        window_seconds = int(cfg["window_seconds"])
+        tol_pct = float(cfg["level_tolerance_pct"])
+        max_penetration = float(cfg["max_penetration_pct"])
+        min_total_vol = int(cfg["min_total_volume"])
+        min_bs_ratio = float(cfg["min_bs_ratio"])
+
+        # 1) 取时间窗口
+        start_time = now_dt - timedelta(seconds=window_seconds)
+        win = ticks[(ticks["datetime"] >= start_time) & (ticks["datetime"] <= now_dt)]
+        if win.empty:
+            return None
+
+        last_price = float(win["price"].iloc[-1])
+        level_price = float(level.level_price)
+
+        # 2) 要求当前价格足够接近关键位
+        dist_pct = abs(last_price - level_price) / max(level_price, 1e-6)
+        if dist_pct > tol_pct:
+            return None
+
+        # 3) 成交量过滤
+        total_vol = float(win["volume"].sum())
+        if total_vol < min_total_vol:
+            return None
+
+        # 4) 主动买卖盘统计
+        if "side" in win.columns:
+            buy_vol = float(win.loc[win["side"] == "B", "volume"].sum())
+            sell_vol = float(win.loc[win["side"] == "S", "volume"].sum())
+        else:
+            # 没有 side 信息，则无法做主动盘分析，直接返回 None
+            return None
+
+        # 避免除零
+        eff_buy = buy_vol if buy_vol > 0 else 1.0
+        eff_sell = sell_vol if sell_vol > 0 else 1.0
+
+        # 5) 价格在窗口内的“刺穿程度”
+        min_price = float(win["price"].min())
+        max_price = float(win["price"].max())
+
+        if level.direction == "support":
+            penetration_pct = (min_price - level_price) / max(level_price, 1e-6)
+        elif level.direction == "resistance":
+            penetration_pct = (max_price - level_price) / max(level_price, 1e-6)
+        else:
+            # 中性位暂时不做交易
+            return None
+
+        # 刺穿太多，视为跌破/突破，放弃
+        if penetration_pct < -max_penetration:
+            return None
+
+        # 6) 根据关键位方向判断多空优势
+        side: Optional[str] = None
+        score = 0.0
+        reason = ""
+
+        if level.direction == "support":
+            # 支撑附近，多头主导才考虑做多
+            bs_ratio = eff_buy / eff_sell
+            if bs_ratio < min_bs_ratio:
+                return None
+            side = "long"
+            score = self._score_support(
+                level_price=level_price,
+                last_price=last_price,
+                penetration_pct=penetration_pct,
+                bs_ratio=bs_ratio,
+                total_vol=total_vol,
+            )
+            reason = f"support_buy_dominate bs_ratio={bs_ratio:.2f}, pen={penetration_pct:.4f}"
+
+        elif level.direction == "resistance":
+            # 压力附近，空头主导才考虑做空
+            sb_ratio = eff_sell / eff_buy
+            if sb_ratio < min_bs_ratio:
+                return None
+            side = "short"
+            score = self._score_resistance(
+                level_price=level_price,
+                last_price=last_price,
+                penetration_pct=penetration_pct,
+                sb_ratio=sb_ratio,
+                total_vol=total_vol,
+            )
+            reason = f"resist_sell_dominate sb_ratio={sb_ratio:.2f}, pen={penetration_pct:.4f}"
+
+        if side is None:
+            return None
+
+        meta = {
+            "total_vol": total_vol,
+            "buy_vol": buy_vol,
+            "sell_vol": sell_vol,
+            "penetration_pct": penetration_pct,
+            "dist_pct": dist_pct,
+        }
+
+        return MicroSignal(
+            ts_code=ts_code,
+            trade_date=trade_date,
+            dt=now_dt,
+            side=side,
+            level_price=level_price,
+            level_type=level.level_type,
+            score=score,
+            reason=reason,
+            meta=meta,
+        )
+
+    # ------------------- 评分函数 -------------------
+
+    def _score_support(
+        self,
+        level_price: float,
+        last_price: float,
+        penetration_pct: float,
+        bs_ratio: float,
+        total_vol: float,
+    ) -> float:
+        """
+        支撑位：分数越高越“像”有资金在关键位吸筹。
+        """
+        score = 60.0
+
+        # 刺穿越少越好
+        score += max(0.0, 10.0 * (1.0 + penetration_pct))  # penetration 介于 [-max, 0]
+
+        # 买盘占优倍数
+        score += min(15.0, (bs_ratio - 1.0) * 5.0)
+
+        # 成交越大越好，取 log 放缩
+        score += min(15.0, math.log10(max(total_vol, 1.0) + 9.0))
+
+        return max(0.0, min(100.0, score))
+
+    def _score_resistance(
+        self,
+        level_price: float,
+        last_price: float,
+        penetration_pct: float,
+        sb_ratio: float,
+        total_vol: float,
+    ) -> float:
+        """
+        压力位：分数越高越“像”有资金在关键位派发。
+        """
+        score = 60.0
+
+        score += max(0.0, 10.0 * (1.0 + penetration_pct))
+        score += min(15.0, (sb_ratio - 1.0) * 5.0)
+        score += min(15.0, math.log10(max(total_vol, 1.0) + 9.0))
+
+        return max(0.0, min(100.0, score))
+
+
+if __name__ == "__main__":
+    # 简单自测：构造一个“支撑位附近多头放量”的窗口，看是否给出 long 信号
+    from datetime import timedelta
+    from strategy.base import PriceLevel
+
+    now = datetime.now()
+    tds = [now - timedelta(seconds=60) + timedelta(seconds=i) for i in range(60)]
+
+    prices = [10.0 - 0.02 * (59 - i) for i in range(60)]
+    volumes = [100 + i * 5 for i in range(60)]
+    sides = ["S"] * 40 + ["B"] * 20
+
+    df = pd.DataFrame(
+        {
+            "datetime": tds,
+            "price": prices,
+            "volume": volumes,
+            "side": sides,
+        }
+    )
+
+    level = PriceLevel(
+        ts_code="000001.SZ",
+        trade_date=now.date(),
+        level_price=10.0,
+        level_type="range_low",
+        direction="support",
+        strength=80,
+        source_flags=["range"],
+        meta={},
+    )
+
+    analyzer = AbuMicrostructureAnalyzer()
+    sig = analyzer.analyze_near_level(
+        ts_code="000001.SZ",
+        trade_date=now.date(),
+        ticks=df,
+        level=level,
+        now_dt=now,
+    )
+
+    print("Micro signal:", sig)
+
+2. microstructure/__init__.py
+# microstructure/__init__.py
+"""
+微观结构分析模块入口。
+"""
+
+from .abu_microstructure import AbuMicrostructureAnalyzer, MicroSignal
+
+__all__ = [
+    "AbuMicrostructureAnalyzer",
+    "MicroSignal",
+]
+
+
+if __name__ == "__main__":
+    print("microstructure package self-test:", __all__)
+
+3. strategy/abu_level_strategy.py
+
+核心策略：
+
+只做单标的（先把逻辑做对，后面扩展到多标的很容易）
+
+每天盘前/盘后：阿布关键位计算已经写入 price_levels_daily（阶段 2）
+
+盘中：
+
+从 PriceLevelProvider 一次性取出当日该票的所有关键位，缓存
+
+对每一个 tick：
+
+如果有持仓 → 检查止损/止盈
+
+没持仓 → 找离当前价最近的关键位（支撑/压力），用微观结构做一遍判断
+
+满足“关键位 + 微观结构”的条件 → 开仓
+
+仓位：按账户权益 * risk_pct 来算，止损距离决定手数，保证实盘/回测统一风控
+
+# strategy/abu_level_strategy.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import math
+import pandas as pd
+
+from strategy.base import PriceLevel, PriceLevelProvider
+from microstructure import AbuMicrostructureAnalyzer, MicroSignal
+
+
+DEFAULT_STRAT_CONFIG: Dict[str, Any] = {
+    # 每笔交易风险占总权益的比例（例如 0.01 = 1%）
+    "risk_per_trade_pct": 0.01,
+    # 单票最大持仓占总权益比例
+    "max_position_pct": 0.3,
+    # 止损（相对价格），例如 0.005 ≈ 0.5%
+    "stop_loss_pct": 0.005,
+    # 盈亏比（盈利目标 = R * 止损距离）
+    "take_profit_R": 2.0,
+    # 认定触及关键位的容忍度
+    "level_tolerance_pct": 0.002,
+    # 微观结构窗口长度（秒）
+    "micro_window_seconds": 60,
+    # 微观结构最低得分，低于此则不交易
+    "min_signal_score": 55.0,
+    # A 股一手股数
+    "lot_size": 100,
+}
+
+
+@dataclass
+class PositionState:
+    """
+    简化版持仓状态（单标的）。
+    """
+    ts_code: str
+    side: str            # "long" / "short"
+    qty: int
+    entry_price: float
+    entry_dt: datetime
+    entry_level_price: float
+    stop_loss: float
+    take_profit: float
+    meta: Dict[str, Any]
+
+
+class AbuKeyLevelStrategy:
+    """
+    阿布价格关键位 + 微观结构的交易策略（单标的版本）。
+
+    要求：
+        - 回测时由 backtest.engine.BacktestContext 提供 ctx（有 cash / equity / send_order 等）
+        - 实盘时你可以实现一个有同样接口的 context，把下单改为调用 qmtmini
+    """
+
+    def __init__(
+        self,
+        ts_code: str,
+        price_level_provider: PriceLevelProvider,
+        micro_analyzer: Optional[AbuMicrostructureAnalyzer] = None,
+        config: Optional[Dict[str, Any]] = None,
+        name: str = "abu_key_level",
+    ) -> None:
+        self.name = name
+        self.ts_code = ts_code
+        self.price_level_provider = price_level_provider
+        self.micro_analyzer = micro_analyzer or AbuMicrostructureAnalyzer()
+
+        self.config = DEFAULT_STRAT_CONFIG.copy()
+        if config:
+            self.config.update(config)
+
+        # 状态
+        self._current_trade_date: Optional[date] = None
+        self._daily_levels: List[PriceLevel] = []
+        self._position: Optional[PositionState] = None
+        # 当日 tick 缓存（用于微观结构窗口）
+        self._tick_buffer: List[Dict[str, Any]] = []
+
+    # --------------- 对外主接口：每个 tick 调用一次 ----------------
+
+    def on_tick(self, tick: Dict[str, Any], ctx: Any) -> None:
+        """
+        tick: dict 或 dict-like，至少包含：
+            - "datetime": datetime
+            - "price": float
+            - "volume": int
+            - "side": 'B'/'S'/'N'（没有也可以，微观结构会直接 None）
+        ctx: BacktestContext 或 具有属性/方法：
+            - cash: float
+            - equity: float
+            - send_order(ts_code, side, price, qty, reason, meta)
+        """
+        dt: datetime = tick["datetime"]
+        trade_date = dt.date()
+        price = float(tick["price"])
+        volume = int(tick.get("volume", 0))
+        side_flag = tick.get("side", "N")
+
+        # 1) 换交易日时重置当日缓存 & 重新加载关键位
+        if self._current_trade_date != trade_date:
+            self._on_new_day(trade_date)
+
+        # 2) 只处理本策略绑定的 ts_code
+        ts_code = tick.get("ts_code", self.ts_code)
+        if ts_code != self.ts_code:
+            return
+
+        # 3) 更新 tick 缓存
+        self._append_tick(dt, price, volume, side_flag)
+
+        # 4) 先管理已有持仓（止损/止盈）
+        if self._position is not None:
+            self._handle_existing_position(price=price, dt=dt, ctx=ctx)
+
+        # 5) 若当前没有持仓，再考虑开仓机会
+        if self._position is None:
+            self._maybe_open_position(price=price, dt=dt, ctx=ctx)
+
+    # --------------- 内部：日切换 & tick 缓存 ----------------
+
+    def _on_new_day(self, trade_date: date) -> None:
+        self._current_trade_date = trade_date
+        self._tick_buffer = []
+        self._position = None  # 简化：日内策略，每天收盘不留 overnight
+
+        # 加载当日关键位
+        try:
+            self._daily_levels = self.price_level_provider.get_levels(
+                self.ts_code, trade_date
+            )
+        except Exception as e:
+            print(f"[{self.name}] get_levels error: {e}")
+            self._daily_levels = []
+
+    def _append_tick(self, dt: datetime, price: float, volume: int, side: str) -> None:
+        self._tick_buffer.append(
+            {
+                "datetime": dt,
+                "price": price,
+                "volume": volume,
+                "side": side,
+            }
+        )
+        # 可以在这里裁剪缓存，只保留最近 N 秒，避免内存爆炸
+        window_seconds = int(self.config["micro_window_seconds"])
+        cutoff = dt - timedelta(seconds=window_seconds * 2)
+        # 简单 O(N) 过滤，tick 量级不特别夸张的话足够用
+        self._tick_buffer = [
+            t for t in self._tick_buffer if t["datetime"] >= cutoff
+        ]
+
+    def _get_tick_window(self, dt: datetime) -> pd.DataFrame:
+        window_seconds = int(self.config["micro_window_seconds"])
+        start = dt - timedelta(seconds=window_seconds)
+        rows = [t for t in self._tick_buffer if start <= t["datetime"] <= dt]
+        if not rows:
+            return pd.DataFrame(columns=["datetime", "price", "volume", "side"])
+        return pd.DataFrame(rows)
+
+    # --------------- 内部：持仓管理 ----------------
+
+    def _handle_existing_position(self, price: float, dt: datetime, ctx: Any) -> None:
+        if self._position is None:
+            return
+
+        pos = self._position
+        stop = pos.stop_loss
+        tp = pos.take_profit
+
+        if pos.side == "long":
+            # 止损
+            if price <= stop:
+                self._close_position(price, dt, ctx, reason="stop_loss")
+                return
+            # 止盈
+            if price >= tp:
+                self._close_position(price, dt, ctx, reason="take_profit")
+                return
+
+        elif pos.side == "short":
+            if price >= stop:
+                self._close_position(price, dt, ctx, reason="stop_loss")
+                return
+            if price <= tp:
+                self._close_position(price, dt, ctx, reason="take_profit")
+                return
+
+        # 未来可以在这里加入“关键位被确认失败”的主动减仓逻辑
+
+    def _close_position(self, price: float, dt: datetime, ctx: Any, reason: str) -> None:
+        if self._position is None:
+            return
+        pos = self._position
+
+        side = "sell" if pos.side == "long" else "buy"
+
+        ctx.send_order(
+            ts_code=pos.ts_code,
+            side=side,
+            price=price,
+            qty=pos.qty,
+            reason=f"exit_{reason}",
+            meta={"entry_price": pos.entry_price},
+        )
+
+        self._position = None
+
+    # --------------- 内部：开仓逻辑 ----------------
+
+    def _maybe_open_position(self, price: float, dt: datetime, ctx: Any) -> None:
+        if not self._daily_levels:
+            return
+
+        tol_pct = float(self.config["level_tolerance_pct"])
+        min_score = float(self.config["min_signal_score"])
+
+        # 找离当前价格最近的支撑/压力关键位
+        candidate_levels: List[PriceLevel] = [
+            lv for lv in self._daily_levels
+            if lv.direction in ("support", "resistance")
+        ]
+        if not candidate_levels:
+            return
+
+        # 根据价格距离排序
+        candidate_levels.sort(
+            key=lambda lv: abs(price - float(lv.level_price)) / max(float(lv.level_price), 1e-6)
+        )
+        best_level = candidate_levels[0]
+        level_price = float(best_level.level_price)
+        dist_pct = abs(price - level_price) / max(level_price, 1e-6)
+        if dist_pct > tol_pct:
+            return
+
+        # 构建微观结构窗口
+        ticks_win = self._get_tick_window(dt)
+        if ticks_win.empty:
+            return
+
+        sig = self.micro_analyzer.analyze_near_level(
+            ts_code=self.ts_code,
+            trade_date=self._current_trade_date,
+            ticks=ticks_win,
+            level=best_level,
+            now_dt=dt,
+        )
+        if sig is None or sig.score < min_score:
+            return
+
+        # 微观结构建议方向与关键位方向一致时才下单
+        # 支撑 + long / 压力 + short
+        if best_level.direction == "support" and sig.side != "long":
+            return
+        if best_level.direction == "resistance" and sig.side != "short":
+            return
+
+        self._open_position(
+            price=price,
+            dt=dt,
+            level=best_level,
+            micro_sig=sig,
+            ctx=ctx,
+        )
+
+    def _open_position(
+        self,
+        price: float,
+        dt: datetime,
+        level: PriceLevel,
+        micro_sig: MicroSignal,
+        ctx: Any,
+    ) -> None:
+        if self._position is not None:
+            return
+
+        cfg = self.config
+        risk_pct = float(cfg["risk_per_trade_pct"])
+        max_pos_pct = float(cfg["max_position_pct"])
+        stop_pct = float(cfg["stop_loss_pct"])
+        take_R = float(cfg["take_profit_R"])
+        lot_size = int(cfg["lot_size"])
+
+        direction = "long" if micro_sig.side == "long" else "short"
+
+        # 止损价 & 盈利目标
+        if direction == "long":
+            stop_price = price * (1.0 - stop_pct)
+            tp_price = price + (price - stop_price) * take_R
+        else:
+            stop_price = price * (1.0 + stop_pct)
+            tp_price = price - (stop_price - price) * take_R
+
+        # 假如止损距离太小或无效，就不交易
+        if direction == "long":
+            risk_per_share = price - stop_price
+        else:
+            risk_per_share = stop_price - price
+        if risk_per_share <= 1e-6:
+            return
+
+        # 根据账户权益 & 风险率计算手数
+        equity = float(getattr(ctx, "equity", getattr(ctx, "cash", 0.0)))
+        max_risk_amount = equity * risk_pct
+        raw_qty = max_risk_amount / risk_per_share
+        # A 股按一手为单位
+        lots = int(raw_qty // lot_size)
+        if lots <= 0:
+            return
+        qty = lots * lot_size
+
+        # 不超过最大仓位限制
+        max_value = equity * max_pos_pct
+        if qty * price > max_value:
+            qty = int(max_value // (price * lot_size)) * lot_size
+        if qty <= 0:
+            return
+
+        order_side = "buy" if direction == "long" else "sell"
+
+        ctx.send_order(
+            ts_code=self.ts_code,
+            side=order_side,
+            price=price,
+            qty=qty,
+            reason=f"entry_level_{level.direction}",
+            meta={
+                "level_price": level.level_price,
+                "level_type": level.level_type,
+                "micro_score": micro_sig.score,
+                "micro_reason": micro_sig.reason,
+            },
+        )
+
+        self._position = PositionState(
+            ts_code=self.ts_code,
+            side=direction,
+            qty=qty,
+            entry_price=price,
+            entry_dt=dt,
+            entry_level_price=float(level.level_price),
+            stop_loss=float(stop_price),
+            take_profit=float(tp_price),
+            meta={
+                "level_type": level.level_type,
+                "level_direction": level.direction,
+                "micro_score": micro_sig.score,
+            },
+        )
+
+
+if __name__ == "__main__":
+    # 自测：用假 tick + 假 ctx 跑一遍 on_tick
+    class DummyLevelProvider(PriceLevelProvider):
+        def precompute(self, trade_date: date) -> None:
+            pass
+
+        def get_levels(self, ts_code: str, trade_date: date) -> List[PriceLevel]:
+            return [
+                PriceLevel(
+                    ts_code=ts_code,
+                    trade_date=trade_date,
+                    level_price=10.0,
+                    level_type="range_low",
+                    direction="support",
+                    strength=80,
+                    source_flags=["range"],
+                    meta={},
+                )
+            ]
+
+    class DummyCtx:
+        def __init__(self) -> None:
+            self.cash = 100_000.0
+            self.equity = 100_000.0
+            self.orders: List[Dict[str, Any]] = []
+
+        def send_order(self, ts_code: str, side: str, price: float, qty: int, reason: str, meta: Dict[str, Any]) -> None:
+            print("ORDER:", ts_code, side, price, qty, reason, meta)
+            self.orders.append(
+                {
+                    "ts_code": ts_code,
+                    "side": side,
+                    "price": price,
+                    "qty": qty,
+                    "reason": reason,
+                    "meta": meta,
+                }
+            )
+
+    from datetime import datetime, timedelta
+
+    prov = DummyLevelProvider()
+    strat = AbuKeyLevelStrategy(
+        ts_code="000001.SZ",
+        price_level_provider=prov,
+        config={"micro_window_seconds": 60, "min_signal_score": 0},  # 放宽分数方便测试
+    )
+    ctx = DummyCtx()
+
+    now = datetime.now()
+    # 构造一段 tick：价格在 10 附近，买盘占优
+    for i in range(60):
+        dt = now - timedelta(seconds=60 - i)
+        tick = {
+            "ts_code": "000001.SZ",
+            "datetime": dt,
+            "price": 10.0 + (i - 50) * 0.001,
+            "volume": 200,
+            "side": "B" if i > 30 else "S",
+        }
+        strat.on_tick(tick, ctx)
+
+    print("Total orders:", len(ctx.orders))
+
+4. strategy/registry.py
+
+一个简单的策略注册表，后面你想加别的策略就可以统一通过名字构造。
+
+# strategy/registry.py
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional
+
+from strategy.base import PriceLevelProvider
+from factors import AbuPriceLevelProvider
+from microstructure import AbuMicrostructureAnalyzer
+from .abu_level_strategy import AbuKeyLevelStrategy
+
+
+StrategyFactory = Callable[..., Any]
+
+
+class StrategyRegistry:
+    """
+    策略注册表：
+        registry = StrategyRegistry()
+        strategy = registry.create("abu_key_level", ts_code="000001.SZ", ...)
+    """
+
+    def __init__(self) -> None:
+        self._factories: Dict[str, StrategyFactory] = {}
+        self._register_builtin()
+
+    def _register_builtin(self) -> None:
+        self._factories["abu_key_level"] = self._create_abu_key_level
+
+    def register(self, name: str, factory: StrategyFactory) -> None:
+        self._factories[name] = factory
+
+    def create(self, name: str, **kwargs: Any) -> Any:
+        if name not in self._factories:
+            raise KeyError(f"Unknown strategy: {name}")
+        return self._factories[name](**kwargs)
+
+    # -------------- 内置策略构造函数 --------------
+
+    def _create_abu_key_level(
+        self,
+        ts_code: str,
+        price_level_provider: Optional[PriceLevelProvider] = None,
+        **kwargs: Any,
+    ) -> AbuKeyLevelStrategy:
+        plp = price_level_provider or AbuPriceLevelProvider()
+        micro = AbuMicrostructureAnalyzer()
+        return AbuKeyLevelStrategy(
+            ts_code=ts_code,
+            price_level_provider=plp,
+            micro_analyzer=micro,
+            **kwargs,
+        )
+
+
+if __name__ == "__main__":
+    # 自测：从 registry 创建一个策略
+    registry = StrategyRegistry()
+    strat = registry.create("abu_key_level", ts_code="000001.SZ")
+    print("Created strategy:", type(strat), strat.name, strat.ts_code)
+
+5. backtest/engine.py
+
+简单的 tick 回测引擎，让你可以直接跑通“阿布关键位 + 微观结构”的整条链路，验证逻辑是否正常。
+
+一次只回测单票（你后面可以自己扩成多票/多线程）。
+
+读：
+
+日线 & 关键位：你已经有（阶段 1 & 2）
+
+tick：用 data.tick_store.TickStore 读文件
+
+主循环：
+
+构造 BacktestContext（持有 cash / equity / positions / trade_log）
+
+遍历当日的 tick df，对每条 tick 调用策略的 on_tick
+
+BacktestContext.send_order() 立即以该 tick 价格成交（简化版）
+
+最后给出：
+
+交易列表
+
+每笔盈亏
+
+简单的统计（胜率 / 平均盈亏 / 总收益等）
+
+# backtest/engine.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from data.tick_store import TickStore
+from strategy.abu_level_strategy import AbuKeyLevelStrategy
+from strategy.base import PriceLevelProvider
+from factors import AbuPriceLevelProvider
+
+
+@dataclass
+class TradeRecord:
+    ts_code: str
+    open_dt: pd.Timestamp
+    close_dt: pd.Timestamp
+    side: str             # "long" / "short"
+    qty: int
+    entry_price: float
+    exit_price: float
+    pnl: float
+    reason: str
+
+
+@dataclass
+class BacktestResult:
+    ts_code: str
+    start_date: date
+    end_date: date
+    initial_cash: float
+    final_equity: float
+    trades: List[TradeRecord]
+
+    @property
+    def total_pnl(self) -> float:
+        return self.final_equity - self.initial_cash
+
+    @property
+    def trade_count(self) -> int:
+        return len(self.trades)
+
+
+class BacktestContext:
+    """
+    简化版回测上下文：
+    - 负责维护 cash / positions / trade_log
+    - 接受策略发来的 send_order，立即在当前价格全成
+    """
+
+    def __init__(self, initial_cash: float = 100_000.0) -> None:
+        self.initial_cash = float(initial_cash)
+        self.cash = float(initial_cash)
+        self.equity = float(initial_cash)
+        # 单票策略：只维护一个持仓
+        self.position_side: Optional[str] = None  # "long" / "short"
+        self.position_qty: int = 0
+        self.position_price: float = 0.0
+        self.position_open_dt: Optional[pd.Timestamp] = None
+        self.trades: List[TradeRecord] = []
+
+    # --------- 策略调用的接口 ---------
+
+    def send_order(
+        self,
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        reason: str,
+        meta: Dict[str, Any],
+    ) -> None:
+        """
+        超简化：市价单，全部在当前成交价成交。
+        """
+        price = float(price)
+        qty = int(qty)
+        # 我们需要当前 tick 的时间戳，策略可以在 meta 里传，也可以这里不记录秒级别
+        dt = meta.get("dt")  # 可以由引擎传入
+        if dt is None:
+            dt = pd.Timestamp.now()
+
+        # 开仓 or 平仓？
+        if side == "buy":
+            if self.position_side is None:
+                # 开多
+                cost = price * qty
+                if cost > self.cash:
+                    # 资金不足，忽略订单
+                    return
+                self.cash -= cost
+                self.position_side = "long"
+                self.position_qty = qty
+                self.position_price = price
+                self.position_open_dt = pd.Timestamp(dt)
+            elif self.position_side == "short":
+                # 平空
+                pnl = (self.position_price - price) * self.position_qty
+                self.cash += self.position_qty * self.position_price + pnl
+                self.trades.append(
+                    TradeRecord(
+                        ts_code=ts_code,
+                        open_dt=self.position_open_dt or pd.Timestamp(dt),
+                        close_dt=pd.Timestamp(dt),
+                        side="short",
+                        qty=self.position_qty,
+                        entry_price=self.position_price,
+                        exit_price=price,
+                        pnl=pnl,
+                        reason=reason,
+                    )
+                )
+                self.position_side = None
+                self.position_qty = 0
+                self.position_price = 0.0
+                self.position_open_dt = None
+        elif side == "sell":
+            if self.position_side is None:
+                # 开空
+                proceeds = price * qty
+                self.cash += proceeds
+                self.position_side = "short"
+                self.position_qty = qty
+                self.position_price = price
+                self.position_open_dt = pd.Timestamp(dt)
+            elif self.position_side == "long":
+                # 平多
+                pnl = (price - self.position_price) * self.position_qty
+                self.cash += self.position_qty * self.position_price + pnl
+                self.trades.append(
+                    TradeRecord(
+                        ts_code=ts_code,
+                        open_dt=self.position_open_dt or pd.Timestamp(dt),
+                        close_dt=pd.Timestamp(dt),
+                        side="long",
+                        qty=self.position_qty,
+                        entry_price=self.position_price,
+                        exit_price=price,
+                        pnl=pnl,
+                        reason=reason,
+                    )
+                )
+                self.position_side = None
+                self.position_qty = 0
+                self.position_price = 0.0
+                self.position_open_dt = None
+
+        # 更新权益
+        self._update_equity(current_price=price)
+
+    def _update_equity(self, current_price: float) -> None:
+        pos_value = 0.0
+        if self.position_side is not None and self.position_qty > 0:
+            if self.position_side == "long":
+                pos_value = current_price * self.position_qty
+            else:
+                # 空头头寸的“市值”简单按初始价格计算
+                pos_value = self.position_price * self.position_qty
+        self.equity = self.cash + pos_value
+
+
+class TickBacktester:
+    """
+    Tick 回测引擎（单票版本）。
+    """
+
+    def __init__(
+        self,
+        ts_code: str,
+        price_level_provider: Optional[PriceLevelProvider] = None,
+        initial_cash: float = 100_000.0,
+    ) -> None:
+        self.ts_code = ts_code
+        self.price_level_provider = price_level_provider or AbuPriceLevelProvider()
+        self.initial_cash = float(initial_cash)
+        self.tick_store = TickStore()
+
+    def run(
+        self,
+        trade_dates: List[date],
+        strategy_config: Optional[Dict[str, Any]] = None,
+    ) -> BacktestResult:
+        ctx = BacktestContext(initial_cash=self.initial_cash)
+        strat = AbuKeyLevelStrategy(
+            ts_code=self.ts_code,
+            price_level_provider=self.price_level_provider,
+            config=strategy_config,
+        )
+
+        first_date = trade_dates[0]
+        last_date = trade_dates[-1]
+
+        for d in trade_dates:
+            df_ticks = self.tick_store.load_ticks(self.ts_code, d)
+            if df_ticks is None or df_ticks.empty:
+                continue
+            # 保证按时间排序
+            df_ticks = df_ticks.sort_values("datetime").reset_index(drop=True)
+
+            # 重置策略当日状态在策略内部完成（on_tick 中通过 trade_date 判断）
+
+            for _, row in df_ticks.iterrows():
+                tick = {
+                    "ts_code": self.ts_code,
+                    "datetime": row["datetime"],
+                    "price": float(row["price"]),
+                    "volume": int(row.get("volume", 0)),
+                    "side": row.get("side", "N"),
+                }
+                strat.on_tick(tick, ctx)
+
+        final_equity = ctx.equity
+        trades = ctx.trades
+
+        return BacktestResult(
+            ts_code=self.ts_code,
+            start_date=first_date,
+            end_date=last_date,
+            initial_cash=self.initial_cash,
+            final_equity=final_equity,
+            trades=trades,
+        )
+
+
+if __name__ == "__main__":
+    # 自测：假设已经有 tick 文件，可以跑一段日期看看是否能正常执行
+    from datetime import timedelta
+
+    ts = "000001.SZ"
+    today = date.today()
+    dates = [today - timedelta(days=i) for i in range(3)]
+    dates = sorted(dates)
+
+    bt = TickBacktester(ts_code=ts, initial_cash=100_000.0)
+
+    try:
+        result = bt.run(dates, strategy_config={"min_signal_score": 60.0})
+        print("Backtest result:")
+        print("Total trades:", result.trade_count)
+        print("Total PnL:", result.total_pnl)
+        print("Final equity:", result.final_equity)
+        for tr in result.trades:
+            print(tr)
+    except FileNotFoundError as e:
+        print("TickBacktester self-test: tick files not found, but engine is wired correctly.")
+
+6. backtest/__init__.py
+# backtest/__init__.py
+"""
+回测相关模块入口。
+"""
+
+from .engine import TickBacktester, BacktestContext, BacktestResult, TradeRecord
+
+__all__ = [
+    "TickBacktester",
+    "BacktestContext",
+    "BacktestResult",
+    "TradeRecord",
+]
+
+
+if __name__ == "__main__":
+    print("backtest package self-test:", __all__)
+
+接下来你可以怎么用（建议第一个实验）
+
+确认阶段 0 / 1 / 2 正常：
+
+Tick 文件已经按 TickStore 的路径写好了
+
+price_levels_daily 已经通过阶段 2 的 AbuPriceLevelProvider.precompute(trade_date) 预计算了一部分日期
+
+快速起一个简单回测：
+
+from datetime import date, timedelta
+from backtest import TickBacktester
+
+ts_code = "000001.SZ"
+today = date.today()
+dates = [today - timedelta(days=i) for i in range(5)]
+dates = sorted(dates)
+
+bt = TickBacktester(ts_code=ts_code, initial_cash=100_000.0)
+result = bt.run(
+    trade_dates=dates,
+    strategy_config={
+        "risk_per_trade_pct": 0.01,
+        "stop_loss_pct": 0.005,
+        "take_profit_R": 2.0,
+        "min_signal_score": 60.0,
+    },
+)
+
+print("Total trades:", result.trade_count)
+print("Total PnL:", result.total_pnl)
