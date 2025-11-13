@@ -1,148 +1,112 @@
-阶段 4 目标（按我们之前的规划）：
+阶段 5 新增内容包括：
 
-实盘交易接入：用 qmtmini 做下单，但通过一个统一的 Context 接口，和回测完全复用同一套策略逻辑。
+live/broker_base.py：Broker 抽象 + DummyBroker（内存模拟券商，下单只打印）
 
-实盘/仿真运行器：把 tick 数据源 + 策略 + 实盘上下文串起来。
+live/broker_qmt.py：QmtBroker 骨架，默认 dry_run=True，实际也是走 DummyBroker 并打印参数（满足你现在“先打印不真下单”的要求）
 
-可视化前端（Streamlit）：查看 K 线 + 阿布关键位、简单回测/交易结果展示。
+live/live_engine.py：实盘引擎 LiveEngine + LiveStrategyContext
 
-下面这些是「阶段 4 新增/重要文件」：
+从 TickStore 回放 tick → AbuKeyLevelStrategy.on_tick
 
-live/qmt_client.py — 封装 qmtmini 的交易客户端（默认 dry-run，方便你先联调）
+策略通过 ctx.send_order(...) → 风控（RiskManager）→ Broker
 
-live/context.py — 实盘上下文（LiveContext），接口与回测 BacktestContext 对齐
+live/__init__.py：导出以上组件
 
-live/runner.py — 实盘/仿真运行器（用 TickStore 回放 + LiveContext + 策略）
+strategy/risk_manager.py：风控模块（与策略解耦）
 
-live/__init__.py
+下面是阶段 5 完整代码，你按路径加到当前仓库里即可。
 
-ui/streamlit_app.py — Streamlit 可视化：K 线 + 阿布关键位
+1. live/broker_base.py — Broker 抽象 + Dummy 实现（打印下单）
+# live/broker_base.py
+"""
+Broker 抽象与 Dummy 实现。
 
-你可以按文件名直接放进当前仓库对应目录。
+本模块定义：
+- BrokerBase: 抽象接口，统一 place_order / cancel_order / get_positions / get_account_info
+- DummyBroker: 内存模拟券商实现，用于开发阶段和 __main__ 自测。
 
-1. live/qmt_client.py — qmtmini 封装（支持 dry-run）
-# live/qmt_client.py
+设计目标：
+1. 实盘引擎只依赖 BrokerBase，不直接耦合 qmt / easytrader 等具体实现。
+2. 先用 DummyBroker 跑通策略 + 风控 + 引擎链路，后续再替换为真实券商实现。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from abc import ABC, abstractmethod
+from datetime import datetime
 import threading
-import time
 import uuid
 
 
 @dataclass
-class QmtOrder:
+class BrokerOrder:
     order_id: str
     ts_code: str
-    side: str      # "buy" / "sell"
+    side: str          # "buy" / "sell"
     price: float
     qty: int
-    status: str    # "new" / "filled" / "rejected"
+    status: str        # "new" / "filled" / "rejected" / "canceled"
     remark: str
+    created_at: datetime
+    filled_at: Optional[datetime] = None
 
 
-class QmtClient:
-    """
-    qmtmini 封装。
+class BrokerBase(ABC):
+    """券商抽象接口。"""
 
-    当前默认实现为 dry-run（只记录订单，不真正发给券商），你可以在标记 TODO
-    的地方替换为你自己的 qmtmini 接口调用。
-
-    预期能力：
-        - connect / disconnect
-        - get_account_info: 返回现金、总资产等
-        - get_positions: 返回持仓列表
-        - place_order: 下单（市价/限价），返回 order_id
-    """
-
-    def __init__(
+    @abstractmethod
+    def place_order(
         self,
-        account_id: Optional[str] = None,
-        dry_run: bool = True,
-        extra_config: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self.account_id = account_id or "default"
-        self.dry_run = dry_run
-        self.extra_config = extra_config or {}
-        self._connected = False
-        self._lock = threading.Lock()
-        self._orders: List[QmtOrder] = []
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        order_type: str = "limit",
+        remark: str = "",
+    ) -> Optional[str]:
+        """下单，返回 order_id。若下单被拒绝，可以返回 None。"""
+        raise NotImplementedError
 
-        # dry-run 下的模拟资金与持仓
-        self._cash = float(self.extra_config.get("initial_cash", 1_000_000.0))
-        self._equity = self._cash
-        self._positions: Dict[str, Dict[str, Any]] = {}  # ts_code -> {qty, cost}
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> None:
+        """撤单（若券商支持）。"""
+        raise NotImplementedError
 
-    # -------------------- 连接 / 断开 --------------------
-
-    def connect(self) -> None:
-        """
-        建立与 qmtmini 的连接。
-
-        TODO: 在这里替换为你的真实 qmtmini 登录逻辑。
-        """
-        if self._connected:
-            return
-        # 真实环境：调用 qmtmini 的登录/连接接口
-        # 例如：self._api = miniqmt.Xxx(...); self._api.connect()
-        self._connected = True
-        print(f"[QmtClient] connected (dry_run={self.dry_run})")
-
-    def disconnect(self) -> None:
-        """
-        断开连接。
-        """
-        if not self._connected:
-            return
-        # TODO: 调用 qmtmini 的断开接口
-        self._connected = False
-        print("[QmtClient] disconnected")
-
-    # -------------------- 账户 / 持仓 --------------------
-
+    @abstractmethod
     def get_account_info(self) -> Dict[str, Any]:
-        """
-        返回账户资金信息。
-        真正接入时，用 qmtmini 的资金查询结果替换这里的实现。
-        """
-        if not self._connected:
-            raise RuntimeError("QmtClient not connected")
+        """返回资金信息，例如 {"cash": 100000.0, "equity": 100000.0}。"""
+        raise NotImplementedError
 
-        if not self.dry_run:
-            # TODO: 调用 qmtmini 查询资金
-            # 返回格式尽量与当前保持一致：{"cash": ..., "equity": ...}
-            pass
-
-        return {
-            "account_id": self.account_id,
-            "cash": self._cash,
-            "equity": self._equity,
-        }
-
+    @abstractmethod
     def get_positions(self) -> List[Dict[str, Any]]:
-        """
-        返回当前持仓列表。
-        """
-        if not self._connected:
-            raise RuntimeError("QmtClient not connected")
+        """返回当前持仓列表，字段尽量保持统一：ts_code / qty / cost。"""
+        raise NotImplementedError
 
-        if not self.dry_run:
-            # TODO: 调用 qmtmini 查询持仓
-            pass
+    @abstractmethod
+    def list_orders(self) -> List[BrokerOrder]:
+        """返回当前已知的订单列表。"""
+        raise NotImplementedError
 
-        res: List[Dict[str, Any]] = []
-        for ts_code, pos in self._positions.items():
-            res.append(
-                {
-                    "ts_code": ts_code,
-                    "qty": pos["qty"],
-                    "cost": pos["cost"],
-                }
-            )
-        return res
 
-    # -------------------- 下单 --------------------
+class DummyBroker(BrokerBase):
+    """一个纯内存的券商模拟实现。
+
+    特性：
+    - 不与外部系统交互，仅在本进程内维护现金 / 持仓 / 订单。
+    - place_order 时直接以指定价格全额成交，并打印到 stdout。
+    - 适合作为开发阶段的默认 Broker，确保实盘引擎逻辑先跑通。
+    """
+
+    def __init__(self, initial_cash: float = 1_000_000.0) -> None:
+        self._cash = float(initial_cash)
+        self._equity = float(initial_cash)
+        self._positions: Dict[str, Dict[str, Any]] = {}  # ts_code -> {qty, cost}
+        self._orders: List[BrokerOrder] = []
+        self._lock = threading.Lock()
+
+    # ----- BrokerBase 接口实现 -----
 
     def place_order(
         self,
@@ -152,178 +116,476 @@ class QmtClient:
         qty: int,
         order_type: str = "limit",
         remark: str = "",
-    ) -> str:
-        """
-        下单接口。
-
-        side: "buy" / "sell"
-        order_type: "limit" / "market"（当前实现统一按成交价处理）
-        """
-        if not self._connected:
-            raise RuntimeError("QmtClient not connected")
-
-        price = float(price)
+    ) -> Optional[str]:
+        dt = datetime.now()
+        side = side.lower()
         qty = int(qty)
+        price = float(price)
+
+        if qty <= 0 or price <= 0:
+            print(f"[DummyBroker] invalid order qty/price: {qty}, {price}")
+            return None
+
         order_id = uuid.uuid4().hex
+        order = BrokerOrder(
+            order_id=order_id,
+            ts_code=ts_code,
+            side=side,
+            price=price,
+            qty=qty,
+            status="new",
+            remark=remark,
+            created_at=dt,
+        )
 
         with self._lock:
-            order = QmtOrder(
-                order_id=order_id,
+            # 简化：按限价立即成交
+            if side == "buy":
+                notional = price * qty
+                if notional > self._cash:
+                    order.status = "rejected"
+                    order.remark += " | insufficient cash"
+                else:
+                    self._cash -= notional
+                    pos = self._positions.get(ts_code, {"qty": 0, "cost": 0.0})
+                    new_qty = pos["qty"] + qty
+                    if new_qty > 0:
+                        pos["cost"] = (pos["cost"] * pos["qty"] + notional) / new_qty
+                    pos["qty"] = new_qty
+                    self._positions[ts_code] = pos
+                    order.status = "filled"
+                    order.filled_at = dt
+            elif side == "sell":
+                pos = self._positions.get(ts_code, {"qty": 0, "cost": 0.0})
+                if qty > pos["qty"]:
+                    order.status = "rejected"
+                    order.remark += " | insufficient position"
+                else:
+                    proceeds = price * qty
+                    self._cash += proceeds
+                    pos["qty"] -= qty
+                    if pos["qty"] <= 0:
+                        self._positions.pop(ts_code, None)
+                    else:
+                        self._positions[ts_code] = pos
+                    order.status = "filled"
+                    order.filled_at = dt
+            else:
+                order.status = "rejected"
+                order.remark += " | unknown side"
+
+            self._orders.append(order)
+            self._update_equity_locked()
+
+        print(f"[DummyBroker] order: {order}")
+        return order_id if order.status != "rejected" else None
+
+    def cancel_order(self, order_id: str) -> None:
+        # Dummy 中，订单是立即成交，不支持撤单；仅更新状态方便调试。
+        with self._lock:
+            for od in self._orders:
+                if od.order_id == order_id and od.status == "new":
+                    od.status = "canceled"
+                    print(f"[DummyBroker] cancel_order: {order_id}")
+                    break
+
+    def get_account_info(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "cash": self._cash,
+                "equity": self._equity,
+            }
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            res: List[Dict[str, Any]] = []
+            for ts_code, pos in self._positions.items():
+                res.append(
+                    {
+                        "ts_code": ts_code,
+                        "qty": pos["qty"],
+                        "cost": pos["cost"],
+                    }
+                )
+            return res
+
+    def list_orders(self) -> List[BrokerOrder]:
+        with self._lock:
+            return list(self._orders)
+
+    # ----- 内部工具 -----
+
+    def _update_equity_locked(self) -> None:
+        # 简化：不计持仓的市值波动，仅用现金近似 equity
+        self._equity = self._cash
+
+
+if __name__ == "__main__":
+    # 简单自测：用 DummyBroker 下几笔单，观察资金和持仓变化。
+    broker = DummyBroker(initial_cash=100_000)
+    print("[selftest] init account:", broker.get_account_info())
+
+    oid1 = broker.place_order("000001.SZ", "buy", price=10.0, qty=1000, remark="test_buy")
+    oid2 = broker.place_order("000001.SZ", "sell", price=10.5, qty=500, remark="test_sell")
+    oid3 = broker.place_order("000002.SZ", "sell", price=20.0, qty=100, remark="invalid_sell")
+
+    print("[selftest] orders:")
+    for od in broker.list_orders():
+        print(od)
+
+    print("[selftest] positions:", broker.get_positions())
+    print("[selftest] account:", broker.get_account_info())
+
+2. live/broker_qmt.py — QmtBroker 骨架（默认 dry_run，只打印）
+# live/broker_qmt.py
+"""基于 qmtmini / easytrader 的券商实现骨架。
+
+说明：
+- 为了兼容当前环境（未必安装了 easytrader / xtquant），本模块默认
+  以 Dummy 模式工作：即仅打印下单参数，不真正发起实盘交易。
+- 将来你在本机/服务器安装好 qmt 相关库后，可以在 TODO 标记处补充
+  真正的下单 / 撤单 / 查询逻辑。
+
+用法建议：
+    from live.broker_qmt import QmtBroker
+
+    broker = QmtBroker(dry_run=True)   # 默认 dry_run，安全
+    broker.place_order(...)
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+try:
+    import easytrader  # type: ignore
+except Exception:  # easytrader 未安装时，保持 None
+    easytrader = None  # type: ignore
+
+from .broker_base import BrokerBase, BrokerOrder, DummyBroker
+
+
+class QmtBroker(BrokerBase):
+    """qmtmini 券商实现（目前为安全起见默认 dry-run）。
+
+    参数：
+        dry_run: True 表示只打印、不发真单；False 时才尝试调用 easytrader。
+        config: 未来可以在这里传入 qmt 账号、路径、网关等信息。
+    """
+
+    def __init__(self, dry_run: bool = True, config: Optional[Dict[str, Any]] = None) -> None:
+        self.dry_run = dry_run
+        self.config = config or {}
+        self._dummy = DummyBroker(initial_cash=float(self.config.get("initial_cash", 1_000_000.0)))
+        self._api = None
+
+        if not self.dry_run:
+            if easytrader is None:
+                raise ImportError("easytrader 未安装，无法使用非 dry_run 模式的 QmtBroker。")
+
+            # TODO: 这里根据你的实际 qmtmini 配置初始化 easytrader / xtquant
+            # 例如：
+            #   self._api = easytrader.use('universal_client')
+            #   self._api.connect(...)
+            # 暂时保留为占位：
+            self._api = None
+            print("[QmtBroker] non-dry_run 模式尚未完成，请在 broker_qmt.py 中补充实现。")
+
+    # ----- BrokerBase 接口 -----
+
+    def place_order(
+        self,
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        order_type: str = "limit",
+        remark: str = "",
+    ) -> Optional[str]:
+        if self.dry_run or self._api is None:
+            # 当前以 DummyBroker 方式模拟，并打印参数
+            print(
+                f"[QmtBroker][dry_run] place_order ts_code={ts_code} "
+                f"side={side} price={price} qty={qty} order_type={order_type} remark={remark}"
+            )
+            return self._dummy.place_order(
                 ts_code=ts_code,
                 side=side,
                 price=price,
                 qty=qty,
-                status="new",
+                order_type=order_type,
                 remark=remark,
             )
-            self._orders.append(order)
 
-            if self.dry_run:
-                # 在 dry-run 下，我们直接假设以提交价格全部成交。
-                self._simulate_fill(order)
-            else:
-                # TODO: 在这里调用 qmtmini 的实单下单接口，
-                #       并根据回报更新 self._orders / self._positions / self._cash / self._equity
-                self._simulate_fill(order)  # 在你接真实接口前，保留这个方便调试
+        # TODO: 真实 easytrader / xtquant 下单实现
+        raise NotImplementedError("QmtBroker.place_order: 非 dry_run 模式尚未实现")
 
-        print(f"[QmtClient] order placed: {order}")
-        return order_id
-
-    # -------------------- dry-run 填充逻辑 --------------------
-
-    def _simulate_fill(self, order: QmtOrder) -> None:
-        """
-        在 dry-run 或未接真接口时，用简单规则模拟成交并更新资金与持仓。
-        """
-        if order.status == "filled":
+    def cancel_order(self, order_id: str) -> None:
+        if self.dry_run or self._api is None:
+            print(f"[QmtBroker][dry_run] cancel_order order_id={order_id}")
+            self._dummy.cancel_order(order_id)
             return
 
-        ts_code = order.ts_code
-        price = order.price
-        qty = order.qty
+        # TODO: 调用券商撤单接口
+        raise NotImplementedError("QmtBroker.cancel_order: 非 dry_run 模式尚未实现")
 
-        # 买入时，减少现金、增加持仓
-        if order.side == "buy":
-            cost = price * qty
-            if cost > self._cash:
-                order.status = "rejected"
-                order.remark += " | insufficient cash"
-                return
+    def get_account_info(self) -> Dict[str, Any]:
+        if self.dry_run or self._api is None:
+            return self._dummy.get_account_info()
 
-            self._cash -= cost
-            pos = self._positions.get(ts_code, {"qty": 0, "cost": 0.0})
-            total_qty = pos["qty"] + qty
-            if total_qty > 0:
-                pos["cost"] = (pos["cost"] * pos["qty"] + cost) / total_qty
-            pos["qty"] = total_qty
-            self._positions[ts_code] = pos
-            order.status = "filled"
+        # TODO: 从券商查询资金信息
+        raise NotImplementedError("QmtBroker.get_account_info: 非 dry_run 模式尚未实现")
 
-        elif order.side == "sell":
-            pos = self._positions.get(ts_code, {"qty": 0, "cost": 0.0})
-            if qty > pos["qty"]:
-                order.status = "rejected"
-                order.remark += " | insufficient position"
-                return
-            proceeds = price * qty
-            self._cash += proceeds
-            pos["qty"] -= qty
-            if pos["qty"] <= 0:
-                self._positions.pop(ts_code, None)
-            else:
-                self._positions[ts_code] = pos
-            order.status = "filled"
+    def get_positions(self) -> List[Dict[str, Any]]:
+        if self.dry_run or self._api is None:
+            return self._dummy.get_positions()
 
-        self._equity = self._cash  # 简化：不计未实现盈亏
+        # TODO: 从券商查询持仓信息
+        raise NotImplementedError("QmtBroker.get_positions: 非 dry_run 模式尚未实现")
 
-    # -------------------- 工具 --------------------
+    def list_orders(self) -> List[BrokerOrder]:
+        if self.dry_run or self._api is None:
+            return self._dummy.list_orders()
 
-    def get_orders(self) -> List[QmtOrder]:
-        with self._lock:
-            return list(self._orders)
+        # TODO: 若券商接口支持，返回当前/历史订单
+        raise NotImplementedError("QmtBroker.list_orders: 非 dry_run 模式尚未实现")
 
 
 if __name__ == "__main__":
-    # 简单自测
-    client = QmtClient(dry_run=True, extra_config={"initial_cash": 100_000})
-    client.connect()
-    print("Account:", client.get_account_info())
+    # 自测：dry_run 模式下下几笔单，确认没有异常。
+    broker = QmtBroker(dry_run=True, config={"initial_cash": 100_000})
+    print("[selftest] account:", broker.get_account_info())
+    oid1 = broker.place_order("000001.SZ", "buy", 10.0, 1000, remark="test_buy")
+    oid2 = broker.place_order("000001.SZ", "sell", 10.5, 500, remark="test_sell")
+    print("[selftest] positions:", broker.get_positions())
+    print("[selftest] orders:", broker.list_orders())
 
-    oid1 = client.place_order("000001.SZ", "buy", 10.0, 1000, remark="test_buy")
-    oid2 = client.place_order("000001.SZ", "sell", 10.5, 500, remark="test_sell")
+3. strategy/risk_manager.py — 风控模块（与策略解耦）
+# strategy/risk_manager.py
+"""
+风控模块（与策略解耦）。
 
-    print("Orders:", client.get_orders())
-    print("Positions:", client.get_positions())
-    print("Account after trades:", client.get_account_info())
+本模块提供：
+- RiskConfig: 风控参数配置
+- RiskDecision: 风控决策结果
+- RiskManager: 下单前检查是否通过风控的组件
 
-    client.disconnect()
+设计原则：
+1. 不直接依赖具体策略，只关心“账户+订单”维度的约束；
+2. 典型规则：
+   - 单笔委托不超过账户市值的一定比例；
+   - 单日订单数量上限；
+   - 可选的股票黑名单 / 白名单；
+3. 策略层只需要在真正调用 broker.place_order 前调用 RiskManager.check_order。
+"""
 
-2. live/context.py — 实盘上下文（对齐策略所需接口）
-# live/context.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Protocol
 
-import pandas as pd
 
-from .qmt_client import QmtClient, QmtOrder
+class HasRiskContext(Protocol):
+    """风险检查依赖的上下文接口。
+
+    统一抽象为 Protocol，方便回测上下文 / 实盘上下文各自实现：
+    - get_cash(): 当前可用现金
+    - get_position(ts_code): 当前持仓数量
+    - log(msg): 日志接口（可选）
+    """
+
+    def get_cash(self) -> float:  # pragma: no cover - Protocol 接口不执行
+        ...
+
+    def get_position(self, ts_code: str) -> float:
+        ...
+
+    def log(self, msg: str) -> None:
+        ...
 
 
 @dataclass
-class LiveTradeRecord:
-    ts_code: str
-    dt: datetime
-    side: str          # "buy" / "sell"
-    price: float
-    qty: int
-    reason: str
-    meta: Dict[str, Any]
-    order_id: str
-    status: str
+class RiskConfig:
+    """风控配置。"""
+
+    max_order_value_pct_of_cash: float = 0.2
+    # 单笔委托的金额不能超过当前可用现金的多少比例。
+
+    max_orders_per_day: int = 50
+    # 单日最多允许多少笔订单（包含买入和卖出）。
+
+    banned_ts_codes: List[str] = field(default_factory=list)
+    # 禁止交易的股票列表（例如 ST 股，或风控名单）。
 
 
-class LiveContext:
+@dataclass
+class RiskDecision:
+    allowed: bool
+    reason: str = ""
+    ts_code: Optional[str] = None
+    side: Optional[str] = None
+    price: Optional[float] = None
+    qty: Optional[int] = None
+    dt: Optional[datetime] = None
+
+
+class RiskManager:
+    """基础风控实现。
+
+    状态：
+        - _daily_order_count: 记录每个 trade_date 的订单数量。
     """
-    实盘上下文（用于给 AbuKeyLevelStrategy 使用），接口与 BacktestContext 尽量对齐：
 
-    - 属性：
-        - cash: float
-        - equity: float
-    - 方法：
-        - send_order(ts_code, side, price, qty, reason, meta)
+    def __init__(self, config: Optional[RiskConfig] = None) -> None:
+        self.config = config or RiskConfig()
+        self._daily_order_count: Dict[date, int] = {}
 
-    注意：
-        - 真实持仓 & 资金以券商为准，这里只做「轻量缓存」与日志记录；
-        - 策略风控（单笔风险、最大仓位等）在策略内完成，
-          LiveContext 只做最基本的 sanity check。
-    """
+    # -------------- 主接口 --------------
 
-    def __init__(
+    def check_order(
         self,
-        client: QmtClient,
-        ts_code: Optional[str] = None,
-        max_slippage_pct: float = 0.002,
-    ) -> None:
-        self.client = client
-        self.ts_code = ts_code
-        self.max_slippage_pct = float(max_slippage_pct)
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        trade_dt: datetime,
+        ctx: HasRiskContext,
+    ) -> RiskDecision:
+        """检查一笔订单是否通过风控。
 
-        self.cash: float = 0.0
-        self.equity: float = 0.0
-        self.trades: List[LiveTradeRecord] = []
+        返回 RiskDecision：
+            - allowed=True: 允许下单；
+            - allowed=False: 拒绝，并给出 reason。
+        """
+        side = side.lower()
+        qty = int(qty)
+        price = float(price)
+        trade_date = trade_dt.date()
 
-        self.refresh_account()
+        # 黑名单检查
+        if ts_code in self.config.banned_ts_codes:
+            return RiskDecision(
+                allowed=False,
+                reason="ts_code in banned list",
+                ts_code=ts_code,
+                side=side,
+                price=price,
+                qty=qty,
+                dt=trade_dt,
+            )
 
-    # --------------- 账户信息 ---------------
+        # 单日下单次数限制
+        cnt = self._daily_order_count.get(trade_date, 0)
+        if cnt >= self.config.max_orders_per_day:
+            return RiskDecision(
+                allowed=False,
+                reason="daily order count limit reached",
+                ts_code=ts_code,
+                side=side,
+                price=price,
+                qty=qty,
+                dt=trade_dt,
+            )
 
-    def refresh_account(self) -> None:
-        info = self.client.get_account_info()
-        self.cash = float(info.get("cash", 0.0))
-        self.equity = float(info.get("equity", self.cash))
+        # 单笔委托金额限制（只对买入严格控制）
+        if side == "buy":
+            cash = ctx.get_cash()
+            max_notional = cash * self.config.max_order_value_pct_of_cash
+            notional = price * qty
+            if notional > max_notional:
+                return RiskDecision(
+                    allowed=False,
+                    reason=f"order notional {notional:.2f} > max {max_notional:.2f}",
+                    ts_code=ts_code,
+                    side=side,
+                    price=price,
+                    qty=qty,
+                    dt=trade_dt,
+                )
 
-    # --------------- 策略调用的核心接口 ---------------
+        # 通过风控
+        self._daily_order_count[trade_date] = cnt + 1
+        return RiskDecision(
+            allowed=True,
+            reason="ok",
+            ts_code=ts_code,
+            side=side,
+            price=price,
+            qty=qty,
+            dt=trade_dt,
+        )
+
+
+if __name__ == "__main__":
+    # 简单自测：构造一个 Dummy 上下文，测几笔单
+    class DummyCtx:
+        def __init__(self, cash: float) -> None:
+            self._cash = cash
+            self._pos: Dict[str, float] = {}
+
+        def get_cash(self) -> float:
+            return self._cash
+
+        def get_position(self, ts_code: str) -> float:
+            return self._pos.get(ts_code, 0.0)
+
+        def log(self, msg: str) -> None:
+            print("[DummyCtx]", msg)
+
+    from datetime import datetime as _dt
+
+    cfg = RiskConfig(
+        max_order_value_pct_of_cash=0.1,
+        max_orders_per_day=3,
+        banned_ts_codes=["000003.SZ"],
+    )
+    rm = RiskManager(cfg)
+    ctx = DummyCtx(cash=100_000)
+
+    dt = _dt.now()
+    for i in range(5):
+        dec = rm.check_order("000001.SZ", "buy", price=10.0, qty=1000, trade_dt=dt, ctx=ctx)
+        print(f"[selftest] i={i}, decision=", dec)
+
+    # 被禁止的股票
+    dec2 = rm.check_order("000003.SZ", "buy", 10.0, 1000, trade_dt=dt, ctx=ctx)
+    print("[selftest] banned ts decision=", dec2)
+
+4. live/live_engine.py — 实盘引擎（Tick 驱动，接 AbuKeyLevelStrategy）
+# live/live_engine.py
+"""
+实盘引擎（可换策略）—— Tick 驱动版本。
+
+职责：
+- 从 tick 数据源拉取“实时”或回放数据；
+- 调用指定策略的 on_tick(tick, context)；
+- 策略通过 context.send_order(...) 触发下单；
+- context 调用 RiskManager 做风控，然后通过 Broker 下单；
+- 所有订单都由 Broker 统一管理（DummyBroker / QmtBroker 等）。
+
+注意：
+- 当前版本主要针对 AbuKeyLevelStrategy 这类“直接在 on_tick 里下单”的策略；
+- 以后将 BaseStrategy + TradeSignal 完全打通时，可以在这里扩展支持 on_bar/on_signal。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Dict, Iterable, List, Optional, Protocol
+
+import pandas as pd
+
+from data.tick_store import TickStore
+from strategy.abu_level_strategy import AbuKeyLevelStrategy
+from strategy.base import StrategyContext
+from strategy.risk_manager import RiskManager
+from live.broker_base import BrokerBase, DummyBroker
+
+
+class HasSendOrderContext(StrategyContext, Protocol):
+    """扩展 StrategyContext，增加 send_order 接口（AbuKeyLevelStrategy 需要）。"""
 
     def send_order(
         self,
@@ -334,487 +596,296 @@ class LiveContext:
         reason: str,
         meta: Dict[str, Any],
     ) -> None:
-        """
-        策略下单接口。
+        ...
 
-        side: "buy" / "sell"
-        """
-        # 若策略绑定了 ts_code，则强制一致
-        if self.ts_code is not None and ts_code != self.ts_code:
-            # 多标的实盘时，你可以改为 raise 或路由到其它 LiveContext
-            print(f"[LiveContext] ignore order for {ts_code}, context bound to {self.ts_code}")
+
+@dataclass
+class LiveOrderLog:
+    ts_code: str
+    dt: datetime
+    side: str
+    price: float
+    qty: int
+    reason: str
+    meta: Dict[str, Any]
+    broker_order_id: Optional[str]
+
+
+class LiveStrategyContext:
+    """实盘策略上下文实现。
+
+    职责：
+        - 为策略提供 get_position / get_cash / log 接口；
+        - 提供 send_order，内部做：风控检查 -> broker.place_order -> 记录日志。
+    """
+
+    def __init__(
+        self,
+        broker: BrokerBase,
+        risk_manager: Optional[RiskManager] = None,
+        logger: Optional[Any] = None,
+    ) -> None:
+        self.broker = broker
+        self.risk_manager = risk_manager or RiskManager()
+        self.logger = logger or (lambda msg: print(f"[LiveContext] {msg}"))
+        self._vars: Dict[str, Any] = {}
+        self._orders: List[LiveOrderLog] = []
+
+    # ------- StrategyContext 需要的方法 -------
+
+    def get_position(self, ts_code: str) -> float:
+        pos_list = self.broker.get_positions()
+        qty = 0.0
+        for pos in pos_list:
+            if pos.get("ts_code") == ts_code:
+                qty += float(pos.get("qty", 0.0))
+        return qty
+
+    def get_cash(self) -> float:
+        info = self.broker.get_account_info()
+        return float(info.get("cash", 0.0))
+
+    def log(self, msg: str) -> None:
+        self.logger(msg)
+
+    def set_var(self, key: str, value: Any) -> None:
+        self._vars[key] = value
+
+    def get_var(self, key: str, default: Any = None) -> Any:
+        return self._vars.get(key, default)
+
+    def get_config(self) -> Dict[str, Any]:
+        # 这里的配置更多是策略自己的 config，不放在 context
+        return {}
+
+    # ------- 扩展：发送订单接口 -------
+
+    def send_order(
+        self,
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        reason: str,
+        meta: Dict[str, Any],
+    ) -> None:
+        dt: datetime = meta.get("dt") or datetime.now()
+        side = side.lower()
+
+        # 风控检查
+        decision = self.risk_manager.check_order(
+            ts_code=ts_code,
+            side=side,
+            price=float(price),
+            qty=int(qty),
+            trade_dt=dt,
+            ctx=self,
+        )
+        if not decision.allowed:
+            self.log(f"[Risk] reject order: {decision.reason}")
             return
 
-        qty = int(qty)
-        price = float(price)
-        dt = meta.get("dt")
-        if dt is None:
-            dt = datetime.now()
-
-        remark = f"{reason}"
-        order_id = self.client.place_order(
+        # 通过风控，调用 Broker（当前可以是 DummyBroker 或 QmtBroker(dry_run)）
+        order_id = self.broker.place_order(
             ts_code=ts_code,
             side=side,
-            price=price,
-            qty=qty,
+            price=float(price),
+            qty=int(qty),
             order_type="limit",
-            remark=remark,
+            remark=reason,
         )
 
-        # 刷新账户信息
-        self.refresh_account()
-
-        # 从 client 中找到刚刚的订单记录
-        status = "unknown"
-        for od in self.client.get_orders():
-            if od.order_id == order_id:
-                status = od.status
-                break
-
-        rec = LiveTradeRecord(
-            ts_code=ts_code,
-            dt=dt,
-            side=side,
-            price=price,
-            qty=qty,
-            reason=reason,
-            meta=meta,
-            order_id=order_id,
-            status=status,
+        self._orders.append(
+            LiveOrderLog(
+                ts_code=ts_code,
+                dt=dt,
+                side=side,
+                price=float(price),
+                qty=int(qty),
+                reason=reason,
+                meta=meta,
+                broker_order_id=order_id,
+            )
         )
-        self.trades.append(rec)
+        self.log(
+            f"[Order] ts={ts_code} side={side} price={price} qty={qty} "
+            f"reason={reason} broker_order_id={order_id}"
+        )
 
-        print(f"[LiveContext] order sent: {rec}")
+    # ------- 工具 -------
 
-    # --------------- 工具方法 ---------------
-
-    def trades_to_dataframe(self) -> pd.DataFrame:
-        if not self.trades:
+    def orders_to_dataframe(self) -> pd.DataFrame:
+        if not self._orders:
             return pd.DataFrame(
-                columns=[
-                    "ts_code",
-                    "dt",
-                    "side",
-                    "price",
-                    "qty",
-                    "reason",
-                    "order_id",
-                    "status",
-                ]
+                columns=["ts_code", "dt", "side", "price", "qty", "reason", "broker_order_id"]
             )
         rows = []
-        for t in self.trades:
+        for od in self._orders:
             rows.append(
                 {
-                    "ts_code": t.ts_code,
-                    "dt": t.dt,
-                    "side": t.side,
-                    "price": t.price,
-                    "qty": t.qty,
-                    "reason": t.reason,
-                    "order_id": t.order_id,
-                    "status": t.status,
+                    "ts_code": od.ts_code,
+                    "dt": od.dt,
+                    "side": od.side,
+                    "price": od.price,
+                    "qty": od.qty,
+                    "reason": od.reason,
+                    "broker_order_id": od.broker_order_id,
                 }
             )
         return pd.DataFrame(rows)
 
 
-if __name__ == "__main__":
-    # 自测：用 dry-run 的 QmtClient 测试一笔买卖
-    client = QmtClient(dry_run=True, extra_config={"initial_cash": 100_000})
-    client.connect()
+class TickSource(Protocol):
+    """tick 数据源抽象。"""
 
-    ctx = LiveContext(client=client, ts_code="000001.SZ")
-    print("Initial account:", ctx.cash, ctx.equity)
-
-    ctx.send_order(
-        ts_code="000001.SZ",
-        side="buy",
-        price=10.0,
-        qty=1000,
-        reason="test_entry",
-        meta={},
-    )
-
-    ctx.send_order(
-        ts_code="000001.SZ",
-        side="sell",
-        price=10.5,
-        qty=1000,
-        reason="test_exit",
-        meta={},
-    )
-
-    print("Account after:", ctx.cash, ctx.equity)
-    print(ctx.trades_to_dataframe())
-
-    client.disconnect()
-
-3. live/runner.py — 实盘/仿真运行器（Tick 回放 + 策略 + LiveContext）
-
-这里我提供一个**“仿真实盘”**实现：
-使用 TickStore 中已有的 tick 数据，按时间顺序回放，并通过 LiveContext 触发 QmtClient 下单。
-你把 dry_run=False 改成实盘版本、并把数据源改成实时 pytdx，即可变成真正的实盘 loop。
-
-# live/runner.py
-from __future__ import annotations
-
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
-import time
-
-import pandas as pd
-
-from data.tick_store import TickStore
-from factors import AbuPriceLevelProvider
-from microstructure import AbuMicrostructureAnalyzer
-from strategy.abu_level_strategy import AbuKeyLevelStrategy
-from .qmt_client import QmtClient
-from .context import LiveContext
+    def iter_ticks(self, ts_code: str, trade_dates: Iterable[date]) -> Iterable[Dict[str, Any]]:
+        ...
 
 
-class LiveRunner:
-    """
-    实盘 / 仿真运行器：
+class TickStoreSource:
+    """基于 TickStore 的简单 tick 源，用于回放/仿真实盘。"""
 
-    当前版本：使用 TickStore 回放某日某票的 tick 数据，
-    让 AbuKeyLevelStrategy + LiveContext 跑一遍完整流程。
+    def __init__(self, store: Optional[TickStore] = None) -> None:
+        self.store = store or TickStore()
 
-    将来接入实盘：
-        - 把 tick 源改成 pytdx 实时推送/轮询
-        - QmtClient 设置 dry_run=False，填入你的真实 qmtmini 调用
+    def iter_ticks(self, ts_code: str, trade_dates: Iterable[date]) -> Iterable[Dict[str, Any]]:
+        for d in trade_dates:
+            df = self.store.load_ticks(ts_code, d)
+            if df is None or df.empty:
+                continue
+            df = df.sort_values("datetime").reset_index(drop=True)
+            for _, row in df.iterrows():
+                dt = row["datetime"]
+                if not isinstance(dt, datetime):
+                    dt = pd.to_datetime(dt).to_pydatetime()
+                yield {
+                    "ts_code": ts_code,
+                    "datetime": dt,
+                    "price": float(row["price"]),
+                    "volume": int(row.get("volume", 0)),
+                    "side": row.get("side", "N"),
+                }
+
+
+class LiveEngine:
+    """实盘引擎（Tick 驱动）。
+
+    当前实现主要用于：
+        - 使用 DummyBroker / QmtBroker(dry_run=True) 做仿真实盘；
+        - 将 TickStore 的历史 tick 当作“实时”来源，验证策略 + 风控 + Broker 链路。
     """
 
     def __init__(
         self,
-        ts_code: str,
-        dry_run: bool = True,
-        qmt_config: Optional[Dict[str, Any]] = None,
-        strategy_config: Optional[Dict[str, Any]] = None,
+        strategy: AbuKeyLevelStrategy,
+        broker: Optional[BrokerBase] = None,
+        risk_manager: Optional[RiskManager] = None,
+        tick_source: Optional[TickSource] = None,
     ) -> None:
-        self.ts_code = ts_code
-        self.dry_run = dry_run
-        self.qmt_config = qmt_config or {}
-        self.strategy_config = strategy_config or {}
-
-        self.tick_store = TickStore()
-        self.price_level_provider = AbuPriceLevelProvider()
-        self.micro_analyzer = AbuMicrostructureAnalyzer()
-
-        self.client = QmtClient(
-            dry_run=self.dry_run,
-            extra_config=self.qmt_config,
+        self.strategy = strategy
+        self.broker = broker or DummyBroker(initial_cash=1_000_000.0)
+        self.risk_manager = risk_manager or RiskManager()
+        self.tick_source = tick_source or TickStoreSource()
+        self.ctx = LiveStrategyContext(
+            broker=self.broker,
+            risk_manager=self.risk_manager,
         )
 
-        self.ctx = LiveContext(
-            client=self.client,
-            ts_code=self.ts_code,
-        )
-
-        self.strategy = AbuKeyLevelStrategy(
-            ts_code=self.ts_code,
-            price_level_provider=self.price_level_provider,
-            micro_analyzer=self.micro_analyzer,
-            config=self.strategy_config,
-        )
-
-    def run_replay(
-        self,
-        trade_date: date,
-        speed: float = 0.0,
-    ) -> None:
-        """
-        用 TickStore 的数据回放某一交易日的 tick。
-
-        speed:
-            - 0.0: 尽快跑完（仅用于调试）
-            - >0: 每个 tick 之间 sleep 的秒数（模拟实时节奏）
-        """
-        self.client.connect()
-
-        df = self.tick_store.load_ticks(self.ts_code, trade_date)
-        if df is None or df.empty:
-            print(f"[LiveRunner] no tick data for {self.ts_code} {trade_date}")
-            self.client.disconnect()
-            return
-
-        df = df.sort_values("datetime").reset_index(drop=True)
-
-        print(
-            f"[LiveRunner] start replay {self.ts_code} {trade_date}, "
-            f"ticks={len(df)}, dry_run={self.dry_run}"
-        )
-
-        for _, row in df.iterrows():
-            tick = self._row_to_tick(row)
-            # 把当前 tick 时间放进 meta，方便 LiveContext 记录
-            tick_meta = {"dt": tick["datetime"]}
-            # AbuKeyLevelStrategy 不用 meta 参数，所以我们只能在 ctx.send_order 里补上
-            # 这里的处理是：策略 on_tick 正常跑，ctx 在 send_order 时自己填 dt=now 或 meta["dt"]
-
+    def run_replay(self, ts_code: str, trade_dates: Iterable[date]) -> pd.DataFrame:
+        """使用 TickStore 源回放若干个交易日的 tick。"""
+        for tick in self.tick_source.iter_ticks(ts_code, trade_dates):
+            # 将 tick 交给策略；策略在内部通过 ctx.send_order 下单
             self.strategy.on_tick(tick, self.ctx)
 
-            if speed > 0:
-                time.sleep(speed)
-
-        print(f"[LiveRunner] replay finished. Trades:")
-        print(self.ctx.trades_to_dataframe())
-
-        self.client.disconnect()
-
-    def _row_to_tick(self, row: pd.Series) -> Dict[str, Any]:
-        dt = row["datetime"]
-        if not isinstance(dt, datetime):
-            dt = pd.to_datetime(dt).to_pydatetime()
-
-        return {
-            "ts_code": self.ts_code,
-            "datetime": dt,
-            "price": float(row["price"]),
-            "volume": int(row.get("volume", 0)),
-            "side": row.get("side", "N"),
-        }
+        # 返回订单日志 DataFrame，方便调试/存盘
+        return self.ctx.orders_to_dataframe()
 
 
 if __name__ == "__main__":
-    # 自测：如果 TickStore 中有某票某日的 tick，可以跑一遍回放（dry_run，不会真下单）
+    # 自测：如果 TickStore 中存在某只股票的 tick 文件，可以跑一遍回放
     from datetime import timedelta
 
-    ts = "000001.SZ"
+    ts_code = "000001.SZ"
     today = date.today()
-    d = today - timedelta(days=1)
+    trade_dates = [today - timedelta(days=1)]
 
-    runner = LiveRunner(
-        ts_code=ts,
-        dry_run=True,
-        qmt_config={"initial_cash": 100_000},
-        strategy_config={"min_signal_score": 60.0},
+    from factors import AbuPriceLevelProvider
+    from microstructure import AbuMicrostructureAnalyzer
+
+    pl_provider = AbuPriceLevelProvider()
+    micro = AbuMicrostructureAnalyzer()
+    strat = AbuKeyLevelStrategy(
+        ts_code=ts_code,
+        price_level_provider=pl_provider,
+        micro_analyzer=micro,
+        config=None,
     )
-    runner.run_replay(trade_date=d, speed=0.0)
 
-4. live/__init__.py
+    engine = LiveEngine(strategy=strat)
+    df_orders = engine.run_replay(ts_code, trade_dates)
+    print("[selftest] orders from replay:")
+    print(df_orders)
+
+5. live/__init__.py — live 包导出
 # live/__init__.py
 """
 实盘相关模块入口。
+
+包含：
+- BrokerBase / DummyBroker / QmtBroker
+- LiveEngine / LiveStrategyContext 等
 """
 
-from .qmt_client import QmtClient, QmtOrder
-from .context import LiveContext, LiveTradeRecord
-from .runner import LiveRunner
+from .broker_base import BrokerBase, DummyBroker, BrokerOrder
+from .broker_qmt import QmtBroker
+from .live_engine import LiveEngine, LiveStrategyContext, LiveOrderLog, TickStoreSource
 
 __all__ = [
-    "QmtClient",
-    "QmtOrder",
-    "LiveContext",
-    "LiveTradeRecord",
-    "LiveRunner",
+    "BrokerBase",
+    "DummyBroker",
+    "BrokerOrder",
+    "QmtBroker",
+    "LiveEngine",
+    "LiveStrategyContext",
+    "LiveOrderLog",
+    "TickStoreSource",
 ]
 
-
 if __name__ == "__main__":
-    print("live package self-test, exports:", __all__)
+    print("live package exports:", __all__)
 
-5. ui/streamlit_app.py — Streamlit 可视化（K 线 + 关键位）
+怎么在你现在的框架里用阶段 5
 
-一个简洁的可视化应用：
+一个典型的仿真实盘（不真下单，只打印+Dummy 资金）的用法：
 
-左侧选股票、日期区间；
+from datetime import date, timedelta
 
-从 stock_daily 读 K 线，从 price_levels_daily 读阿布关键位；
-
-用 Plotly 画出 K 线 + 关键位水平线；
-
-底部表格展示关键位信息。
-
-需要依赖：streamlit、plotly。
-你可以用 pip install streamlit plotly 安装。
-
-# ui/streamlit_app.py
-from __future__ import annotations
-
-from datetime import date
-from typing import List
-
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-from sqlalchemy import text
-
-from db.connection import get_session
-from data.repository import get_all_stock_basics
 from factors import AbuPriceLevelProvider
+from microstructure import AbuMicrostructureAnalyzer
+from strategy.abu_level_strategy import AbuKeyLevelStrategy
+from live import LiveEngine, QmtBroker  # 或 DummyBroker
+
+ts_code = "000001.SZ"
+today = date.today()
+trade_dates = [today - timedelta(days=1)]
+
+pl_provider = AbuPriceLevelProvider()
+micro = AbuMicrostructureAnalyzer()
+strategy = AbuKeyLevelStrategy(
+    ts_code=ts_code,
+    price_level_provider=pl_provider,
+    micro_analyzer=micro,
+    config=None,
+)
+
+# 目前 qmt 没测好，可以直接用 QmtBroker(dry_run=True) 或 DummyBroker
+broker = QmtBroker(dry_run=True, config={"initial_cash": 100_000})
+engine = LiveEngine(strategy=strategy, broker=broker)
+
+df_orders = engine.run_replay(ts_code, trade_dates)
+print(df_orders)
 
 
-def load_daily_bars(ts_code: str, start: date, end: date) -> pd.DataFrame:
-    with get_session() as session:
-        sql = text(
-            """
-            select trade_date, open, high, low, close, volume, amount
-            from stock_daily
-            where ts_code = :ts
-              and trade_date between :start and :end
-            order by trade_date
-            """
-        )
-        df = pd.read_sql(
-            sql,
-            session.get_bind(),
-            params={"ts": ts_code, "start": start, "end": end},
-        )
-    if df.empty:
-        return df
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    return df
+这样你就有了一条完整链路：
 
-
-def load_price_levels(ts_code: str, trade_date: date) -> pd.DataFrame:
-    plp = AbuPriceLevelProvider()
-    levels = plp.get_levels(ts_code, trade_date)
-    if not levels:
-        return pd.DataFrame(
-            columns=[
-                "ts_code",
-                "trade_date",
-                "level_price",
-                "level_type",
-                "direction",
-                "strength",
-                "source_flags",
-            ]
-        )
-    rows = []
-    for lv in levels:
-        rows.append(
-            {
-                "ts_code": lv.ts_code,
-                "trade_date": lv.trade_date,
-                "level_price": lv.level_price,
-                "level_type": lv.level_type,
-                "direction": lv.direction,
-                "strength": lv.strength,
-                "source_flags": ",".join(lv.source_flags or []),
-            }
-        )
-    df = pd.DataFrame(rows)
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    return df
-
-
-def main() -> None:
-    st.set_page_config(
-        page_title="A股阿布关键位策略可视化",
-        layout="wide",
-    )
-
-    st.title("A股阿布价格理论关键位可视化")
-
-    # ---------- 左侧选择股票 & 日期 ----------
-
-    basics = get_all_stock_basics()
-    if not basics:
-        st.error("stock_basic 为空，请先跑数据更新任务。")
-        return
-
-    ts_codes: List[str] = [b.ts_code for b in basics]
-    names: List[str] = [f"{b.ts_code} {b.name}" for b in basics]
-    code_to_name = dict(zip(ts_codes, names))
-
-    ts = st.sidebar.selectbox("选择股票", options=ts_codes, format_func=lambda x: code_to_name.get(x, x))
-
-    today = date.today()
-    start = st.sidebar.date_input("开始日期", value=today.replace(year=today.year - 1))
-    end = st.sidebar.date_input("结束日期", value=today)
-
-    level_date = st.sidebar.date_input("关键位日期（通常选最近一个交易日）", value=end)
-
-    st.sidebar.write("---")
-    st.sidebar.write("提示：")
-    st.sidebar.write("1. 先用数据更新任务拉取日线和关键位。")
-    st.sidebar.write("2. 实盘/回测逻辑由后端模块完成，这里只负责可视化。")
-
-    # ---------- 加载数据 ----------
-
-    with st.spinner("加载日线数据..."):
-        df_ohlc = load_daily_bars(ts, start, end)
-
-    if df_ohlc.empty:
-        st.warning("选定区间内无日线数据。")
-        return
-
-    with st.spinner("加载关键位数据..."):
-        df_levels = load_price_levels(ts, level_date)
-
-    # ---------- 绘制 K 线 + 关键位 ----------
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df_ohlc["trade_date"],
-            open=df_ohlc["open"],
-            high=df_ohlc["high"],
-            low=df_ohlc["low"],
-            close=df_ohlc["close"],
-            name="K线",
-        )
-    )
-
-    if not df_levels.empty:
-        # 按方向分别画
-        for direction, color in [("support", "green"), ("resistance", "red"), ("neutral", "blue")]:
-            sub = df_levels[df_levels["direction"] == direction]
-            for _, row in sub.iterrows():
-                fig.add_hline(
-                    y=row["level_price"],
-                    line=dict(color=color, width=1, dash="dot"),
-                    annotation_text=f"{direction} | {row['level_type']} | {row['strength']}",
-                    annotation_position="right",
-                )
-
-    fig.update_layout(
-        xaxis_title="日期",
-        yaxis_title="价格",
-        xaxis_rangeslider_visible=False,
-        height=600,
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ---------- 关键位表格 ----------
-
-    st.subheader(f"{ts} {level_date} 关键价格列表")
-    if df_levels.empty:
-        st.info("该日尚未计算关键位。请先跑 AbuPriceLevelProvider.precompute(trade_date)。")
-    else:
-        st.dataframe(
-            df_levels.sort_values("level_price"),
-            use_container_width=True,
-        )
-
-
-if __name__ == "__main__":
-    # 直接 python ui/streamlit_app.py 时给出提示
-    print(
-        "请用命令运行 Streamlit 应用：\n\n"
-        "    streamlit run ui/streamlit_app.py\n"
-    )
-    # 也可以直接调用 main() 在命令行调试数据加载逻辑
-    # main()
-
-怎么把阶段 4 跑起来（简要）
-
-安装新依赖（如果还没装）：
-
-pip install streamlit plotly pyarrow
-
-
-仿真“实盘跑策略”（不下真单）：
-
-python -m live.runner
-
-
-（确保 TickStore 下有对应 ts_code + trade_date 的 tick 文件）
-
-查看 K 线 + 关键位：
-
-streamlit run ui/streamlit_app.py
+TickStore → AbuKeyLevelStrategy(on_tick) → LiveStrategyContext.send_order → RiskManager → Broker(Dummy / Qmt dry-run) → 打印订单 & 内存记账
