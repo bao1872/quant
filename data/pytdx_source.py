@@ -59,13 +59,11 @@ class PytdxDataSource(DataSource):
             ("218.108.98.244", 7709),
         ]
         for ip, port in candidates:
-            try:
-                if self.api.connect(ip, port):
-                    self.api.disconnect()
-                    return ip, port
-            except Exception:
-                pass
-        return ("119.147.164.60", 7709)
+            ok = self.api.connect(ip, port)
+            if ok:
+                self.api.disconnect()
+                return ip, port
+        return candidates[0]
 
     def disconnect(self) -> None:
         if self._connected:
@@ -221,6 +219,95 @@ class PytdxDataSource(DataSource):
         wanted = ["ts_code", "datetime", "price", "volume", "amount", "time", "side"]
         cols = [c for c in wanted if c in df.columns or c in ["ts_code", "datetime"]]
         return df[cols]
+
+    def fetch_all_stock_list(self) -> pd.DataFrame:
+        self.connect()
+        all_rows = []
+        for market, exch in [(MARKET_SZ, "SZ"), (MARKET_SH, "SH")]:
+            step = 1000
+            start = 0
+            while True:
+                data = self.api.get_security_list(market=market, start=start)
+                if not data:
+                    break
+                df = pd.DataFrame(data)
+                if df.empty:
+                    break
+                df["exchange"] = exch
+                cols = [c for c in ["code", "name", "exchange"] if c in df.columns]
+                all_rows.append(df[cols])
+                if len(df) < step:
+                    break
+                start += step
+        if not all_rows:
+            return pd.DataFrame(columns=["code", "name", "exchange"])
+        out = pd.concat(all_rows, ignore_index=True)
+        out["code"] = out["code"].astype(str)
+        out["name"] = out["name"].astype(str)
+        out["exchange"] = out["exchange"].astype(str)
+        return out
+
+    def fetch_finance_info(self, ts_code: str) -> pd.DataFrame:
+        self.connect()
+        market, code = self.ts_code_to_tdx(ts_code)
+        data = self.api.get_finance_info(market, code)
+        if not data:
+            return pd.DataFrame(columns=["ts_code", "total_shares", "float_shares"])
+        df = pd.DataFrame([data])
+        total = df.get("zongguben")
+        floatable = df.get("liutongguben")
+        total_val = float(total.iloc[0]) * 10000 if total is not None and len(total) > 0 else None
+        float_val = float(floatable.iloc[0]) * 10000 if floatable is not None and len(floatable) > 0 else None
+        return pd.DataFrame({"ts_code": [ts_code], "total_shares": [total_val], "float_shares": [float_val]})
+
+    def get_ticks_full_day(self, ts_code: str, trade_date: date) -> pd.DataFrame:
+        self.connect()
+        market, code = self.ts_code_to_tdx(ts_code)
+        all_rows: list = []
+        start = 0
+        step = 1000
+        while True:
+            raw = self.api.get_history_transaction_data(market, code, trade_date, start, step)
+            if not raw:
+                break
+            df = pd.DataFrame(raw)
+            if df.empty:
+                break
+            if "vol" in df.columns:
+                df = df.rename(columns={"vol": "volume"})
+            if "buyorsell" in df.columns:
+                df["side"] = df["buyorsell"].map({0: "B", 1: "S"}).fillna("N")
+            elif "bsflag" in df.columns:
+                df["side"] = df["bsflag"].astype(str)
+            else:
+                df["side"] = "N"
+            if "amount" not in df.columns and {"price", "volume"}.issubset(df.columns):
+                df["amount"] = df["price"] * df["volume"]
+            base_date = trade_date
+            if "time" in df.columns:
+                def _parse_time(t: str) -> datetime:
+                    t = str(t)
+                    if len(t) == 5:
+                        fmt = "%Y-%m-%d %H:%M"
+                    elif len(t) == 8:
+                        fmt = "%Y-%m-%d %H:%M:%S"
+                    else:
+                        t = t[:5]
+                        fmt = "%Y-%m-%d %H:%M"
+                    return datetime.strptime(f"{base_date.strftime('%Y-%m-%d')} {t}", fmt)
+                df["datetime"] = df["time"].apply(_parse_time)
+            else:
+                df["datetime"] = datetime.combine(base_date, datetime.min.time())
+            df["ts_code"] = ts_code
+            all_rows.append(df[["ts_code", "datetime", "price", "volume", "amount", "time", "side"]].copy())
+            if len(df) < step:
+                break
+            start += step
+        if not all_rows:
+            return pd.DataFrame(columns=["ts_code", "datetime", "price", "volume", "amount", "time", "side"])
+        out = pd.concat(all_rows, ignore_index=True)
+        out = out.sort_values("datetime").reset_index(drop=True)
+        return out
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ def update_daily_bars(
     print(f"[update_daily_bars] Start for {len(ts_codes)} stocks, trade_date={trade_date}")
 
     with PytdxDataSource() as ds:
-        for i, ts_code in enumerate(tqdm(ts_codes, desc="daily"), start=1):
+        for i, ts_code in enumerate(tqdm(ts_codes, desc="daily", unit="stk"), start=1):
             last_date = repository.get_last_trade_date_for_stock(ts_code)
             df = ds.get_daily_bars(ts_code, count=count)
             if df.empty:
@@ -96,7 +96,7 @@ def update_minute_bars(
     )
 
     with PytdxDataSource() as ds:
-        for ts_code in tqdm(ts_codes, desc="minute"):
+        for ts_code in tqdm(ts_codes, desc="minute", unit="stk"):
             df = ds.get_minute_bars(ts_code, freq=freq, count=count)
             if df.empty:
                 continue
@@ -125,12 +125,12 @@ def collect_intraday_ticks(
     )
 
     with PytdxDataSource() as ds:
-        for ts_code in tqdm(ts_codes, desc="ticks"):
+        for ts_code in tqdm(ts_codes, desc="ticks", unit="stk"):
             tick_limit = (settings.tick_count_limit if settings is not None else TICK_COUNT_LIMIT) or count
             df_tick = ds.get_ticks(ts_code, trade_date=trade_date, count=tick_limit)
             if df_tick.empty:
                 continue
-            store.save_ticks(ts_code, trade_date, df_tick)
+            store.save_ticks(ts_code, trade_date, df_tick, already_sorted=True)
 
     print("[collect_intraday_ticks] Done.")
 
@@ -144,3 +144,37 @@ if __name__ == "__main__":
 
     # 为了安全起见，这里只更新日线，不去更新分钟和 tick（避免短时间大量请求）
     update_daily_bars(trade_date=today, count=50)
+
+def update_stock_basic(settings: Optional[Settings] = None) -> int:
+    with PytdxDataSource() as ds:
+        df_all = ds.fetch_all_stock_list()
+    if df_all.empty:
+        return 0
+    df_all["code"] = df_all["code"].astype(str)
+    df_all["exchange"] = df_all["exchange"].astype(str)
+    df_all["name"] = df_all["name"].astype(str)
+    name_upper = df_all["name"].str.upper()
+    is_st = name_upper.str.contains("ST")
+    is_sz = df_all["exchange"].str.upper().eq("SZ")
+    is_sh = df_all["exchange"].str.upper().eq("SH")
+    sz_code = df_all["code"].str.slice(0, 3)
+    sh_code = df_all["code"].str.slice(0, 3)
+    sz_ok = is_sz & (sz_code.isin(["000", "001", "002", "003", "004", "300", "301"]))
+    sh_ok = is_sh & (sh_code.isin(["600", "601", "603", "605", "688"]))
+    df_filt = df_all[(sz_ok | sh_ok) & (~is_st)].copy()
+    n = repository.upsert_stock_basic(df_filt)
+    return n
+
+def collect_full_day_ticks(trade_date: date, settings: Optional[Settings] = None) -> None:
+    basics = repository.get_all_stock_basics()
+    ts_codes = [s.ts_code for s in basics]
+    from .tick_store import TickStore
+    store = TickStore(settings=settings)
+    print(f"[collect_full_day_ticks] Start for {len(ts_codes)} stocks, trade_date={trade_date}")
+    with PytdxDataSource() as ds:
+        for ts_code in tqdm(ts_codes, desc="ticks_full", unit="stk"):
+            df_tick = ds.get_ticks_full_day(ts_code, trade_date)
+            if df_tick.empty:
+                continue
+            store.save_ticks(ts_code, trade_date, df_tick, already_sorted=True)
+    print("[collect_full_day_ticks] Done.")

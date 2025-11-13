@@ -58,6 +58,37 @@ def get_all_stock_basics() -> List[StockBasic]:
         return [StockBasic("000001.SZ")]
 
 
+def upsert_stock_basic(df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        return 0
+    eng = get_engine()
+    if eng is None:
+        with get_session() as session:
+            return len(df)
+    existing = pd.DataFrame()
+    if _table_exists(eng, "stock_basic"):
+        existing = pd.read_sql("select ts_code, code, exchange, name from stock_basic", eng)
+    df = df.copy()
+    df["ts_code"] = df["code"].astype(str) + "." + df["exchange"].astype(str)
+    df = df[["ts_code", "code", "exchange", "name"]]
+    to_insert = df
+    to_delete = pd.DataFrame(columns=["ts_code"])
+    if not existing.empty:
+        merged = existing.merge(df, on=["ts_code"], how="outer", indicator=True, suffixes=("_old", ""))
+        changed = merged[(merged["_merge"] == "both") & (merged["name_old"] != merged["name"])]["ts_code"].dropna()
+        new_codes = merged[merged["_merge"] == "right_only"]["ts_code"].dropna()
+        to_delete = pd.concat([changed]).to_frame(name="ts_code")
+        to_insert = df[df["ts_code"].isin(pd.concat([changed, new_codes]).astype(str))]
+    with eng.begin() as conn:
+        if not to_delete.empty and _table_exists(eng, "stock_basic"):
+            payload = [{"code": c} for c in to_delete["ts_code"].astype(str).tolist()]
+            if payload:
+                conn.execute(text("delete from stock_basic where ts_code = :code"), payload)
+        if not to_insert.empty:
+            to_insert.to_sql("stock_basic", eng, if_exists="append", index=False)
+    return len(to_insert)
+
+
 # -------- StockDaily --------
 
 def get_last_trade_date_for_stock(ts_code: str) -> Optional[date]:
