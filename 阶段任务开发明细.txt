@@ -1,490 +1,820 @@
-1. 回测引擎空头仓位的现金 & 权益计算有 bug（需要优先修）
+阶段 4 目标（按我们之前的规划）：
 
-文件：backtest/engine.py 中 BacktestContext
+实盘交易接入：用 qmtmini 做下单，但通过一个统一的 Context 接口，和回测完全复用同一套策略逻辑。
 
-现状问题
+实盘/仿真运行器：把 tick 数据源 + 策略 + 实盘上下文串起来。
 
-现在的逻辑大致是：
+可视化前端（Streamlit）：查看 K 线 + 阿布关键位、简单回测/交易结果展示。
 
-开多：
+下面这些是「阶段 4 新增/重要文件」：
 
-self.cash -= price * qty
-self.position_side = "long"
-self.position_price = price
+live/qmt_client.py — 封装 qmtmini 的交易客户端（默认 dry-run，方便你先联调）
 
+live/context.py — 实盘上下文（LiveContext），接口与回测 BacktestContext 对齐
 
-平多（在 side == "sell" and position_side == "long" 分支）：
+live/runner.py — 实盘/仿真运行器（用 TickStore 回放 + LiveContext + 策略）
 
-pnl = (price - self.position_price) * self.position_qty
-self.cash += self.position_qty * self.position_price + pnl
+live/__init__.py
 
+ui/streamlit_app.py — Streamlit 可视化：K 线 + 阿布关键位
 
-开空：
+你可以按文件名直接放进当前仓库对应目录。
 
-proceeds = price * qty
-self.cash += proceeds
-self.position_side = "short"
-self.position_price = price
+1. live/qmt_client.py — qmtmini 封装（支持 dry-run）
+# live/qmt_client.py
+from __future__ import annotations
 
-
-平空（在 side == "buy" and position_side == "short" 分支）：
-
-pnl = (self.position_price - price) * self.position_qty
-self.cash += self.position_qty * self.position_price + pnl
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+import threading
+import time
+import uuid
 
 
-这样会有两个问题：
-
-多头平仓时现金多加了一次开仓成本
-正确做法是「开仓时减成本、平仓时只加平仓成交额」，不需要再加开仓价 * 数量。
-
-空头的现金和权益都算错了
-
-开空时已经把 proceeds = P0 * Q 加到 cash 里。
-
-平空时再 cash += P0 * Q + pnl，等于又把开仓收入加了一遍。
-
-_update_equity 里对空头是：
-
-if self.position_side == "long":
-    pos_value = current_price * qty
-else:
-    pos_value = self.position_price * qty
+@dataclass
+class QmtOrder:
+    order_id: str
+    ts_code: str
+    side: str      # "buy" / "sell"
+    price: float
+    qty: int
+    status: str    # "new" / "filled" / "rejected"
+    remark: str
 
 
-对空头来说，这个 pos_value 应该是 负的当前市值，而不是开仓价 * 数量。
+class QmtClient:
+    """
+    qmtmini 封装。
 
-我在本地简单模拟了一下（开空 10 元 100 股，9 元平仓），当前实现的结果是：
+    当前默认实现为 dry-run（只记录订单，不真正发给券商），你可以在标记 TODO
+    的地方替换为你自己的 qmtmini 接口调用。
 
-初始 cash = 100000
+    预期能力：
+        - connect / disconnect
+        - get_account_info: 返回现金、总资产等
+        - get_positions: 返回持仓列表
+        - place_order: 下单（市价/限价），返回 order_id
+    """
 
-开空后 cash = 101000
+    def __init__(
+        self,
+        account_id: Optional[str] = None,
+        dry_run: bool = True,
+        extra_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.account_id = account_id or "default"
+        self.dry_run = dry_run
+        self.extra_config = extra_config or {}
+        self._connected = False
+        self._lock = threading.Lock()
+        self._orders: List[QmtOrder] = []
 
-平空后 cash = 102100（多出来 2000），但记录的 pnl 只有 100 —— 这就是典型的算错。
+        # dry-run 下的模拟资金与持仓
+        self._cash = float(self.extra_config.get("initial_cash", 1_000_000.0))
+        self._equity = self._cash
+        self._positions: Dict[str, Dict[str, Any]] = {}  # ts_code -> {qty, cost}
 
-建议修改方案
+    # -------------------- 连接 / 断开 --------------------
 
-把逻辑改成现金流 + 市值一致的版本：
+    def connect(self) -> None:
+        """
+        建立与 qmtmini 的连接。
 
-class BacktestContext:
-    ...
+        TODO: 在这里替换为你的真实 qmtmini 登录逻辑。
+        """
+        if self._connected:
+            return
+        # 真实环境：调用 qmtmini 的登录/连接接口
+        # 例如：self._api = miniqmt.Xxx(...); self._api.connect()
+        self._connected = True
+        print(f"[QmtClient] connected (dry_run={self.dry_run})")
 
-    def send_order(self, ts_code: str, side: str, price: float, qty: int, reason: str, meta: Dict[str, Any]) -> None:
+    def disconnect(self) -> None:
+        """
+        断开连接。
+        """
+        if not self._connected:
+            return
+        # TODO: 调用 qmtmini 的断开接口
+        self._connected = False
+        print("[QmtClient] disconnected")
+
+    # -------------------- 账户 / 持仓 --------------------
+
+    def get_account_info(self) -> Dict[str, Any]:
+        """
+        返回账户资金信息。
+        真正接入时，用 qmtmini 的资金查询结果替换这里的实现。
+        """
+        if not self._connected:
+            raise RuntimeError("QmtClient not connected")
+
+        if not self.dry_run:
+            # TODO: 调用 qmtmini 查询资金
+            # 返回格式尽量与当前保持一致：{"cash": ..., "equity": ...}
+            pass
+
+        return {
+            "account_id": self.account_id,
+            "cash": self._cash,
+            "equity": self._equity,
+        }
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """
+        返回当前持仓列表。
+        """
+        if not self._connected:
+            raise RuntimeError("QmtClient not connected")
+
+        if not self.dry_run:
+            # TODO: 调用 qmtmini 查询持仓
+            pass
+
+        res: List[Dict[str, Any]] = []
+        for ts_code, pos in self._positions.items():
+            res.append(
+                {
+                    "ts_code": ts_code,
+                    "qty": pos["qty"],
+                    "cost": pos["cost"],
+                }
+            )
+        return res
+
+    # -------------------- 下单 --------------------
+
+    def place_order(
+        self,
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        order_type: str = "limit",
+        remark: str = "",
+    ) -> str:
+        """
+        下单接口。
+
+        side: "buy" / "sell"
+        order_type: "limit" / "market"（当前实现统一按成交价处理）
+        """
+        if not self._connected:
+            raise RuntimeError("QmtClient not connected")
+
         price = float(price)
         qty = int(qty)
-        dt = meta.get("dt", pd.Timestamp.now())
+        order_id = uuid.uuid4().hex
 
-        if side == "buy":
-            if self.position_side is None:
-                # 开多
-                cost = price * qty
-                if cost > self.cash:
-                    return
-                self.cash -= cost
-                self.position_side = "long"
-                self.position_qty = qty
-                self.position_price = price
-                self.position_open_dt = pd.Timestamp(dt)
+        with self._lock:
+            order = QmtOrder(
+                order_id=order_id,
+                ts_code=ts_code,
+                side=side,
+                price=price,
+                qty=qty,
+                status="new",
+                remark=remark,
+            )
+            self._orders.append(order)
 
-            elif self.position_side == "short":
-                # 平空
-                if qty != self.position_qty:
-                    # 简化：当前版本只支持一次性全平
-                    return
-                pnl = (self.position_price - price) * self.position_qty
-                # 平空实际上是用 cash 去回购股票
-                self.cash -= price * self.position_qty
-                self.trades.append(
-                    TradeRecord(
-                        ts_code=ts_code,
-                        side="cover",
-                        entry_dt=self.position_open_dt or pd.Timestamp(dt),
-                        exit_dt=pd.Timestamp(dt),
-                        entry_price=self.position_price,
-                        exit_price=price,
-                        pnl=pnl,
-                        reason=reason,
-                    )
-                )
-                self.position_side = None
-                self.position_qty = 0
-                self.position_price = 0.0
-                self.position_open_dt = None
+            if self.dry_run:
+                # 在 dry-run 下，我们直接假设以提交价格全部成交。
+                self._simulate_fill(order)
+            else:
+                # TODO: 在这里调用 qmtmini 的实单下单接口，
+                #       并根据回报更新 self._orders / self._positions / self._cash / self._equity
+                self._simulate_fill(order)  # 在你接真实接口前，保留这个方便调试
 
-        elif side == "sell":
-            if self.position_side is None:
-                # 开空
-                proceeds = price * qty
-                self.cash += proceeds
-                self.position_side = "short"
-                self.position_qty = qty
-                self.position_price = price
-                self.position_open_dt = pd.Timestamp(dt)
+        print(f"[QmtClient] order placed: {order}")
+        return order_id
 
-            elif self.position_side == "long":
-                # 平多
-                if qty != self.position_qty:
-                    # 简化：当前版本只支持一次性全平
-                    return
-                pnl = (price - self.position_price) * self.position_qty
-                # 平多收回平仓价 * 数量
-                self.cash += price * self.position_qty
-                self.trades.append(
-                    TradeRecord(
-                        ts_code=ts_code,
-                        side="sell",
-                        entry_dt=self.position_open_dt or pd.Timestamp(dt),
-                        exit_dt=pd.Timestamp(dt),
-                        entry_price=self.position_price,
-                        exit_price=price,
-                        pnl=pnl,
-                        reason=reason,
-                    )
-                )
-                self.position_side = None
-                self.position_qty = 0
-                self.position_price = 0.0
-                self.position_open_dt = None
+    # -------------------- dry-run 填充逻辑 --------------------
 
-        self._update_equity(current_price=price)
+    def _simulate_fill(self, order: QmtOrder) -> None:
+        """
+        在 dry-run 或未接真接口时，用简单规则模拟成交并更新资金与持仓。
+        """
+        if order.status == "filled":
+            return
 
-    def _update_equity(self, current_price: float) -> None:
-        pos_value = 0.0
-        if self.position_side is not None and self.position_qty > 0:
-            if self.position_side == "long":
-                pos_value = current_price * self.position_qty
-            elif self.position_side == "short":
-                # 空头仓位的市值是负的
-                pos_value = -current_price * self.position_qty
-        self.equity = self.cash + pos_value
+        ts_code = order.ts_code
+        price = order.price
+        qty = order.qty
 
+        # 买入时，减少现金、增加持仓
+        if order.side == "buy":
+            cost = price * qty
+            if cost > self._cash:
+                order.status = "rejected"
+                order.remark += " | insufficient cash"
+                return
 
-这样：
+            self._cash -= cost
+            pos = self._positions.get(ts_code, {"qty": 0, "cost": 0.0})
+            total_qty = pos["qty"] + qty
+            if total_qty > 0:
+                pos["cost"] = (pos["cost"] * pos["qty"] + cost) / total_qty
+            pos["qty"] = total_qty
+            self._positions[ts_code] = pos
+            order.status = "filled"
 
-多头：
+        elif order.side == "sell":
+            pos = self._positions.get(ts_code, {"qty": 0, "cost": 0.0})
+            if qty > pos["qty"]:
+                order.status = "rejected"
+                order.remark += " | insufficient position"
+                return
+            proceeds = price * qty
+            self._cash += proceeds
+            pos["qty"] -= qty
+            if pos["qty"] <= 0:
+                self._positions.pop(ts_code, None)
+            else:
+                self._positions[ts_code] = pos
+            order.status = "filled"
 
-开仓：cash -= P0 * Q；
+        self._equity = self._cash  # 简化：不计未实现盈亏
 
-平仓：cash += Pc * Q；
+    # -------------------- 工具 --------------------
 
-最终 cash = 初始 + (Pc - P0) * Q。
+    def get_orders(self) -> List[QmtOrder]:
+        with self._lock:
+            return list(self._orders)
 
-空头：
-
-开仓：cash += P0 * Q；
-
-平仓：cash -= Pc * Q；
-
-最终 cash = 初始 + (P0 - Pc) * Q。
-
-_update_equity 对任意时刻都满足：equity = initial_cash + 已实现PnL + 未实现PnL。
-
-2. 多日回测时，策略内部 _position 与回测上下文仓位状态不一致
-
-文件：strategy/abu_level_strategy.py，方法 _on_new_day & on_tick
-文件：backtest/engine.py，TickBacktester.run
-
-现状
-
-AbuKeyLevelStrategy._on_new_day 中：
-
-def _on_new_day(self, trade_date: date) -> None:
-    self._current_trade_date = trade_date
-    self._tick_buffer = []
-    self._position = None  # 简化：日内策略，每天收盘不留 overnight
-    ...
-
-
-也就是说策略内部状态认为“新的一天不留仓”。
-
-但 TickBacktester.run 的循环是：
-
-ctx = BacktestContext(...)
-strat = AbuKeyLevelStrategy(...)
-for d in trade_dates:
-    df_ticks = tick_store.load_ticks(...)
-    for row in df_ticks.to_dict("records"):
-        strat.on_tick(row, ctx)
-
-
-回测上下文 ctx 是跨多天复用的；
-
-每天结束时并没有做「强制平仓」；
-
-如果某天最后一个 tick 时还持仓，第二天 _on_new_day 会把 self._position 清掉，但 ctx 里的真实仓位还在。
-
-造成的问题
-
-多日回测时，会出现：
-
-策略内部认为已经「日内清仓」；
-
-回测上下文仍然有持仓，权益在按旧仓位标记市值；
-
-之后再产生信号，很可能会产生与实盘不一致的仓位行为。
-
-建议改法（两种方案，选一种）
-
-方案 A：策略明确支持「隔夜持仓」，就不要在 _on_new_day 里清 _position
-
-把 _on_new_day 中的 self._position = None 去掉；
-
-让平仓动作完全由 _handle_existing_position 的止损/止盈逻辑完成；
-
-这样：strategy 层和 context 层的状态始终是一致的。
-
-方案 B：保持「日内策略」的设定，在回测引擎里增加 EOD 强制平仓
-
-例如在 TickBacktester.run 中每天循环末尾加一个「收盘时刻」回调：
-
-class TickBacktester:
-    ...
-    def run(...):
-        ctx = BacktestContext(initial_cash=self.initial_cash)
-        strat = AbuKeyLevelStrategy(...)
-
-        for d in trade_dates:
-            df_ticks = self.tick_store.load_ticks(...)
-            if df_ticks.empty:
-                continue
-
-            last_price = None
-            last_dt = None
-
-            for row in df_ticks.to_dict("records"):
-                tick_dt = row["datetime"]
-                price = float(row["price"])
-                last_price = price
-                last_dt = tick_dt
-                strat.on_tick(row, ctx)
-
-            # 日内结束，强制平仓（若还持仓）
-            if strat._position is not None and last_price is not None:
-                pos = strat._position
-                side = "sell" if pos.side == "long" else "buy"
-                ctx.send_order(
-                    ts_code=self.ts_code,
-                    side=side,
-                    price=last_price,
-                    qty=pos.qty,
-                    reason="eod_flat",
-                    meta={"dt": last_dt, "force_flat": True},
-                )
-                strat._position = None
-
-
-不论你选 A 还是 B，一定要保证策略内部 _position 和回测/实盘上下文里的仓位状态是一致的。
-如果你觉得以后会有持仓跨日的策略，推荐用方案 A。
-
-3. strategy/__main__.py 引用的 _REGISTRY 未定义
-
-文件：strategy/__main__.py
-
-现在是：
-
-from .registry import _REGISTRY
 
 if __name__ == "__main__":
-    print("strategy package self-test")
-    print("Available strategies:", list(_REGISTRY.keys()))
+    # 简单自测
+    client = QmtClient(dry_run=True, extra_config={"initial_cash": 100_000})
+    client.connect()
+    print("Account:", client.get_account_info())
+
+    oid1 = client.place_order("000001.SZ", "buy", 10.0, 1000, remark="test_buy")
+    oid2 = client.place_order("000001.SZ", "sell", 10.5, 500, remark="test_sell")
+
+    print("Orders:", client.get_orders())
+    print("Positions:", client.get_positions())
+    print("Account after trades:", client.get_account_info())
+
+    client.disconnect()
+
+2. live/context.py — 实盘上下文（对齐策略所需接口）
+# live/context.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from .qmt_client import QmtClient, QmtOrder
 
 
-但 strategy/registry.py 中并没有 _REGISTRY 这个变量，只定义了 StrategyRegistry 类。
-这在你执行 python -m strategy 或被其他工具调用时会直接 ImportError。
-
-建议修正
-
-两种简单做法：
-
-做法 1：在 registry.py 里加一个全局注册表
-
-# registry.py 顶部或中部
-_REGISTRY = {
-    "abu_key_level": (AbuKeyLevelStrategy, AbuPriceLevelProvider, AbuMicrostructureAnalyzer),
-}
-
-class StrategyRegistry:
-    def __init__(self) -> None:
-        self._factories = _REGISTRY
-    ...
+@dataclass
+class LiveTradeRecord:
+    ts_code: str
+    dt: datetime
+    side: str          # "buy" / "sell"
+    price: float
+    qty: int
+    reason: str
+    meta: Dict[str, Any]
+    order_id: str
+    status: str
 
 
-这样 __main__.py 可以继续用 _REGISTRY。
+class LiveContext:
+    """
+    实盘上下文（用于给 AbuKeyLevelStrategy 使用），接口与 BacktestContext 尽量对齐：
 
-做法 2：不暴露 _REGISTRY，改用工厂类
+    - 属性：
+        - cash: float
+        - equity: float
+    - 方法：
+        - send_order(ts_code, side, price, qty, reason, meta)
 
-把 __main__.py 改成：
+    注意：
+        - 真实持仓 & 资金以券商为准，这里只做「轻量缓存」与日志记录；
+        - 策略风控（单笔风险、最大仓位等）在策略内完成，
+          LiveContext 只做最基本的 sanity check。
+    """
 
-from .registry import StrategyRegistry
-
-if __name__ == "__main__":
-    print("strategy package self-test")
-    reg = StrategyRegistry()
-    print("Available strategies:", list(reg._factories.keys()))
-
-
-对项目功能没影响，只是自测脚本的小问题，但最好修掉，避免未来有人依赖这个入口。
-
-4. Tick 存储依赖 parquet 引擎，需要在你的环境里安装
-
-文件：data/tick_store.py
-
-你用的是：
-
-df.to_parquet(file_path)
-pd.read_parquet(file_path)
-
-
-在我这边会报：
-
-Missing optional dependency 'pyarrow' or 'fastparquet'
-
-在你的开发/生产环境里，只要确保安装了其一即可：
-
-pip install pyarrow
-# 或者
-pip install fastparquet
-
-
-不算代码 bug，但这是一个部署时必须注意的依赖。
-
-5. DB 模型目前是「假 ORM」，打开真实 Postgres 会出问题
-
-文件：db/models.py
-
-现在的模型类似：
-
-class TickFileIndex:
-    def __init__(..., file_path, record_cnt, time_start, time_end, checksum):
+    def __init__(
+        self,
+        client: QmtClient,
+        ts_code: Optional[str] = None,
+        max_slippage_pct: float = 0.002,
+    ) -> None:
+        self.client = client
         self.ts_code = ts_code
-        ...
+        self.max_slippage_pct = float(max_slippage_pct)
+
+        self.cash: float = 0.0
+        self.equity: float = 0.0
+        self.trades: List[LiveTradeRecord] = []
+
+        self.refresh_account()
+
+    # --------------- 账户信息 ---------------
+
+    def refresh_account(self) -> None:
+        info = self.client.get_account_info()
+        self.cash = float(info.get("cash", 0.0))
+        self.equity = float(info.get("equity", self.cash))
+
+    # --------------- 策略调用的核心接口 ---------------
+
+    def send_order(
+        self,
+        ts_code: str,
+        side: str,
+        price: float,
+        qty: int,
+        reason: str,
+        meta: Dict[str, Any],
+    ) -> None:
+        """
+        策略下单接口。
+
+        side: "buy" / "sell"
+        """
+        # 若策略绑定了 ts_code，则强制一致
+        if self.ts_code is not None and ts_code != self.ts_code:
+            # 多标的实盘时，你可以改为 raise 或路由到其它 LiveContext
+            print(f"[LiveContext] ignore order for {ts_code}, context bound to {self.ts_code}")
+            return
+
+        qty = int(qty)
+        price = float(price)
+        dt = meta.get("dt")
+        if dt is None:
+            dt = datetime.now()
+
+        remark = f"{reason}"
+        order_id = self.client.place_order(
+            ts_code=ts_code,
+            side=side,
+            price=price,
+            qty=qty,
+            order_type="limit",
+            remark=remark,
+        )
+
+        # 刷新账户信息
+        self.refresh_account()
+
+        # 从 client 中找到刚刚的订单记录
+        status = "unknown"
+        for od in self.client.get_orders():
+            if od.order_id == order_id:
+                status = od.status
+                break
+
+        rec = LiveTradeRecord(
+            ts_code=ts_code,
+            dt=dt,
+            side=side,
+            price=price,
+            qty=qty,
+            reason=reason,
+            meta=meta,
+            order_id=order_id,
+            status=status,
+        )
+        self.trades.append(rec)
+
+        print(f"[LiveContext] order sent: {rec}")
+
+    # --------------- 工具方法 ---------------
+
+    def trades_to_dataframe(self) -> pd.DataFrame:
+        if not self.trades:
+            return pd.DataFrame(
+                columns=[
+                    "ts_code",
+                    "dt",
+                    "side",
+                    "price",
+                    "qty",
+                    "reason",
+                    "order_id",
+                    "status",
+                ]
+            )
+        rows = []
+        for t in self.trades:
+            rows.append(
+                {
+                    "ts_code": t.ts_code,
+                    "dt": t.dt,
+                    "side": t.side,
+                    "price": t.price,
+                    "qty": t.qty,
+                    "reason": t.reason,
+                    "order_id": t.order_id,
+                    "status": t.status,
+                }
+            )
+        return pd.DataFrame(rows)
 
 
-但你在 tick_store.save_ticks 里是用：
+if __name__ == "__main__":
+    # 自测：用 dry-run 的 QmtClient 测试一笔买卖
+    client = QmtClient(dry_run=True, extra_config={"initial_cash": 100_000})
+    client.connect()
+
+    ctx = LiveContext(client=client, ts_code="000001.SZ")
+    print("Initial account:", ctx.cash, ctx.equity)
+
+    ctx.send_order(
+        ts_code="000001.SZ",
+        side="buy",
+        price=10.0,
+        qty=1000,
+        reason="test_entry",
+        meta={},
+    )
+
+    ctx.send_order(
+        ts_code="000001.SZ",
+        side="sell",
+        price=10.5,
+        qty=1000,
+        reason="test_exit",
+        meta={},
+    )
+
+    print("Account after:", ctx.cash, ctx.equity)
+    print(ctx.trades_to_dataframe())
+
+    client.disconnect()
+
+3. live/runner.py — 实盘/仿真运行器（Tick 回放 + 策略 + LiveContext）
+
+这里我提供一个**“仿真实盘”**实现：
+使用 TickStore 中已有的 tick 数据，按时间顺序回放，并通过 LiveContext 触发 QmtClient 下单。
+你把 dry_run=False 改成实盘版本、并把数据源改成实时 pytdx，即可变成真正的实盘 loop。
+
+# live/runner.py
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
+import time
+
+import pandas as pd
+
+from data.tick_store import TickStore
+from factors import AbuPriceLevelProvider
+from microstructure import AbuMicrostructureAnalyzer
+from strategy.abu_level_strategy import AbuKeyLevelStrategy
+from .qmt_client import QmtClient
+from .context import LiveContext
+
+
+class LiveRunner:
+    """
+    实盘 / 仿真运行器：
+
+    当前版本：使用 TickStore 回放某日某票的 tick 数据，
+    让 AbuKeyLevelStrategy + LiveContext 跑一遍完整流程。
+
+    将来接入实盘：
+        - 把 tick 源改成 pytdx 实时推送/轮询
+        - QmtClient 设置 dry_run=False，填入你的真实 qmtmini 调用
+    """
+
+    def __init__(
+        self,
+        ts_code: str,
+        dry_run: bool = True,
+        qmt_config: Optional[Dict[str, Any]] = None,
+        strategy_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.ts_code = ts_code
+        self.dry_run = dry_run
+        self.qmt_config = qmt_config or {}
+        self.strategy_config = strategy_config or {}
+
+        self.tick_store = TickStore()
+        self.price_level_provider = AbuPriceLevelProvider()
+        self.micro_analyzer = AbuMicrostructureAnalyzer()
+
+        self.client = QmtClient(
+            dry_run=self.dry_run,
+            extra_config=self.qmt_config,
+        )
+
+        self.ctx = LiveContext(
+            client=self.client,
+            ts_code=self.ts_code,
+        )
+
+        self.strategy = AbuKeyLevelStrategy(
+            ts_code=self.ts_code,
+            price_level_provider=self.price_level_provider,
+            micro_analyzer=self.micro_analyzer,
+            config=self.strategy_config,
+        )
+
+    def run_replay(
+        self,
+        trade_date: date,
+        speed: float = 0.0,
+    ) -> None:
+        """
+        用 TickStore 的数据回放某一交易日的 tick。
+
+        speed:
+            - 0.0: 尽快跑完（仅用于调试）
+            - >0: 每个 tick 之间 sleep 的秒数（模拟实时节奏）
+        """
+        self.client.connect()
+
+        df = self.tick_store.load_ticks(self.ts_code, trade_date)
+        if df is None or df.empty:
+            print(f"[LiveRunner] no tick data for {self.ts_code} {trade_date}")
+            self.client.disconnect()
+            return
+
+        df = df.sort_values("datetime").reset_index(drop=True)
+
+        print(
+            f"[LiveRunner] start replay {self.ts_code} {trade_date}, "
+            f"ticks={len(df)}, dry_run={self.dry_run}"
+        )
+
+        for _, row in df.iterrows():
+            tick = self._row_to_tick(row)
+            # 把当前 tick 时间放进 meta，方便 LiveContext 记录
+            tick_meta = {"dt": tick["datetime"]}
+            # AbuKeyLevelStrategy 不用 meta 参数，所以我们只能在 ctx.send_order 里补上
+            # 这里的处理是：策略 on_tick 正常跑，ctx 在 send_order 时自己填 dt=now 或 meta["dt"]
+
+            self.strategy.on_tick(tick, self.ctx)
+
+            if speed > 0:
+                time.sleep(speed)
+
+        print(f"[LiveRunner] replay finished. Trades:")
+        print(self.ctx.trades_to_dataframe())
+
+        self.client.disconnect()
+
+    def _row_to_tick(self, row: pd.Series) -> Dict[str, Any]:
+        dt = row["datetime"]
+        if not isinstance(dt, datetime):
+            dt = pd.to_datetime(dt).to_pydatetime()
+
+        return {
+            "ts_code": self.ts_code,
+            "datetime": dt,
+            "price": float(row["price"]),
+            "volume": int(row.get("volume", 0)),
+            "side": row.get("side", "N"),
+        }
+
+
+if __name__ == "__main__":
+    # 自测：如果 TickStore 中有某票某日的 tick，可以跑一遍回放（dry_run，不会真下单）
+    from datetime import timedelta
+
+    ts = "000001.SZ"
+    today = date.today()
+    d = today - timedelta(days=1)
+
+    runner = LiveRunner(
+        ts_code=ts,
+        dry_run=True,
+        qmt_config={"initial_cash": 100_000},
+        strategy_config={"min_signal_score": 60.0},
+    )
+    runner.run_replay(trade_date=d, speed=0.0)
+
+4. live/__init__.py
+# live/__init__.py
+"""
+实盘相关模块入口。
+"""
+
+from .qmt_client import QmtClient, QmtOrder
+from .context import LiveContext, LiveTradeRecord
+from .runner import LiveRunner
+
+__all__ = [
+    "QmtClient",
+    "QmtOrder",
+    "LiveContext",
+    "LiveTradeRecord",
+    "LiveRunner",
+]
+
+
+if __name__ == "__main__":
+    print("live package self-test, exports:", __all__)
+
+5. ui/streamlit_app.py — Streamlit 可视化（K 线 + 关键位）
+
+一个简洁的可视化应用：
+
+左侧选股票、日期区间；
+
+从 stock_daily 读 K 线，从 price_levels_daily 读阿布关键位；
+
+用 Plotly 画出 K 线 + 关键位水平线；
+
+底部表格展示关键位信息。
+
+需要依赖：streamlit、plotly。
+你可以用 pip install streamlit plotly 安装。
+
+# ui/streamlit_app.py
+from __future__ import annotations
+
+from datetime import date
+from typing import List
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from sqlalchemy import text
 
 from db.connection import get_session
-from db.models import TickFileIndex
-
-with get_session() as session:
-    ...
-    idx = TickFileIndex(...)
-    session.merge(idx)
+from data.repository import get_all_stock_basics
+from factors import AbuPriceLevelProvider
 
 
-而 db/connection.py 的 get_session() 只有在 USE_REAL_DB=1 时才创建 SQLAlchemy 的 Session；当前这套 TickFileIndex 类 并不是映射到任何 ORM 表上的，在真 DB 场景会报错。
-
-当前阶段的情况
-
-你现在测试阶段都是 USE_REAL_DB=0，走的是 DummySession，所以不会报错；
-
-但一旦你把 USE_REAL_DB 打开，TickFileIndex 相关写入一定是不能用的。
-
-建议
-
-把「真 ORM 模型」作为后续一个阶段独立出来，比如：
-
-用 SQLAlchemy Declarative Base 实现真正的 StockBasic, StockDaily, TickFileIndex, PriceLevelsDaily；
-
-保持接口不变（TickStore 仍然是 save_ticks / load_ticks），只内部替换。
-
-这一点不用现在改，但你迁移到真实 Postgres 的时候，要记得这个坑。
-
-6. 微观结构 & 关键位策略本身的一致性 & 性能
-
-这一块整体逻辑是对的，和我们之前约定的思路基本匹配：
-
-AbuPriceStructureExtractor + AbuPriceLevelProvider 负责盘后计算关键位，并落库（或 Dummy 环境下跳过）。
-
-AbuMicrostructureAnalyzer 只关注「某个关键位附近的一小段 tick 窗」：
-
-价格离关键位的相对距离 dist_pct；
-
-总成交量 total_vol；
-
-B/S 比例；
-
-穿透程度 penetration_pct；
-
-然后输出一个 MicroSignal（方向 + score + meta）。
-
-AbuKeyLevelStrategy 每个 tick 的流程：
-
-检查是否新的一天，加载当日关键位；
-
-维护 tick buffer（时间窗）；
-
-根据 _position 决定是先处理已有仓位还是寻找新机会；
-
-在价格接近关键位时调用 micro_analyzer.analyze_near_level(...)；
-
-score 合格 → 计算仓位大小 → ctx.send_order(...)。
-
-一致性方面
-
-从现在的代码来看，回测和实盘的逻辑如果共用 AbuKeyLevelStrategy，是天然一致的：
-
-关键位来源：统一通过 PriceLevelProvider；
-
-微观结构分析：统一用 AbuMicrostructureAnalyzer；
-
-下单入口：统一通过 ctx.send_order(...)。
-
-只要你将来实盘那边的 ctx 实现（比如 QmtContext）遵守同一个接口（get_position / cash / equity / send_order），逻辑路径就能完全复用。
-
-性能方面
-
-现在的实现有一个「可以以后优化」的点：
-
-def _get_tick_window(self, dt: datetime) -> pd.DataFrame:
-    window_seconds = int(self.config["micro_window_seconds"])
-    start = dt - timedelta(seconds=window_seconds)
-    rows = [t for t in self._tick_buffer if start <= t["datetime"] <= dt]
-    return pd.DataFrame(rows)
+def load_daily_bars(ts_code: str, start: date, end: date) -> pd.DataFrame:
+    with get_session() as session:
+        sql = text(
+            """
+            select trade_date, open, high, low, close, volume, amount
+            from stock_daily
+            where ts_code = :ts
+              and trade_date between :start and :end
+            order by trade_date
+            """
+        )
+        df = pd.read_sql(
+            sql,
+            session.get_bind(),
+            params={"ts": ts_code, "start": start, "end": end},
+        )
+    if df.empty:
+        return df
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    return df
 
 
-每个 tick 都从 _tick_buffer 全表扫描，构造一个新的 DataFrame，O(N)；
+def load_price_levels(ts_code: str, trade_date: date) -> pd.DataFrame:
+    plp = AbuPriceLevelProvider()
+    levels = plp.get_levels(ts_code, trade_date)
+    if not levels:
+        return pd.DataFrame(
+            columns=[
+                "ts_code",
+                "trade_date",
+                "level_price",
+                "level_type",
+                "direction",
+                "strength",
+                "source_flags",
+            ]
+        )
+    rows = []
+    for lv in levels:
+        rows.append(
+            {
+                "ts_code": lv.ts_code,
+                "trade_date": lv.trade_date,
+                "level_price": lv.level_price,
+                "level_type": lv.level_type,
+                "direction": lv.direction,
+                "strength": lv.strength,
+                "source_flags": ",".join(lv.source_flags or []),
+            }
+        )
+    df = pd.DataFrame(rows)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    return df
 
-在高频 tick（单日几万、十几万）时会有性能压力。
 
-优化方向（可以后面一个阶段再做）：
+def main() -> None:
+    st.set_page_config(
+        page_title="A股阿布关键位策略可视化",
+        layout="wide",
+    )
 
-把 _tick_buffer 换成一个按时间升序的 deque：
+    st.title("A股阿布价格理论关键位可视化")
 
-新 tick append；
+    # ---------- 左侧选择股票 & 日期 ----------
 
-每次只从左边 pop 掉超出时间窗的部分；
+    basics = get_all_stock_basics()
+    if not basics:
+        st.error("stock_basic 为空，请先跑数据更新任务。")
+        return
 
-然后 _get_tick_window 可以直接用 list(self._tick_buffer) 建表，复杂度接近 O(window_size)，而不是 O(total_ticks)。
+    ts_codes: List[str] = [b.ts_code for b in basics]
+    names: List[str] = [f"{b.ts_code} {b.name}" for b in basics]
+    code_to_name = dict(zip(ts_codes, names))
 
-这不影响正确性，只是性能和内存优化。
+    ts = st.sidebar.selectbox("选择股票", options=ts_codes, format_func=lambda x: code_to_name.get(x, x))
 
-总结：当前阶段是否“能用”？以及建议优先修什么
+    today = date.today()
+    start = st.sidebar.date_input("开始日期", value=today.replace(year=today.year - 1))
+    end = st.sidebar.date_input("结束日期", value=today)
 
-综合结论：
+    level_date = st.sidebar.date_input("关键位日期（通常选最近一个交易日）", value=end)
 
-阶段 0–3 的整体架构和模块划分是合理的，和你最初的“可复用框架 + 可以替换策略核心”的目标是对齐的；
+    st.sidebar.write("---")
+    st.sidebar.write("提示：")
+    st.sidebar.write("1. 先用数据更新任务拉取日线和关键位。")
+    st.sidebar.write("2. 实盘/回测逻辑由后端模块完成，这里只负责可视化。")
 
-在 Dummy DB + 本地测试 tick 的前提下，大部分代码可以正常跑通；
+    # ---------- 加载数据 ----------
 
-但要让「回测结果可信」并且为后面真实实盘准备，有几处必须调整。
+    with st.spinner("加载日线数据..."):
+        df_ohlc = load_daily_bars(ts, start, end)
 
-我建议的优先级：
+    if df_ohlc.empty:
+        st.warning("选定区间内无日线数据。")
+        return
 
-立刻修：BacktestContext 空头 & 平多/空 的现金和权益计算
-这是会直接把回测 PnL 算错的关键 bug。
+    with st.spinner("加载关键位数据..."):
+        df_levels = load_price_levels(ts, level_date)
 
-尽快决定：策略是允许隔夜，还是强制日内平仓
+    # ---------- 绘制 K 线 + 关键位 ----------
 
-允许隔夜 → 删掉 _on_new_day 里清 _position 的那一行；
+    fig = go.Figure()
 
-强制日内 → 在 TickBacktester 里加「收盘强制平仓」逻辑。
-两者选一个就好，关键是保证策略状态和上下文仓位一致。
+    fig.add_trace(
+        go.Candlestick(
+            x=df_ohlc["trade_date"],
+            open=df_ohlc["open"],
+            high=df_ohlc["high"],
+            low=df_ohlc["low"],
+            close=df_ohlc["close"],
+            name="K线",
+        )
+    )
 
-顺手修：strategy/__main__.py 的 _REGISTRY 引用
-小问题，但修掉会干净很多。
+    if not df_levels.empty:
+        # 按方向分别画
+        for direction, color in [("support", "green"), ("resistance", "red"), ("neutral", "blue")]:
+            sub = df_levels[df_levels["direction"] == direction]
+            for _, row in sub.iterrows():
+                fig.add_hline(
+                    y=row["level_price"],
+                    line=dict(color=color, width=1, dash="dot"),
+                    annotation_text=f"{direction} | {row['level_type']} | {row['strength']}",
+                    annotation_position="right",
+                )
 
-记在 TODO 里：ORM 真模型 + parquet 依赖
+    fig.update_layout(
+        xaxis_title="日期",
+        yaxis_title="价格",
+        xaxis_rangeslider_visible=False,
+        height=600,
+    )
 
-ORM：等你准备好切真实 Postgres 再统一上；
+    st.plotly_chart(fig, use_container_width=True)
 
-parquet：保证你的运行环境安装了 pyarrow 或 fastparquet。
+    # ---------- 关键位表格 ----------
+
+    st.subheader(f"{ts} {level_date} 关键价格列表")
+    if df_levels.empty:
+        st.info("该日尚未计算关键位。请先跑 AbuPriceLevelProvider.precompute(trade_date)。")
+    else:
+        st.dataframe(
+            df_levels.sort_values("level_price"),
+            use_container_width=True,
+        )
+
+
+if __name__ == "__main__":
+    # 直接 python ui/streamlit_app.py 时给出提示
+    print(
+        "请用命令运行 Streamlit 应用：\n\n"
+        "    streamlit run ui/streamlit_app.py\n"
+    )
+    # 也可以直接调用 main() 在命令行调试数据加载逻辑
+    # main()
+
+怎么把阶段 4 跑起来（简要）
+
+安装新依赖（如果还没装）：
+
+pip install streamlit plotly pyarrow
+
+
+仿真“实盘跑策略”（不下真单）：
+
+python -m live.runner
+
+
+（确保 TickStore 下有对应 ts_code + trade_date 的 tick 文件）
+
+查看 K 线 + 关键位：
+
+streamlit run ui/streamlit_app.py
