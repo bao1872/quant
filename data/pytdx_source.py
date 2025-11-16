@@ -20,9 +20,10 @@ from .base_source import DataSource
 
 
 class PytdxDataSource(DataSource):
-    def __init__(self, host: str = "auto", port: int = 7709):
+    def __init__(self, host: str = "auto", port: int = 7709, enable_fallback: bool = True):
         self.host = host
         self.port = port
+        self.enable_fallback = enable_fallback
         self.api = TdxHq_API()
         self._connected = False
 
@@ -99,12 +100,18 @@ class PytdxDataSource(DataSource):
 
         # 确保有 datetime 字段为真正的 datetime 类型
         if "datetime" in df.columns:
-            # 日线: 'YYYY-MM-DD', 分钟: 'YYYY-MM-DD HH:MM'
             df["datetime"] = df["datetime"].apply(
-                lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M")
-                if " " in str(x)
-                else datetime.strptime(x, "%Y-%m-%d")
+                lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M") if " " in str(x) else datetime.strptime(x, "%Y-%m-%d")
             )
+        elif "date" in df.columns:
+            df["datetime"] = pd.to_datetime(df["date"], format="%Y-%m-%d", errors="coerce")
+            df = df.drop(columns=[c for c in ["date"] if c in df.columns])
+        elif {"year", "month", "day"}.issubset(set(df.columns)):
+            df["datetime"] = pd.to_datetime(
+                dict(year=df["year"], month=df["month"], day=df["day"])
+            )
+        else:
+            return pd.DataFrame()
         return df
 
     # ---------- DataSource 实现 ----------
@@ -127,6 +134,8 @@ class PytdxDataSource(DataSource):
             count=count,
         )
         df = self._bars_to_df(raw)
+        if df.empty or ("datetime" not in df.columns):
+            return pd.DataFrame()
         df = df.sort_values("datetime").reset_index(drop=True)
         df["ts_code"] = ts_code
         return df
@@ -161,6 +170,8 @@ class PytdxDataSource(DataSource):
             count=count,
         )
         df = self._bars_to_df(raw)
+        if df.empty or ("datetime" not in df.columns):
+            return pd.DataFrame()
         df = df.sort_values("datetime").reset_index(drop=True)
         df["ts_code"] = ts_code
         df["freq"] = freq
@@ -189,10 +200,13 @@ class PytdxDataSource(DataSource):
             df = df.rename(columns={"vol": "volume"})
 
         if "buyorsell" in df.columns:
-            map_side = {0: "B", 1: "S"}
-            df["side"] = df["buyorsell"].map(map_side).fillna("N")
+            s = pd.to_numeric(df["buyorsell"], errors="coerce")
+            df["side"] = s.map({0: "B", 1: "S", 2: "N"}).fillna("N")
         elif "bsflag" in df.columns:
-            df["side"] = df["bsflag"].astype(str)
+            bs = df["bsflag"].astype(str).str.upper().str.strip()
+            df["side"] = bs.map({"B": "B", "S": "S", "N": "N"}).fillna(
+                bs.apply(lambda x: "B" if x.startswith("B") else ("S" if x.startswith("S") else "N"))
+            )
         else:
             df["side"] = "N"
 
@@ -266,8 +280,9 @@ class PytdxDataSource(DataSource):
         all_rows: list = []
         start = 0
         step = 1000
+        date_int = int(str(trade_date).replace("-", ""))
         while True:
-            raw = self.api.get_history_transaction_data(market, code, trade_date, start, step)
+            raw = self.api.get_history_transaction_data(market, code, start, step, date_int)
             if not raw:
                 break
             df = pd.DataFrame(raw)
@@ -276,9 +291,13 @@ class PytdxDataSource(DataSource):
             if "vol" in df.columns:
                 df = df.rename(columns={"vol": "volume"})
             if "buyorsell" in df.columns:
-                df["side"] = df["buyorsell"].map({0: "B", 1: "S"}).fillna("N")
+                s = pd.to_numeric(df["buyorsell"], errors="coerce")
+                df["side"] = s.map({0: "B", 1: "S", 2: "N"}).fillna("N")
             elif "bsflag" in df.columns:
-                df["side"] = df["bsflag"].astype(str)
+                bs = df["bsflag"].astype(str).str.upper().str.strip()
+                df["side"] = bs.map({"B": "B", "S": "S", "N": "N"}).fillna(
+                    bs.apply(lambda x: "B" if x.startswith("B") else ("S" if x.startswith("S") else "N"))
+                )
             else:
                 df["side"] = "N"
             if "amount" not in df.columns and {"price", "volume"}.issubset(df.columns):
@@ -303,6 +322,67 @@ class PytdxDataSource(DataSource):
             if len(df) < step:
                 break
             start += step
+        if not all_rows and self.enable_fallback:
+            self.api.disconnect()
+            candidates = [
+                ("119.147.164.60", 7709),
+                ("180.153.18.171", 7709),
+                ("114.80.149.19", 7709),
+                ("115.238.90.165", 7709),
+                ("123.125.108.23", 7709),
+                ("218.108.98.244", 7709),
+            ]
+            for ip, port in candidates:
+                ok = self.api.connect(ip, port)
+                if not ok:
+                    continue
+                start = 0
+                got = False
+                while True:
+                    raw = self.api.get_history_transaction_data(market, code, start, step, date_int)
+                    if not raw:
+                        break
+                    df = pd.DataFrame(raw)
+                    if df.empty:
+                        break
+                    got = True
+                    if "vol" in df.columns:
+                        df = df.rename(columns={"vol": "volume"})
+                    if "buyorsell" in df.columns:
+                        s = pd.to_numeric(df["buyorsell"], errors="coerce")
+                        df["side"] = s.map({0: "B", 1: "S", 2: "N"}).fillna("N")
+                    elif "bsflag" in df.columns:
+                        bs = df["bsflag"].astype(str).str.upper().str.strip()
+                        df["side"] = bs.map({"B": "B", "S": "S", "N": "N"}).fillna(
+                            bs.apply(lambda x: "B" if x.startswith("B") else ("S" if x.startswith("S") else "N"))
+                        )
+                    else:
+                        df["side"] = "N"
+                    if "amount" not in df.columns and {"price", "volume"}.issubset(df.columns):
+                        df["amount"] = df["price"] * df["volume"]
+                    base_date = trade_date
+                    if "time" in df.columns:
+                        def _parse_time(t: str) -> datetime:
+                            t = str(t)
+                            if len(t) == 5:
+                                fmt = "%Y-%m-%d %H:%M"
+                            elif len(t) == 8:
+                                fmt = "%Y-%m-%d %H:%M:%S"
+                            else:
+                                t = t[:5]
+                                fmt = "%Y-%m-%d %H:%M"
+                            return datetime.strptime(f"{base_date.strftime('%Y-%m-%d')} {t}", fmt)
+                        df["datetime"] = df["time"].apply(_parse_time)
+                    else:
+                        df["datetime"] = datetime.combine(base_date, datetime.min.time())
+                    df["ts_code"] = ts_code
+                    all_rows.append(df[["ts_code", "datetime", "price", "volume", "amount", "time", "side"]].copy())
+                    if len(df) < step:
+                        break
+                    start += step
+                self.api.disconnect()
+                if got:
+                    break
         if not all_rows:
             return pd.DataFrame(columns=["ts_code", "datetime", "price", "volume", "amount", "time", "side"])
         out = pd.concat(all_rows, ignore_index=True)

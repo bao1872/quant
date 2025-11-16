@@ -170,11 +170,13 @@ def collect_full_day_ticks(trade_date: date, settings: Optional[Settings] = None
     ts_codes = [s.ts_code for s in basics]
     from .tick_store import TickStore
     store = TickStore(settings=settings)
+    store.defer_index = True
     print(f"[collect_full_day_ticks] Start for {len(ts_codes)} stocks, trade_date={trade_date}")
-    with PytdxDataSource() as ds:
+    with PytdxDataSource(enable_fallback=False) as ds:
         for ts_code in tqdm(ts_codes, desc="ticks_full", unit="stk"):
             df_tick = ds.get_ticks_full_day(ts_code, trade_date)
             if df_tick.empty:
                 continue
             store.save_ticks(ts_code, trade_date, df_tick, already_sorted=True)
     print("[collect_full_day_ticks] Done.")
+    store.flush_index_for_date(trade_date)

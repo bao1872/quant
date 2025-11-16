@@ -30,7 +30,8 @@ def _table_exists(eng, table_name: str) -> bool:
         + table_name
         + "'"
     )
-    df = pd.read_sql(q, eng)
+    with eng.connect() as conn:
+        df = pd.read_sql(q, conn)
     return len(df) > 0
 
 # -------- StockBasic --------
@@ -39,7 +40,8 @@ def get_all_stock_basics() -> List[StockBasic]:
     eng = get_engine()
     if eng is not None:
         if _table_exists(eng, "stock_basic"):
-            df = pd.read_sql("select * from stock_basic", eng)
+            with eng.connect() as conn:
+                df = pd.read_sql("select * from stock_basic", conn)
             if "ts_code" in df.columns:
                 codes = df["ts_code"].astype(str).tolist()
             else:
@@ -67,7 +69,8 @@ def upsert_stock_basic(df: pd.DataFrame) -> int:
             return len(df)
     existing = pd.DataFrame()
     if _table_exists(eng, "stock_basic"):
-        existing = pd.read_sql("select ts_code, code, exchange, name from stock_basic", eng)
+        with eng.connect() as conn:
+            existing = pd.read_sql("select ts_code, code, exchange, name from stock_basic", conn)
     df = df.copy()
     df["ts_code"] = df["code"].astype(str) + "." + df["exchange"].astype(str)
     df = df[["ts_code", "code", "exchange", "name"]]
@@ -85,7 +88,7 @@ def upsert_stock_basic(df: pd.DataFrame) -> int:
             if payload:
                 conn.execute(text("delete from stock_basic where ts_code = :code"), payload)
         if not to_insert.empty:
-            to_insert.to_sql("stock_basic", eng, if_exists="append", index=False)
+            to_insert.to_sql("stock_basic", conn, if_exists="append", index=False)
     return len(to_insert)
 
 
@@ -98,10 +101,11 @@ def get_last_trade_date_for_stock(ts_code: str) -> Optional[date]:
     eng = get_engine()
     if eng is not None:
         if _table_exists(eng, "stock_daily"):
-            df = pd.read_sql(
-                f"select max(trade_date) as last_date from stock_daily where ts_code = '{ts_code}'",
-                eng,
-            )
+            with eng.connect() as conn:
+                df = pd.read_sql(
+                    f"select max(trade_date) as last_date from stock_daily where ts_code = '{ts_code}'",
+                    conn,
+                )
             if df.empty:
                 return None
             last = df["last_date"].iloc[0]
@@ -161,7 +165,7 @@ def upsert_stock_daily(ts_code: str, df: pd.DataFrame) -> int:
             "trade_date","open","high","low","close","volume","amount"
         ]].copy()
         out.insert(0, "ts_code", ts_code)
-        out.to_sql("stock_daily", eng, if_exists="append", index=False)
+        out.to_sql("stock_daily", conn, if_exists="append", index=False)
     return len(df)
 
 
@@ -221,7 +225,7 @@ def upsert_stock_minute(
             "trade_date","minute","open","high","low","close","volume","amount"
         ]].copy()
         out.insert(0, "ts_code", ts_code)
-        out.to_sql("stock_minute", eng, if_exists="append", index=False)
+        out.to_sql("stock_minute", conn, if_exists="append", index=False)
     return len(df)
 
 
