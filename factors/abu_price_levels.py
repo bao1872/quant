@@ -23,7 +23,7 @@ import math
 import pandas as pd
 from sqlalchemy import text
 
-from db.connection import get_session
+from db.connection import get_engine
 from data.repository import get_all_stock_basics
 from strategy.base import PriceLevel, PriceLevelProvider
 
@@ -31,28 +31,16 @@ from strategy.base import PriceLevel, PriceLevelProvider
 # ---------------- 工具：获取 SQLAlchemy engine ----------------
 
 def _get_engine():
-    """
-    尝试从 get_session() 拿到底层 engine。
-    若当前环境是 DummySession（没有真实 DB），返回 None。
-    """
-    try:
-        with get_session() as session:
-            eng = session.get_bind()
-        return eng
-    except Exception:
-        return None
+    return get_engine()
 
 def _table_exists(eng, table_name: str) -> bool:
-    try:
-        q = (
-            "select 1 from information_schema.tables where table_schema='public' and table_name='"
-            + table_name
-            + "'"
-        )
-        df = pd.read_sql(q, eng)
-        return len(df) > 0
-    except Exception:
-        return False
+    q = (
+        "select 1 from information_schema.tables where table_schema='public' and table_name='"
+        + table_name
+        + "'"
+    )
+    df = pd.read_sql(q, eng)
+    return len(df) > 0
 
 
 # ---------------- 配置 ----------------
@@ -543,9 +531,6 @@ class AbuPriceLevelProvider(PriceLevelProvider):
 
     def precompute(self, trade_date: date) -> None:
         eng = _get_engine()
-        if eng is None:
-            print("[AbuPriceLevelProvider] No real DB engine, skip precompute.")
-            return
 
         basics = get_all_stock_basics()
         ts_codes = [b.ts_code for b in basics]
@@ -562,30 +547,25 @@ class AbuPriceLevelProvider(PriceLevelProvider):
 
         with eng.begin() as conn:
             for i, ts_code in enumerate(ts_codes, start=1):
-                try:
-                    df_hist = self._load_history(conn, ts_code, trade_date)
-                    if df_hist.empty:
-                        if debug and i <= 5:
-                            print(f"[AbuPriceLevelProvider] {ts_code}: no history for {trade_date}")
-                        continue
+                df_hist = self._load_history(conn, ts_code, trade_date)
+                if df_hist.empty:
+                    if debug and i <= 5:
+                        print(f"[AbuPriceLevelProvider] {ts_code}: no history for {trade_date}")
+                    continue
 
-                    levels = self.extractor.extract_levels_for_history(ts_code, df_hist, trade_date)
-                    if not levels:
-                        continue
+                levels = self.extractor.extract_levels_for_history(ts_code, df_hist, trade_date)
+                if not levels:
+                    continue
 
-                    self._write_levels_for_stock(conn, levels)
+                self._write_levels_for_stock(conn, levels)
 
-                    if i % 50 == 0 or (debug and i <= 5):
-                        print(f"[AbuPriceLevelProvider] {i}/{total} {ts_code}: {len(levels)} levels generated.")
-                except Exception as e:
-                    print(f"[AbuPriceLevelProvider] error on {ts_code}: {e}")
+                if i % 50 == 0 or (debug and i <= 5):
+                    print(f"[AbuPriceLevelProvider] {i}/{total} {ts_code}: {len(levels)} levels generated.")
 
         print(f"[AbuPriceLevelProvider] precompute done for {trade_date}, stocks={total}")
 
     def get_levels(self, ts_code: str, trade_date: date) -> List[PriceLevel]:
         eng = _get_engine()
-        if eng is None:
-            return []
         if not _table_exists(eng, "price_levels_daily"):
             return []
         sql_txt = (

@@ -1,4 +1,9 @@
 from __future__ import annotations
+import os
+import sys
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
 
 from datetime import date
 from typing import List
@@ -6,25 +11,18 @@ from typing import List
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sqlalchemy import text
-
-from db.connection import get_session
+from db.connection import get_engine
 from data.repository import get_all_stock_basics
-from factors import AbuPriceLevelProvider
 
 
 def load_daily_bars(ts_code: str, start: date, end: date) -> pd.DataFrame:
-    with get_session() as session:
-        sql = text(
-            """
-            select trade_date, open, high, low, close, volume, amount
-            from stock_daily
-            where ts_code = :ts
-              and trade_date between :start and :end
-            order by trade_date
-            """
-        )
-        df = pd.read_sql(sql, session.get_bind(), params={"ts": ts_code, "start": start, "end": end})
+    eng = get_engine()
+    df = pd.read_sql_table("stock_daily", eng)
+    if df.empty:
+        return df
+    df = df[df["ts_code"].astype(str).eq(ts_code)]
+    df = df[(df["trade_date"] >= pd.Timestamp(start)) & (df["trade_date"] <= pd.Timestamp(end))]
+    df = df.sort_values("trade_date").reset_index(drop=True)
     if df.empty:
         return df
     df["trade_date"] = pd.to_datetime(df["trade_date"])
@@ -32,15 +30,16 @@ def load_daily_bars(ts_code: str, start: date, end: date) -> pd.DataFrame:
 
 
 def load_price_levels(ts_code: str, trade_date: date) -> pd.DataFrame:
-    plp = AbuPriceLevelProvider()
-    levels = plp.get_levels(ts_code, trade_date)
-    if not levels:
-        return pd.DataFrame(columns=["ts_code", "trade_date", "level_price", "level_type", "direction", "strength", "source_flags"])
-    rows = []
-    for lv in levels:
-        rows.append({"ts_code": lv.ts_code, "trade_date": lv.trade_date, "level_price": lv.level_price, "level_type": lv.level_type, "direction": lv.direction, "strength": lv.strength, "source_flags": ",".join(lv.source_flags or [])})
-    df = pd.DataFrame(rows)
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    eng = get_engine()
+    df = pd.read_sql_table("price_levels_daily", eng)
+    if df.empty:
+        return df
+    df = df[df["ts_code"].astype(str).eq(ts_code)]
+    df = df[df["trade_date"].astype("datetime64[ns]").dt.date == trade_date]
+    df = df.sort_values("level_price").reset_index(drop=True)
+    if "source_flags" in df.columns:
+        df["source_flags"] = df["source_flags"].astype(str)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]) 
     return df
 
 
@@ -59,6 +58,7 @@ def main() -> None:
     start = st.sidebar.date_input("开始日期", value=today.replace(year=today.year - 1))
     end = st.sidebar.date_input("结束日期", value=today)
     level_date = st.sidebar.date_input("关键位日期（通常选最近一个交易日）", value=end)
+    min_signal_score = st.sidebar.slider("最小信号评分", min_value=0.0, max_value=100.0, value=60.0, step=1.0)
     st.sidebar.write("---")
     st.sidebar.write("提示：")
     st.sidebar.write("1. 先用数据更新任务拉取日线和关键位。")
@@ -88,4 +88,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     print("请用命令运行 Streamlit 应用：\n\n    streamlit run ui/streamlit_app.py\n")
-

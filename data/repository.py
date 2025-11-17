@@ -20,7 +20,7 @@ from typing import Dict, Iterable, List, Optional
 import pandas as pd
 from sqlalchemy import func, select, text
 
-from db.connection import get_session, DummySession, get_engine
+from db.connection import get_session, get_engine
 from db.models import StockBasic, StockDaily, StockMinute
 
 
@@ -38,35 +38,29 @@ def _table_exists(eng, table_name: str) -> bool:
 
 def get_all_stock_basics() -> List[StockBasic]:
     eng = get_engine()
-    if eng is not None:
-        if _table_exists(eng, "stock_basic"):
-            with eng.connect() as conn:
-                df = pd.read_sql("select * from stock_basic", conn)
-            if "ts_code" in df.columns:
-                codes = df["ts_code"].astype(str).tolist()
+    if _table_exists(eng, "stock_basic"):
+        with eng.connect() as conn:
+            df = pd.read_sql("select * from stock_basic", conn)
+        if "ts_code" in df.columns:
+            codes = df["ts_code"].astype(str).tolist()
+        else:
+            market_map = {0: "SZ", 1: "SH", "SZ": "SZ", "SH": "SH"}
+            if "market" in df.columns:
+                exch = df["market"].map(market_map).fillna("SZ").astype(str)
+                codes = (df["code"].astype(str) + "." + exch).tolist()
+            elif "exchange" in df.columns:
+                exch = df["exchange"].map(market_map).fillna("SZ").astype(str)
+                codes = (df["code"].astype(str) + "." + exch).tolist()
             else:
-                market_map = {0: "SZ", 1: "SH", "SZ": "SZ", "SH": "SH"}
-                if "market" in df.columns:
-                    exch = df["market"].map(market_map).fillna("SZ").astype(str)
-                    codes = (df["code"].astype(str) + "." + exch).tolist()
-                elif "exchange" in df.columns:
-                    exch = df["exchange"].map(market_map).fillna("SZ").astype(str)
-                    codes = (df["code"].astype(str) + "." + exch).tolist()
-                else:
-                    codes = (df["code"].astype(str) + ".SZ").tolist()
-            return [StockBasic(ts) for ts in codes]
-        return [StockBasic("000001.SZ")]
-    with get_session() as session:
-        return [StockBasic("000001.SZ")]
+                codes = (df["code"].astype(str) + ".SZ").tolist()
+        return [StockBasic(ts) for ts in codes]
+    return []
 
 
 def upsert_stock_basic(df: pd.DataFrame) -> int:
     if df is None or df.empty:
         return 0
     eng = get_engine()
-    if eng is None:
-        with get_session() as session:
-            return len(df)
     existing = pd.DataFrame()
     if _table_exists(eng, "stock_basic"):
         with eng.connect() as conn:
@@ -99,20 +93,18 @@ def get_last_trade_date_for_stock(ts_code: str) -> Optional[date]:
     返回某只股票在 StockDaily 中最新的 trade_date。
     """
     eng = get_engine()
-    if eng is not None:
-        if _table_exists(eng, "stock_daily"):
-            with eng.connect() as conn:
-                df = pd.read_sql(
-                    f"select max(trade_date) as last_date from stock_daily where ts_code = '{ts_code}'",
-                    conn,
-                )
-            if df.empty:
-                return None
-            last = df["last_date"].iloc[0]
-            if pd.isna(last):
-                return None
-            return last.date() if hasattr(last, "date") else last
-        return None
+    if _table_exists(eng, "stock_daily"):
+        with eng.connect() as conn:
+            df = pd.read_sql(
+                f"select max(trade_date) as last_date from stock_daily where ts_code = '{ts_code}'",
+                conn,
+            )
+        if df.empty:
+            return None
+        last = df["last_date"].iloc[0]
+        if pd.isna(last):
+            return None
+        return last.date() if hasattr(last, "date") else last
     return None
 
 
@@ -135,24 +127,6 @@ def upsert_stock_daily(ts_code: str, df: pd.DataFrame) -> int:
     max_date = df["trade_date"].max()
 
     eng = get_engine()
-    if eng is None:
-        with get_session() as session:
-            objs = []
-            for _, row in df.iterrows():
-                objs.append(
-                    StockDaily(
-                        ts_code=ts_code,
-                        trade_date=row["trade_date"],
-                        open=row["open"],
-                        high=row["high"],
-                        low=row["low"],
-                        close=row["close"],
-                        volume=row["volume"],
-                        amount=row.get("amount", 0.0),
-                    )
-                )
-            session.bulk_save_objects(objs)
-            return len(objs)
     with eng.begin() as conn:
         if _table_exists(eng, "stock_daily"):
             conn.execute(
@@ -194,25 +168,6 @@ def upsert_stock_minute(
     max_date = df["trade_date"].max()
 
     eng = get_engine()
-    if eng is None:
-        with get_session() as session:
-            objs = []
-            for _, row in df.iterrows():
-                objs.append(
-                    StockMinute(
-                        ts_code=ts_code,
-                        trade_date=row["trade_date"],
-                        minute=row["minute"],
-                        open=row["open"],
-                        high=row["high"],
-                        low=row["low"],
-                        close=row["close"],
-                        volume=row["volume"],
-                        amount=row.get("amount", 0.0),
-                    )
-                )
-            session.bulk_save_objects(objs)
-            return len(objs)
     with eng.begin() as conn:
         if _table_exists(eng, "stock_minute"):
             conn.execute(

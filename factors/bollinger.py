@@ -145,8 +145,6 @@ def compute_stock_bollinger_for_date(
     conn=None,
 ) -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if ts_codes is None:
         basics = repository.get_all_stock_basics()
         ts_codes = [s.ts_code for s in basics]
@@ -245,8 +243,6 @@ def compute_stock_bollinger_for_date(
 
 def compute_concept_bollinger_for_date(trade_date: date, conn=None) -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if not _table_exists(eng, "stock_bollinger_data"):
         return 0
     cols_sbd = _table_columns(eng, "stock_bollinger_data")
@@ -363,8 +359,6 @@ def _fetch_stock_daily_range(eng, start_date: date, end_date: date, conn=None) -
 
 def compute_stock_bollinger_from_db_range(start_date: date, end_date: date, window: int = 20, k: float = 2.0, z_window: int = 120, conn=None) -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     df = _fetch_stock_daily_range(eng, start_date, end_date, conn=conn)
     if df.empty:
         return 0
@@ -428,8 +422,6 @@ def compute_stock_bollinger_from_db_range(start_date: date, end_date: date, wind
 
 def compute_concept_bollinger_from_db_range(start_date: date, end_date: date, conn=None) -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     cols_sbd = _table_columns(eng, "stock_bollinger_data")
     date_col = "trade_date" if "trade_date" in cols_sbd else ("date" if "date" in cols_sbd else None)
     if date_col is None:
@@ -486,8 +478,6 @@ def compute_concept_bollinger_from_db_range(start_date: date, end_date: date, co
 
 def compute_stock_bollinger_between(start_date: date, end_date: date, window: int = 20, k: float = 2.0, z_window: int = 120, ts_codes: Optional[List[str]] = None) -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if ts_codes is None:
         basics = repository.get_all_stock_basics()
         ts_codes = [s.ts_code for s in basics]
@@ -550,8 +540,6 @@ def compute_stock_bollinger_between(start_date: date, end_date: date, window: in
 
 def compute_concept_bollinger_between(start_date: date, end_date: date) -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if not _table_exists(eng, "stock_bollinger_data"):
         return 0
     cols_sbd = _table_columns(eng, "stock_bollinger_data")

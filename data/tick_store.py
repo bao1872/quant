@@ -16,8 +16,8 @@ from typing import List, Optional
 import pandas as pd
 
 from config import TICK_BASE_DIR, Settings
-from sqlalchemy import text
-from db.connection import get_session, get_engine, DummySession
+from sqlalchemy import text, inspect
+from db.connection import get_engine
 from db.models import TickFileIndex
 
 
@@ -99,28 +99,12 @@ class TickStore:
             self._pending_index.append(row)
             return
         eng = get_engine()
-        if eng is None:
-            with get_session() as session:
-                if isinstance(session, DummySession):
-                    return
-        else:
-            def _table_exists(conn, table_name: str) -> bool:
-                q = (
-                    "select 1 from information_schema.tables where table_schema='public' and table_name='"
-                    + table_name
-                    + "'"
-                )
-                df_chk = pd.read_sql(q, conn)
-                return len(df_chk) > 0
-            with eng.begin() as conn:
-                if _table_exists(conn, "tick_file_index"):
-                    conn.execute(
-                        text(
-                            "delete from tick_file_index where ts_code=:ts and trade_date=:d"
-                        ),
-                        {"ts": ts_code, "d": trade_date},
-                    )
-                pd.DataFrame([row]).to_sql("tick_file_index", conn, if_exists="append", index=False)
+        with eng.begin() as conn:
+            inspector = inspect(conn)
+            has_tbl = inspector.has_table("tick_file_index", schema="public")
+            if has_tbl:
+                conn.execute(text("delete from tick_file_index where ts_code=:ts and trade_date=:d"), {"ts": ts_code, "d": trade_date})
+            pd.DataFrame([row]).to_sql("tick_file_index", conn, if_exists="append", index=False)
 
     def flush_index_for_date(self, trade_date: date) -> int:
         if not self._pending_index:
@@ -129,18 +113,10 @@ class TickStore:
         if not rows:
             return 0
         eng = get_engine()
-        if eng is None:
-            return 0
-        def _table_exists(conn, table_name: str) -> bool:
-            q = (
-                "select 1 from information_schema.tables where table_schema='public' and table_name='"
-                + table_name
-                + "'"
-            )
-            df_chk = pd.read_sql(q, conn)
-            return len(df_chk) > 0
         with eng.begin() as conn:
-            if _table_exists(conn, "tick_file_index"):
+            inspector = inspect(conn)
+            has_tbl = inspector.has_table("tick_file_index", schema="public")
+            if has_tbl:
                 ts_set = sorted(list({r["ts_code"] for r in rows}))
                 for ts in ts_set:
                     conn.execute(text("delete from tick_file_index where ts_code=:ts and trade_date=:d"), {"ts": ts, "d": trade_date})
@@ -200,16 +176,10 @@ class TickStore:
                         renames.append((str(f), str(new_path), f"{code_dir.name}.{market_dir.name}", dt))
         eng = get_engine()
         if eng is not None and renames:
-            def _table_exists(conn, table_name: str) -> bool:
-                q = (
-                    "select 1 from information_schema.tables where table_schema='public' and table_name='"
-                    + table_name
-                    + "'"
-                )
-                df_chk = pd.read_sql(q, conn)
-                return len(df_chk) > 0
             with eng.begin() as conn:
-                if _table_exists(conn, "tick_file_index"):
+                inspector = inspect(conn)
+                has_tbl = inspector.has_table("tick_file_index", schema="public")
+                if has_tbl:
                     for _, new_path, ts, dt in renames:
                         conn.execute(text("update tick_file_index set file_path=:p where ts_code=:ts and trade_date=:d"), {"p": new_path, "ts": ts, "d": dt})
         return n
@@ -223,24 +193,57 @@ class TickStore:
         从 parquet 文件读取某日某股的 tick 数据。
         """
         file_path = self._file_path(ts_code, trade_date)
-        if not file_path.exists():
-            return pd.DataFrame()
-        return pd.read_parquet(file_path)
+        if file_path.exists():
+            return pd.read_parquet(file_path)
+        code, exch = ts_code.split(".")
+        ymd = trade_date.strftime("%Y%m%d")
+        ymd_dash = trade_date.strftime("%Y-%m-%d")
+        candidates_dirs = [
+            self.base_dir / exch.upper() / code,
+            self.base_dir / exch.lower() / code,
+            self.base_dir / code,
+        ]
+        for d in candidates_dirs:
+            if d.exists():
+                p1 = d / f"{ymd}_交易数据.parquet"
+                if p1.exists():
+                    return pd.read_parquet(p1)
+                p2 = d / f"{ymd_dash}_交易数据.parquet"
+                if p2.exists():
+                    return pd.read_parquet(p2)
+                files = list(d.glob("*.parquet"))
+                if files:
+                    sel = None
+                    for f in files:
+                        name = f.name
+                        has_ymd = (ymd in name) or (ymd_dash in name)
+                        if has_ymd:
+                            sel = f
+                            break
+                    if sel is None:
+                        sel = sorted(files)[-1]
+                    return pd.read_parquet(sel)
+        # 递归兜底：在任意层级下的 code 目录中查找目标日期文件
+        files2 = list(self.base_dir.rglob(f"**/{code}/*.parquet"))
+        if files2:
+            sel2 = None
+            for f in files2:
+                name = f.name
+                has_ymd = (ymd in name) or (ymd_dash in name)
+                if has_ymd:
+                    sel2 = f
+                    break
+            if sel2 is None:
+                sel2 = sorted(files2)[-1]
+            return pd.read_parquet(sel2)
+        return pd.DataFrame()
 
     def list_tick_files(self, ts_code: str, start_date: date, end_date: date) -> List[TickFileIndex]:
         eng = get_engine()
-        if eng is None:
-            return []
-        def _table_exists(conn, table_name: str) -> bool:
-            q = (
-                "select 1 from information_schema.tables where table_schema='public' and table_name='"
-                + table_name
-                + "'"
-            )
-            df_chk = pd.read_sql(q, conn)
-            return len(df_chk) > 0
         with eng.connect() as conn:
-            if not _table_exists(conn, "tick_file_index"):
+            inspector = inspect(conn)
+            has_tbl = inspector.has_table("tick_file_index", schema="public")
+            if not has_tbl:
                 return []
             q = text(
                 "select ts_code, trade_date, market, file_path, record_cnt, time_start, time_end, checksum "

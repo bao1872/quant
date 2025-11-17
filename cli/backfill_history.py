@@ -128,7 +128,7 @@ def main() -> None:
     os.environ["USE_REAL_DB"] = "1"
     eng = get_engine()
     start_time = perf_counter()
-    empty = True if eng is None else _is_db_empty(eng)
+    empty = _is_db_empty(eng)
     mode = "full"
 
     # If specific ts_codes provided, run targeted action and exit
@@ -151,12 +151,9 @@ def main() -> None:
             print(f"[collect_intraday_ticks:selected] Start for {len(ts_list)} stocks, trade_date={today}")
             collect_intraday_ticks(today, ts_codes=ts_list, count=args.count)
             print("[collect_intraday_ticks:selected] Done.")
-        tick_files = 0
-        tick_records = 0
-        if eng is not None:
-            n, total = _count_tick_stats_for_date_fs(today)
-            tick_files = n
-            tick_records = total
+        n, total = _count_tick_stats_for_date_fs(today)
+        tick_files = n
+        tick_records = total
         print(
             f"[backfill_history:selected] mode={args.mode} date={today} selected_count={len(ts_list)} today_tick_files={tick_files} today_records={tick_records} status=ok"
         )
@@ -186,18 +183,14 @@ def main() -> None:
             print(f"[backfill_tick_batch] start={b_start} end={b_end} size={len(b)}")
             for d in tqdm(b, desc="ticks_days", unit="day"):
                 collect_full_day_ticks(d)
-                if eng is not None:
-                    n, total = _count_tick_stats_for_date_fs(d)
-                    print(f"[verify] date={d} files={n} records={total}")
+                n, total = _count_tick_stats_for_date_fs(d)
+                print(f"[verify] date={d} files={n} records={total}")
 
     # job_finalize_ticks_and_levels(today)
     elapsed = perf_counter() - start_time
-    tick_files = 0
-    tick_records = 0
-    if eng is not None:
-        n, total = _count_tick_stats_for_date_fs(today)
-        tick_files = n
-        tick_records = total
+    n, total = _count_tick_stats_for_date_fs(today)
+    tick_files = n
+    tick_records = total
     print(f"[backfill_history] mode={mode} ohlc_range={ohlc_start}~{end} tick_range={tick_start}~{end} today_tick_files={tick_files} today_records={tick_records} elapsed={elapsed:.2f}s status=ok")
 
 

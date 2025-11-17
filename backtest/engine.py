@@ -7,9 +7,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from data.tick_store import TickStore
-from strategy.abu_level_strategy import AbuKeyLevelStrategy
-from strategy.base import PriceLevelProvider
-from factors import AbuPriceLevelProvider
+from strategy.base import PriceLevelProvider, Tick
+from strategy.registry import StrategyRegistry
 
 
 @dataclass
@@ -129,16 +128,18 @@ class BacktestContext:
 
 
 class TickBacktester:
-    def __init__(self, ts_code: str, price_level_provider: Optional[PriceLevelProvider] = None, initial_cash: float = 100_000.0, risk_config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, ts_code: str, price_level_provider: Optional[PriceLevelProvider] = None, initial_cash: float = 100_000.0, risk_config: Optional[Dict[str, Any]] = None, strategy_name: str = "abu_key_level") -> None:
         self.ts_code = ts_code
-        self.price_level_provider = price_level_provider or AbuPriceLevelProvider()
+        self.price_level_provider = price_level_provider
         self.initial_cash = float(initial_cash)
         self.tick_store = TickStore()
         self.risk_config = risk_config
+        self.strategy_name = strategy_name
 
     def run(self, trade_dates: List[date], strategy_config: Optional[Dict[str, Any]] = None) -> BacktestResult:
         ctx = BacktestContext(initial_cash=self.initial_cash, risk_config=self.risk_config)
-        strat = AbuKeyLevelStrategy(ts_code=self.ts_code, price_level_provider=self.price_level_provider, config=strategy_config)
+        registry = StrategyRegistry()
+        strat = registry.create(self.strategy_name, ts_code=self.ts_code, price_level_provider=self.price_level_provider, config=strategy_config)
         first_date = trade_dates[0]
         last_date = trade_dates[-1]
         for d in trade_dates:
@@ -147,8 +148,9 @@ class TickBacktester:
                 continue
             df_ticks = df_ticks.sort_values("datetime").reset_index(drop=True)
             for _, row in df_ticks.iterrows():
-                tick = {"ts_code": self.ts_code, "datetime": row["datetime"], "price": float(row.get("price", 0.0)), "volume": int(row.get("volume", 0)), "side": row.get("side", "N")}
-                strat.on_tick(tick, ctx)
+                t = Tick(ts_code=self.ts_code, dt=pd.Timestamp(row["datetime"]), price=float(row.get("price", 0.0)), volume=float(row.get("volume", 0)), amount=float(row.get("amount", 0.0)))
+                tick_dict = {"ts_code": t.ts_code, "datetime": t.dt, "price": t.price, "volume": int(t.volume), "side": row.get("side", "N")}
+                strat.on_tick(tick_dict, ctx)
         final_equity = ctx.equity
         trades = ctx.trades
         return BacktestResult(ts_code=self.ts_code, start_date=first_date, end_date=last_date, initial_cash=self.initial_cash, final_equity=final_equity, trades=trades)

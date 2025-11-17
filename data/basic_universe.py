@@ -4,7 +4,7 @@ import pandas as pd
 
 from config import MARKET_SZ, MARKET_SH
 from db.connection import get_engine
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 from .pytdx_source import PytdxDataSource
 from tqdm import tqdm
 
@@ -28,21 +28,18 @@ def load_a_share_universe() -> pd.DataFrame:
     df = df[(sz_ok | sh_ok) & (~is_st)].copy()
     df["market"] = df["exchange"]
     df["ts_code"] = df["code"] + "." + df["market"]
-    def _classify_board(code: str, market_name: str) -> str:
-        if market_name == "SZ":
-            if code.startswith(("000", "001", "003")):
-                return "SZ_MAIN"
-            if code.startswith("002"):
-                return "SZ_SMEB"
-            if code.startswith(("300", "301")):
-                return "SZ_CHINEXT"
-            return ""
-        if code.startswith(("600", "601", "603", "605")):
-            return "SH_MAIN"
-        if code.startswith(("688", "689")):
-            return "SH_STAR"
-        return ""
-    df["board"] = df.apply(lambda r: _classify_board(str(r["code"]), str(r["market"])), axis=1)
+    sz_main = df["market"].eq("SZ") & df["code"].str.startswith(tuple(["000", "001", "003"]))
+    sz_smeb = df["market"].eq("SZ") & df["code"].str.startswith("002")
+    sz_chinext = df["market"].eq("SZ") & df["code"].str.startswith(tuple(["300", "301"]))
+    sh_main = df["market"].eq("SH") & df["code"].str.startswith(tuple(["600", "601", "603", "605"]))
+    sh_star = df["market"].eq("SH") & df["code"].str.startswith(tuple(["688", "689"]))
+    board = pd.Series([""] * len(df))
+    board = board.mask(sz_main, "SZ_MAIN")
+    board = board.mask(sz_smeb, "SZ_SMEB")
+    board = board.mask(sz_chinext, "SZ_CHINEXT")
+    board = board.mask(sh_main, "SH_MAIN")
+    board = board.mask(sh_star, "SH_STAR")
+    df["board"] = board
     df = df[df["board"] != ""].copy()
     df = df[["ts_code", "code", "name", "market", "board"]].drop_duplicates(subset=["ts_code"]).sort_values(["market", "code"]).reset_index(drop=True)
     return df
@@ -51,27 +48,14 @@ def load_a_share_universe() -> pd.DataFrame:
 def ensure_stock_basic_a_share() -> int:
     df = load_a_share_universe()
     eng = get_engine()
-    if eng is None:
-        return 0
-    def _table_exists(table_name: str) -> bool:
-        q = (
-            "select 1 from information_schema.tables where table_schema='public' and table_name='"
-            + table_name
-            + "'"
-        )
-        chk = pd.read_sql(q, eng)
-        return len(chk) > 0
-    def _table_columns(table_name: str) -> list[str]:
-        q = (
-            "select column_name from information_schema.columns where table_schema='public' and table_name='"
-            + table_name
-            + "' order by ordinal_position"
-        )
-        df_cols = pd.read_sql(q, eng)
-        return [str(c) for c in df_cols["column_name"].tolist()]
-    if _table_exists("stock_basic"):
-        with eng.begin() as conn:
-            conn.execute(text("truncate table stock_basic"))
+    insp = inspect(eng)
+    has_table = insp.has_table("stock_basic", schema="public")
+    cols: list[str] = []
+    if has_table:
+        df_existing = pd.read_sql_table("stock_basic", eng)
+        existing_ts = set(df_existing["ts_code"].astype(str).tolist()) if not df_existing.empty else set()
+    else:
+        existing_ts = set()
     # enrich shares info
     with PytdxDataSource() as ds:
         shares_rows = []
@@ -82,7 +66,7 @@ def ensure_stock_basic_a_share() -> int:
         if shares_rows:
             df_shares = pd.concat(shares_rows, ignore_index=True)
             df = df.merge(df_shares, on="ts_code", how="left")
-    cols = _table_columns("stock_basic") if _table_exists("stock_basic") else ["ts_code", "code", "exchange", "name"]
+    cols = list(df.columns) if not has_table else df_existing.columns.astype(str).tolist()
     df_out = df.copy()
     df_out["exchange"] = df_out["market"].astype(str)
     if "is_st" in cols:
@@ -104,6 +88,8 @@ def ensure_stock_basic_a_share() -> int:
         "ts_code","code","exchange","market","name","board","total_shares","float_shares","is_st","source","updated_at","security_type","currency"
     ] if c in cols]
     df_out = df_out[out_cols]
+    if existing_ts:
+        df_out = df_out[~df_out["ts_code"].isin(existing_ts)]
     df_out.to_sql("stock_basic", eng, if_exists="append", index=False)
     return len(df_out)
 

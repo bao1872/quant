@@ -46,16 +46,18 @@ class DummySession:
         return None
 
 
+_engine = None
+
+def _get_real_engine():
+    global _engine
+    if _engine is None:
+        _engine = create_engine(DATABASE_URL, future=True)
+    return _engine
+
 def get_session():
-    use_real = os.getenv("USE_REAL_DB", "0") == "1"
-    if use_real:
-        engine = create_engine(DATABASE_URL, future=True)
-        Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-        return Session()
-    return DummySession()
+    engine = _get_real_engine()
+    Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    return Session()
 
 def get_engine():
-    use_real = os.getenv("USE_REAL_DB", "0") == "1"
-    if use_real:
-        return create_engine(DATABASE_URL, future=True)
-    return None
+    return _get_real_engine()

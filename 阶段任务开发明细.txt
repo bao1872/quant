@@ -1,548 +1,507 @@
-一、你要实现的四件事
+一、目标概述
 
-StockBasic：全市场 A 股股票池（主板/中小板/创业板/科创板，剔除 ST）
+围绕 stock_bollinger_data + 逐笔数据，构建一套完整的：
 
-K 线历史：至少最近 2 年的日线 OHLC 数据
+股性活跃选股池：
 
-Tick：当前版本支持“每日盘后抓取最近 N 笔 tick，写入 TickStore”
+条件：近期曾 v_price_position > 99、曾 price_position > 50，代表放量+强势。
 
-APScheduler：每天盘后自动跑一次增量更新（股票池 + 日线 + tick + 因子）
+资金质量评估（日度）：
 
-下面所有代码都按你现在的项目结构来写：
+评价过去几天拉升是“高质量资金”还是“杂散资金”，用于在股池里排序、过滤。
 
-quant/
-  config.py
-  data/
-    base_source.py
-    pytdx_source.py
-    repository.py
-    updater.py
-    jobs.py          # 会替换成新版本
-    basic_universe.py  # 新增
-  cli/
-    backfill_history.py  # 新增
-  scheduler.py       # 新增
+关键价位（支撑/阻力）资金吸收分析：
 
-二、修改 1：放开股票池上限（一次性跑全 A 股）
+对阿布价位 / 重要价位附近，统计大单吸筹/出货情况，判断真正的强支撑/重阻力。
 
-文件：config.py
+最终策略：
 
-你现在是：
+只在：
 
-def _parse_optional_int(env_name: str, default: str) -> int | None:
-    v = os.getenv(env_name, default)
-    v = v.strip() if isinstance(v, str) else v
-    if v == "":
-        return None
-    return int(v)
+股性活跃
 
-STOCK_POOL_LIMIT: int | None = _parse_optional_int("STOCK_POOL_LIMIT", "20")
-TICK_COUNT_LIMIT: int = int(os.getenv("TICK_COUNT_LIMIT", "1000"))
+资金质量高
 
+下方有强支撑吸筹、上方无明显重阻力出货
+的标的上找买点。
 
-改成：
+二、数据与新表设计
+2.1 已有表（只引用）
 
-def _parse_optional_int(env_name: str, default: str) -> int | None:
-    v = os.getenv(env_name, default)
-    v = v.strip() if isinstance(v, str) else v
-    if v == "":
-        return None
-    return int(v)
+stock_bollinger_data
 
-# 默认不限制股票池（全市场）；调试时可以在环境变量里设置 STOCK_POOL_LIMIT=100 之类的
-STOCK_POOL_LIMIT: int | None = _parse_optional_int("STOCK_POOL_LIMIT", "")
+字段（简化）：ts_code, trade_date, price_position, band_width_zscore, v_price_position, v_band_width_zscore, ...
 
-# 每只股票抓多少条 tick（pytdx 限制一般是 2000 左右）
-TICK_COUNT_LIMIT: int = int(os.getenv("TICK_COUNT_LIMIT", "1000"))
+stock_daily
 
+ts_code, trade_date, open, high, low, close, vol, amount, ...
 
-这样 _get_all_stock_codes() 默认就会返回 所有 stock_basic 里的股票，而不再只取 20 只。
+tick 数据 & 价位表
 
-三、修改 2：新增全 A 股股票池构建模块
+tick：逐笔（以你现有 parquet / 表为准）
 
-文件（新增）：data/basic_universe.py
+abu_price_levels（或你现有的阿布价位表）
 
-这个模块用 pytdx 的 get_security_list 拉深/沪所有证券列表，然后：
+ts_code, trade_date / calc_date, level_price, level_type (support/resistance/flip), ...
 
-通过 代码前缀 判断是不是 A 股（主板/中小板/创业板/科创板）
+2.2 新增一：股性活跃选股池表 stock_active_pool
 
-用 名字里是否包含 “ST”/“退” 过滤 ST & 退市股 
-GitHub
-+1
+作用：记录每天盘后筛出来的“活跃标的池”。
 
-生成 ts_code = code.market（如 000001.SZ）
+表结构建议：
 
-写入 stock_basic 表（默认先 TRUNCATE 再插入）
+stock_active_pool
+-----------------
+ts_code        VARCHAR
+trade_date     DATE      -- 信号日期（T 日）
+window_days    INT       -- 回看窗口，比如 20
+has_high_vpos  BOOLEAN   -- 该窗口内是否出现 v_price_position > 99
+has_high_ppos  BOOLEAN   -- 该窗口内是否出现 price_position > 50 or 70
+max_vpos       FLOAT
+max_ppos       FLOAT
+avg_amount     NUMERIC   -- 窗口内日均成交额
+remarks        TEXT      -- 预留
+PRIMARY KEY (ts_code, trade_date)
 
-# data/basic_universe.py
-"""
-A 股股票池管理与 stock_basic 表回填脚本。
+2.3 新增二：日度微结构摘要 stock_microstructure_daily
 
-功能：
-- 从 pytdx 行情服务器获取沪深全部证券列表；
-- 过滤出 A 股（主板 / 中小板 / 创业板 / 科创板）且剔除 ST、退市；
-- 生成 ts_code（如 000001.SZ），写入 Postgres 中的 stock_basic 表；
-- 提供 ensure_stock_basic_a_share() 在定时任务中每日调用，保证股票池最新。
+作用：对每只股票、每天的逐笔成交做资金结构汇总，用于资金质量和后续分析。
 
-使用前准备：
-- 已在 config.DATABASE_URL 中配置好 Postgres 连接；
-- 已安装 pytdx：  pip install pytdx ;
-- 推荐在环境变量中设置 USE_REAL_DB=1 ，确保真正写库。
-"""
+表结构建议：
 
-from __future__ import annotations
+stock_microstructure_daily
+--------------------------
+ts_code           VARCHAR
+trade_date        DATE
+total_value       NUMERIC    -- 全日成交额
+total_volume      BIGINT
+vwap              NUMERIC    -- 全日 VWAP
 
-from dataclasses import dataclass
-from typing import List
+big_buy_value     NUMERIC    -- 大单买入额
+big_sell_value    NUMERIC    -- 大单卖出额
+big_net_value     NUMERIC    -- 大单净额
+big_net_ratio     NUMERIC    -- big_net_value / total_value
+big_buy_ratio     NUMERIC    -- big_buy_value / total_value
+big_sell_ratio    NUMERIC    -- big_sell_value / total_value
 
-import pandas as pd
-from pytdx.hq import TdxHq_API
-from sqlalchemy import text
+big_net_open      NUMERIC    -- 09:30-10:00
+big_net_mid       NUMERIC    -- 10:00-14:00
+big_net_close     NUMERIC    -- 14:00-15:00
 
-from config import MARKET_SZ, MARKET_SH
-from db.connection import get_engine
+order_flow_imbalance  NUMERIC  -- (主动买额 - 主动卖额) / 总成交额
 
-A_SHARE_PREFIX_SZ = ("000", "001", "002", "003", "300")
-A_SHARE_PREFIX_SH = ("600", "601", "603", "605", "688", "689")
+created_at        TIMESTAMP
+PRIMARY KEY (ts_code, trade_date)
 
 
-@dataclass
-class AShareBasic:
-    ts_code: str
-    code: str
-    name: str
-    market: str   # "SZ" / "SH"
-    board: str    # "SZ_MAIN" / "SZ_SMEB" / "SZ_CHINEXT" / "SH_MAIN" / "SH_STAR"
+大单阈值建议按 每只股票、最近 60 日 tick 的成交额 P90/P95 计算，可先写死一个阈值，后面再优化。
 
+2.4 新增三：资金质量评分表 stock_fund_quality
 
-def _connect_td_api() -> TdxHq_API:
-    api = TdxHq_API()
-    # 可以换成你稳定的 pytdx 服务器
-    hosts = [
-        ("119.147.164.60", 7709),
-        ("180.153.18.171", 7709),
-        ("114.80.149.19", 7709),
-        ("115.238.90.165", 7709),
-        ("123.125.108.23", 7709),
-        ("218.108.98.244", 7709),
-    ]
-    for ip, port in hosts:
-        try:
-            if api.connect(ip, port):
-                print(f"[basic_universe] Connected pytdx {ip}:{port}")
-                return api
-        except Exception as e:  # noqa: BLE001
-            print(f"[basic_universe] connect {ip}:{port} failed: {e}")
-    raise RuntimeError("basic_universe: 无法连接任一 pytdx 服务器，请检查网络或更换节点。")
+作用：以“最近一段上涨窗口”为单位，对资金质量打分。
 
+stock_fund_quality
+------------------
+ts_code              VARCHAR
+window_start         DATE
+window_end           DATE
+window_days          INT
 
-def _fetch_market_list(api: TdxHq_API, market: int, market_name: str) -> pd.DataFrame:
+price_return         NUMERIC      -- 涨幅（close_end / close_start - 1）
+big_net_sum          NUMERIC      -- 窗口大单净流入
+turnover_ratio       NUMERIC      -- 窗口总成交额 / 自由流通市值
+
+pos_days_ratio       NUMERIC      -- 大单净流入为正的天数占比
+trend_corr           NUMERIC      -- 累计净流入 vs 收盘价的相关
+
+big_cost_gain        NUMERIC      -- 成本区浮盈：close_end / big_buy_vwap - 1
+support_ratio        NUMERIC      -- 回调段中大单净流入 >= 0 的比例
+
+fund_quality_score   NUMERIC      -- 综合得分，0~1 或 z-score
+created_at           TIMESTAMP
+
+PRIMARY KEY (ts_code, window_end)
+
+2.5 新增四：价位微结构表 stock_level_microstructure
+
+作用：对每个关键价位、每次测试，统计资金吸收情况（支撑/阻力）。
+
+stock_level_microstructure
+--------------------------
+ts_code          VARCHAR
+trade_date       DATE
+level_price      NUMERIC
+level_type       VARCHAR   -- 'support' / 'resistance' / 'flip'
+test_id          INT       -- 当日同一价位的第几次测试
+
+band_pct         NUMERIC   -- 观察带宽相对比例
+vol_total        BIGINT
+value_total      NUMERIC
+
+big_buy_value    NUMERIC
+big_sell_value   NUMERIC
+big_net_value    NUMERIC
+big_net_ratio    NUMERIC
+
+order_flow_imbalance NUMERIC
+
+max_penetration  NUMERIC   -- 相对 level 的最大穿透幅度（support 用向下，resistance 用向上）
+time_above_level_ratio  NUMERIC
+time_below_level_ratio  NUMERIC
+
+future_return_30m  NUMERIC
+future_return_1d   NUMERIC
+
+support_absorption_score_test         NUMERIC  -- 对 support type 有效
+resistance_sell_absorption_score_test NUMERIC  -- 对 resistance type 有效
+flip_support_score_test               NUMERIC  -- 对 flip type 回踩时
+
+created_at       TIMESTAMP
+PRIMARY KEY (ts_code, trade_date, level_price, test_id)
+
+三、模块与函数设计
+
+下面按照你项目风格，给出推荐的模块 / 函数。
+
+3.1 股性活跃选股池（基于 stock_bollinger_data）
+
+文件建议： factors/active_pool.py
+
+核心函数：
+
+def build_active_pool(trade_date: date, window_days: int = 20) -> None:
     """
-    拉取某市场全部证券列表，并附加 market 列（'SZ' / 'SH'）。
+    从 stock_bollinger_data 构建某日的股性活跃池，写入 stock_active_pool。
+    条件：
+      - 过去 window_days 内曾经 v_price_position > 99
+      - 且曾经 price_position > 50 或 70
+      - 过滤 ST、退市、日均成交额过低的票
     """
-    from math import ceil
-
-    total = api.get_security_count(market)
-    if not total or total <= 0:
-        return pd.DataFrame()
-    all_chunks: List[pd.DataFrame] = []
-    for i in range(ceil(total / 1000)):
-        start = i * 1000
-        rows = api.get_security_list(market=market, start=start)
-        if not rows:
-            break
-        df = pd.DataFrame(rows)
-        df["market"] = market_name
-        all_chunks.append(df)
-    if not all_chunks:
-        return pd.DataFrame()
-    df_all = pd.concat(all_chunks, ignore_index=True)
-    return df_all
 
 
-def _classify_board(code: str, market_name: str) -> str:
-    if market_name == "SZ":
-        if code.startswith(("000", "001", "003")):
-            return "SZ_MAIN"
-        if code.startswith("002"):
-            return "SZ_SMEB"
-        if code.startswith("300"):
-            return "SZ_CHINEXT"
-        return ""
-    else:  # SH
-        if code.startswith(("600", "601", "603", "605")):
-            return "SH_MAIN"
-        if code.startswith(("688", "689")):
-            return "SH_STAR"
-        return ""
+逻辑要点：
 
+从 stock_bollinger_data 查询 [trade_date - window_days + 1, trade_date] 范围内数据；
 
-def load_a_share_universe() -> pd.DataFrame:
+group by ts_code：
+
+max_vpos = max(v_price_position)
+
+max_ppos = max(price_position)
+
+avg_amount 从 stock_daily 聚合；
+
+条件：
+
+max_vpos > 99
+
+max_ppos > 50（或 70，可配）
+
+avg_amount > 某阈值（如 3000 万）
+
+将满足条件的 ts_code 写入 stock_active_pool。
+
+3.2 日度微结构摘要（逐笔 → stock_microstructure_daily）
+
+文件建议： microstructure/daily_summary.py
+
+3.2.1 逐笔增强 &单日指标
+def summarize_microstructure_for_stock(
+    ts_code: str,
+    trade_date: date,
+    big_trade_threshold: float,
+) -> dict:
     """
-    返回过滤后的 A 股股票列表 DataFrame，字段：
-    - ts_code
-    - code
-    - name
-    - market
-    - board
+    读取某只股票某一天的 tick 数据，计算:
+      - total_value, total_volume, vwap
+      - big_buy_value, big_sell_value, big_net_value, big_net_ratio
+      - big_net_open/mid/close
+      - order_flow_imbalance
+    返回字典，后续写库。
     """
-    api = _connect_td_api()
-    try:
-        df_sz = _fetch_market_list(api, MARKET_SZ, "SZ")
-        df_sh = _fetch_market_list(api, MARKET_SH, "SH")
-    finally:
-        api.disconnect()
-
-    if df_sz.empty and df_sh.empty:
-        raise RuntimeError("basic_universe: 从 pytdx 未取到任何证券列表。")
-
-    df_all = pd.concat([df_sz, df_sh], ignore_index=True)
-
-    # 只保留必要字段
-    # 常见字段：code, name, volunit, decimal_point, pre_close
-    cols = [c for c in ["code", "name", "market"] if c in df_all.columns]
-    df = df_all[cols].copy()
-
-    # 剔除缺失 code 的行
-    df = df[df["code"].astype(str).str.len() > 0].reset_index(drop=True)
-
-    # 分类板块 + 过滤 A 股
-    df["board"] = df.apply(
-        lambda r: _classify_board(str(r["code"]), str(r["market"])),
-        axis=1,
-    )
-    df = df[df["board"] != ""].copy()
-
-    # 过滤 ST / 退市
-    name_series = df["name"].astype(str)
-    mask_st = (
-        name_series.str.contains("ST", case=False, na=False)
-        | name_series.str.contains("退", na=False)
-    )
-    df = df[~mask_st].copy()
-
-    # 生成 ts_code
-    df["code"] = df["code"].astype(str).str.zfill(6)
-    df["ts_code"] = df["code"] + "." + df["market"].astype(str)
-
-    df = df[["ts_code", "code", "name", "market", "board"]].drop_duplicates(
-        subset=["ts_code"]
-    )
-    df = df.sort_values(["market", "code"]).reset_index(drop=True)
-
-    print(f"[basic_universe] A 股非 ST 股票数量: {len(df)}")
-    return df
 
 
-def save_stock_basic(df: pd.DataFrame) -> int:
+要点：
+
+从 TickStore 或 tick 表读出该日 tick；
+
+为每条成交打上：
+
+trade_value = price * volume
+
+side（主动买/卖）——用你已有逻辑；
+
+time_bucket（09:30–10:00 / 10:00–14:00 / 14:00–15:00）；
+
+根据 big_trade_threshold 判断大单；
+
+按上面表结构聚合。
+
+3.2.2 批量任务（对股池）
+def build_microstructure_daily(trade_date: date, only_active_pool: bool = True) -> None:
     """
-    将 DataFrame 写入 stock_basic 表。
-
-    简化策略：
-    - 如果已存在 stock_basic：先 TRUNCATE，再插入；
-    - 如果不存在：自动创建（仅包含 df 中的字段）。
-
-    如你已有自定义字段，可以在建表时先手工加上默认值 / 允许 NULL。
+    对 trade_date 的股票，批量生成 daily microstructure，写入 stock_microstructure_daily。
+    默认只对 stock_active_pool 里的股票处理。
     """
-    eng = get_engine()
-    if eng is None:
-        print("[basic_universe] 当前未启用真实数据库 (USE_REAL_DB != 1)，仅返回 DataFrame。")
-        return 0
 
-    with eng.begin() as conn:
-        # 尝试截断原表（如果不存在会失败，我们忽略异常）
-        try:
-            conn.execute(text("TRUNCATE TABLE stock_basic"))
-            print("[basic_universe] 已清空 stock_basic 表。")
-        except Exception as e:  # noqa: BLE001
-            print(f"[basic_universe] TRUNCATE stock_basic 失败，可能是首次创建表：{e}")
+3.3 资金质量评分（stock_fund_quality）
 
-    # 追加写入
-    df.to_sql("stock_basic", eng, if_exists="append", index=False)
-    print(f"[basic_universe] 已写入 stock_basic 行数: {len(df)}")
-    return len(df)
+文件建议： microstructure/fund_quality.py
 
-
-def ensure_stock_basic_a_share() -> int:
+3.3.1 确定上涨窗口
+def detect_rise_window(ts_code: str, trade_date: date, max_lookback: int = 20) -> tuple[date, date]:
     """
-    对外入口：
-    - 从 pytdx 拉取最新 A 股列表；
-    - 写入 / 覆盖 stock_basic。
+    从 stock_daily / stock_bollinger_data 中，识别出以 trade_date 为末日的
+    最近一段“上涨窗口”[window_start, trade_date]。
+    简化版可以用：
+      - close_trade_date > close_{trade_date-k}
+      - 中间最大回撤 < 某阈值
     """
-    df = load_a_share_universe()
-    return save_stock_basic(df)
 
-
-if __name__ == "__main__":
-    # 手动执行：python -m data.basic_universe
-    cnt = ensure_stock_basic_a_share()
-    print(f"[basic_universe] DONE, count={cnt}")
-
-四、修改 3：调整 jobs.py，让日线一次拿够 2 年，并支持不限股票数抓 tick
-
-文件（替换原文件）：data/jobs.py
-
-# data/jobs.py
-"""
-定时任务入口（供 APScheduler 或手工脚本调用）。
-
-包含三个主要 Job：
-- job_update_ohlc: 盘前 / 盘后更新日线 & 分钟线
-- job_collect_ticks_once: 抓取当日 tick（当前为“最近 N 笔”）
-- job_finalize_ticks_and_levels: 收盘后（或盘前）计算关键价位等因子
-"""
-
-from __future__ import annotations
-
-from datetime import date as _date
-
-from .updater import (
-    update_daily_bars,
-    update_minute_bars,
-    collect_intraday_ticks,
-)
-from .repository import get_all_stock_basics
-from factors import AbuPriceLevelProvider
-
-
-def job_update_ohlc(trade_date: _date) -> None:
+3.3.2 在窗口上计算资金质量
+def compute_fund_quality_for_window(
+    ts_code: str,
+    window_start: date,
+    window_end: date,
+) -> dict:
     """
-    更新 OHLC（open / high / low / close）相关的 K 线数据。
-
-    当前实现：
-    - 日线：对股票池中全部 ts_code，拉取最近 600 条日线；
-      * 首次运行时，数据库为空，会写入最近 ~2 年的日线数据；
-      * 此后每天运行时，只会对“数据库中最后 trade_date 之后”的部分做增量写入；
-    - 分钟线：默认关闭，如需 1 分钟 K 线，可解除注释。
+    从 stock_microstructure_daily + stock_daily + basic 表读取数据，计算：
+      - price_return, big_net_sum, turnover_ratio
+      - pos_days_ratio, trend_corr
+      - big_cost_gain（大单成本区浮盈）
+      - support_ratio（回调段中大单净流入 >= 0 的比例）
+      - fund_quality_score（按权重综合）
+    返回字典。
     """
-    print(f"[job_update_ohlc] trade_date={trade_date}")
-
-    # 日线：最近 600 条（约 2 年）
-    update_daily_bars(trade_date=trade_date, count=600)
-
-    # 如果需要分钟线，可打开下面一行（注意数据量 & 访问频率）：
-    # update_minute_bars(trade_date=trade_date, freq="1m", count=240)
 
 
-def job_collect_ticks_once(trade_date: _date, limit: int | None = 20) -> None:
+具体指标实现参考：
+
+price_return = close_end / close_start - 1
+
+big_net_sum = Σ big_net_value_d
+
+turnover_ratio = Σ total_value_d / free_float_value
+
+pos_days_ratio = (big_net_value_d > 0 的天数) / 窗口长度
+
+trend_corr：对 [累计 big_net_value_d] 和 close_d 做相关系数
+
+big_buy_vwap：窗口内所有大买单的加权价；
+big_cost_gain = close_end / big_buy_vwap - 1
+
+support_ratio：在窗口内所有“回调段”中，big_net_pullback >= 0 的段数比率
+（回调段可以先简单定义为连续多日收盘回落 2%～4% 的片段）
+
+fund_quality_score：
+
+先对上述指标做标准化（在同一日或滚动窗口内），再用权重线性组合。
+
+3.3.3 批量任务
+def build_fund_quality(trade_date: date) -> None:
     """
-    抓取当日 tick 数据并写入 TickStore（parquet + tick_file_index）。
-
-    参数：
-    - trade_date: 交易日期
-    - limit: 限制股票数量；None 或 <=0 表示对股票池中全部标的抓取。
-
-    说明：
-    - 当前 collect_intraday_ticks 使用 pytdx 网络接口，只能获取最近 N 笔成交；
-      无法直接一次性拿到完整的“当日全量 tick”，因此严格意义上的
-      “最近两年 tick 全量历史”仍需配合本地通达信数据文件等方式回填。
+    对 trade_date 当天 stock_active_pool 中的每只标的：
+      1）识别上涨窗口
+      2）计算资金质量指标
+      3）写入 stock_fund_quality
     """
-    basics = get_all_stock_basics()
-    ts_codes = [s.ts_code for s in basics]
-    if limit is not None and limit > 0:
-        ts_codes = ts_codes[:limit]
-        print(f"[job_collect_ticks_once] limit={limit} -> 实际抓取 {len(ts_codes)} 只股票")
-    else:
-        print(f"[job_collect_ticks_once] 不限制股票数量，抓取 {len(ts_codes)} 只股票")
 
-    collect_intraday_ticks(trade_date=trade_date, ts_codes=ts_codes, count=1000)
+3.4 价位资金吸收（stock_level_microstructure）
 
+文件建议： microstructure/level_absorption.py
 
-def job_finalize_ticks_and_levels(trade_date: _date) -> None:
+3.4.1 对单个价位、单次测试做分析
+def analyze_level_absorption_for_test(
+    ticks: pd.DataFrame,
+    level_price: float,
+    level_type: str,
+    band_pct: float = 0.005,
+    future_horizon_minutes: int = 30,
+) -> dict:
     """
-    基于 tick / 日线等数据重新计算关键价位（供因子使用）。
+    针对某只股票某日 tick 中的一次“价位测试”，计算：
+      - vol_total, value_total
+      - big_buy_value / big_sell_value / big_net_value / big_net_ratio
+      - order_flow_imbalance
+      - max_penetration（最大穿透幅）
+      - time_above_level_ratio / time_below_level_ratio
+      - future_return_30m, future_return_1d
+      - support_absorption_score_test / resistance_sell_absorption_score_test / flip_support_score_test
     """
-    print(f"[job_finalize_ticks_and_levels] trade_date={trade_date}")
-    provider = AbuPriceLevelProvider()
-    provider.precompute(trade_date)
 
 
-if __name__ == "__main__":
-    from datetime import date as date_cls
+处理流程：
 
-    today = date_cls.today()
-    print("[jobs] self test -> job_update_ohlc")
-    job_update_ohlc(today)
-    print("[jobs] self test -> job_finalize_ticks_and_levels")
-    job_finalize_ticks_and_levels(today)
+确定观察带：
+[L*(1-band_pct), L*(1+band_pct)]；
 
+识别“测试片段”：
 
-说明：
+价格从带外进入→在带内停留→离开带内
 
-update_daily_bars(trade_date, count=600) 会对每只股票取最近 600 条日线（你在 pytdx_source 里已经写好按时间升序 + upsert）。
+给每个片段一个 test_id；
 
-limit=None 时，job_collect_ticks_once 会对股票池中所有股票抓 tick。
-建议一开始调试时用 limit=100 + 比较小的 STOCK_POOL_LIMIT，确认速度和磁盘占用再放开。
+对每个片段在带内的 tick 做聚合，计算上述字段；
 
-五、修改 4：新增 CLI 一键历史回填脚本
+分别按 level_type 推出对应 score（公式参考你前面认同的那套）：
 
-文件（新增）：cli/backfill_history.py
+支撑吸收：大单净买 + 不被深穿 + 后续反弹；
 
-这个脚本就是你手动执行一次，用来初始化历史数据。
+阻力卖出吸收：大单净卖 + 多次冲不过 + 后续回落；
 
-# cli/backfill_history.py
-"""
-一次性历史数据回填入口。
+flip 支撑：阻力上方变为支撑后的回踩吸筹质量。
 
-执行步骤：
-1）根据 pytdx 行情服务器自动生成 A 股（主板 / 中小板 / 创业板 / 科创板，剔除 ST）
-    股票池，并写入 stock_basic；
-2）回填最近 600 条日线数据（约 2 年历史）到 stock_daily；
-3）可选：抓取当日 tick、计算关键价位等。
-
-用法：
-- 在项目根目录执行：  python -m cli.backfill_history
-- 或者： python cli/backfill_history.py
-"""
-
-from __future__ import annotations
-
-from datetime import date
-
-from data.basic_universe import ensure_stock_basic_a_share
-from data.jobs import job_update_ohlc, job_collect_ticks_once, job_finalize_ticks_and_levels
-
-
-def main() -> None:
-    today = date.today()
-    print(f"[backfill_history] 回填基准日期 trade_date={today}")
-
-    print("[backfill_history] 1) 回填 A 股股票池到 stock_basic ...")
-    ensure_stock_basic_a_share()
-
-    print("[backfill_history] 2) 回填最近 ~2 年日线数据到 stock_daily ...")
-    job_update_ohlc(today)
-
-    print("[backfill_history] 3) 抓取当日 tick（当前仅最近 N 笔） ...")
-    # 如不需要 tick，可以注释掉下面一行
-    job_collect_ticks_once(today, limit=None)
-
-    print("[backfill_history] 4) 计算价位因子 ...")
-    job_finalize_ticks_and_levels(today)
-
-    print("[backfill_history] 历史数据回填完成。")
-
-
-if __name__ == "__main__":
-    main()
-
-六、修改 5：新增 APScheduler 定时任务入口
-
-文件（新增）：项目根目录 scheduler.py
-
-这个文件用 APScheduler 的 BlockingScheduler，每个交易日盘后 15:10 自动跑：
-
-更新股票池
-
-更新最近 600 条日线
-
-抓取当日 tick
-
-计算因子
-
-# scheduler.py
-"""
-使用 APScheduler 管理量化项目的定时任务。
-
-主要任务：
-- 每个交易日盘后（默认为 15:10，收盘后预留几分钟）：
-    1）更新 A 股股票池（主板/中小板/创业板/科创板，剔除 ST）；
-    2）回填最近若干日的日线数据（默认 600 个交易日 ≈ 2 年）；
-    3）可选：分钟线；
-    4）抓取当日 tick（当前通过 pytdx 网络接口，只能拿到最近 N 笔，非完整两年历史）；
-    5）计算关键价位等因子。
-
-使用方式：
-- 安装依赖： pip install apscheduler pytz
-- 在项目根目录执行：  python scheduler.py
-- 部署时可以用 systemd / supervisor 等将其作为常驻进程。
-"""
-
-from __future__ import annotations
-
-from datetime import date, datetime
-
-import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-from config import Settings
-from data.basic_universe import ensure_stock_basic_a_share
-from data.jobs import job_update_ohlc, job_collect_ticks_once, job_finalize_ticks_and_levels
-
-TZ_CN = pytz.timezone("Asia/Shanghai")
-
-
-def is_trading_day(d: date) -> bool:
+3.4.2 批量处理（某标的一天）
+def build_level_microstructure_for_stock(
+    ts_code: str,
+    trade_date: date,
+    band_pct: float = 0.005,
+) -> None:
     """
-    简单判断交易日：周一~周五视为交易日。
-    更精细的节假日过滤可以后续接入交易所日历或 tushare 等。
+    读取：
+      - 当日 tick
+      - 当日或最近一次的阿布价位（abu_price_levels）
+    对每个 level, 对所有测试片段调用 analyze_level_absorption_for_test，
+    并写入 stock_level_microstructure。
     """
-    return d.weekday() < 5  # 0=Monday, 6=Sunday
 
+3.4.3 全市场任务（可只对活跃池）
+def build_level_microstructure(trade_date: date) -> None:
+    """
+    对 trade_date 的股票（建议只对 active_pool + 有 Abu 价位的票）批量执行。
+    """
+
+四、策略层设计（选股+择时）
+
+文件建议： strategy/strategy_bollinger_microstructure.py
+
+4.1 选股（盘后）
+
+选股逻辑（T 日盘后）：
+
+从以下表 join：
+
+stock_active_pool（T 日）
+
+stock_fund_quality（以 window_end <= T 的最近一条）
+
+stock_level_microstructure（最近 N 日统计）
+
+筛选条件示例：
+
+股性活跃：
+
+stock_active_pool 里存在；
+
+资金质量：
+
+fund_quality_score 在当日所有候选中处于前 30%；
+
+支撑吸筹：
+
+下方某个主要支撑位（如最近的阿布支撑）
+support_absorption_score_L 在历史分位数 Top 30%，
+并且当前收盘价距离该支撑位不太远。
+
+阻力压制不强：
+
+上方最近主要阻力位的 resistance_sell_absorption_score_L 不高；
+
+或已翻转为 flip 支撑，且 flip_support_score_L 高。
+
+输出：
+T+1 观察 + 允许建仓的 候选列表，包含：
+
+ts_code
+
+理想支撑价位（买点参考）
+
+资金质量分数 & 支撑/阻力情况。
+
+4.2 择时 & 交易规则（框架）
+
+可以先在日线回测层实现简单版本：
+
+入场（T+1）：
+
+若 T+1 日开盘价在支撑位附近（比如 |open - L| / L < 0.5%），则按开盘价建仓；
+
+或在 T+1 日低价不跌破支撑位太多、收盘在 L 上方则以收盘价建仓。
+
+止盈：
+
+第一档：价格回到布林中轨 price_position >= 50 卖一半；
+
+第二档：价格接近上轨 price_position >= 80 或上方阻力位附近全部卖出。
+
+止损：
+
+跌破支撑位一定比例（如 1–2%）+ 当日支撑位附近 big_net_ratio < 0、order_flow_imbalance << 0 → 止损；
+
+或固定 -5% + 时间止损（超过 10 日未触达中轨）。
+
+后续可以在 tick 回测引擎中实现更精细的 “在支撑带内看逐笔实时吸筹再决策”。
+
+五、调度与运行流程（APScheduler）
+
+在你现有 scheduler 中加一个盘后任务链：
 
 def run_post_close_jobs(trade_date: date | None = None) -> None:
-    """
-    盘后主任务：
-    - 更新股票池
-    - 更新日线（最近 600 条）
-    - 抓取当日 tick
-    - 计算价位因子
-    """
-    if trade_date is None:
-        trade_date = date.today()
+    d = trade_date or get_latest_trading_date()
 
-    if not is_trading_day(trade_date):
-        print(f"[scheduler] {trade_date} 非交易日，跳过盘后任务。")
-        return
+    # 1. 更新日线 & 布林表（你已经有）
+    job_update_ohlc(d)
+    job_update_bollinger(d)
 
-    print(f"[scheduler] ====== 开始盘后任务 trade_date={trade_date} ======")
+    # 2. 构建股性活跃池
+    build_active_pool(d)
 
-    # 1) 更新 A 股股票池
-    ensure_stock_basic_a_share()
+    # 3. 对活跃池生成日度微结构摘要
+    build_microstructure_daily(d, only_active_pool=True)
 
-    # 2) 更新日线 / 分钟线
-    #   - update_daily_bars 内部会根据数据库中已有的最后交易日做增量控制；
-    #   - count 设为 600，首次运行即可拿到最近 ~2 年的日线数据。
-    print("[scheduler] 更新日线 / 分钟线 ...")
-    job_update_ohlc(trade_date)
+    # 4. 对活跃池计算资金质量
+    build_fund_quality(d)
 
-    # 如果后续需要分钟线，可以在 data.jobs.job_update_ohlc 中打开 update_minute_bars 调用；
-    # 这里不单独再调一次，避免重复。
+    # 5. 对活跃池 + 有阿布价位的票构建价位微结构
+    build_level_microstructure(d)
 
-    # 3) 抓取当日 tick（当前实现为“最近 N 笔”，由 config.TICK_COUNT_LIMIT 控制）
-    print("[scheduler] 抓取当日 tick ...")
-    # limit=None 表示对股票池中全部标的抓取
-    job_collect_ticks_once(trade_date, limit=None)
+    # 6. 生成 T+1 策略候选股票列表（可以落库或输出到某表）
+    build_strategy_candidates(d)
 
-    # 4) 计算价位等因子
-    print("[scheduler] 重新计算价位因子 ...")
-    job_finalize_ticks_and_levels(trade_date)
+六、建议的开发顺序（可分阶段）
 
-    print(f"[scheduler] ====== 盘后任务完成 trade_date={trade_date} ======")
+阶段 1：股池 & 日度微结构
 
+实现 build_active_pool；
 
-def main() -> None:
-    """
-    启动 APScheduler，注册定时任务。
-    """
-    scheduler = BlockingScheduler(timezone=TZ_CN)
+实现 stock_microstructure_daily 相关代码；
 
-    # 每个交易日 15:10 触发盘后任务（若想调整时间，可以改 hour/minute）
-    scheduler.add_job(
-        func=lambda: run_post_close_jobs(),
-        trigger=CronTrigger(hour=15, minute=10),
-        id="post_close_job",
-        name="A 股盘后数据更新",
-        replace_existing=True,
-    )
+检查日度指标是否合理。
 
-    print("[scheduler] APScheduler 已启动，等待定时任务触发 ...")
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        print("[scheduler] 收到退出信号，正在停止 ...")
+阶段 2：资金质量评分
 
+实现上涨窗口识别；
 
-if __name__ == "__main__":
-    main()
+实现 stock_fund_quality；
+
+做简单统计：资金质量高 vs 低 的未来收益分布。
+
+阶段 3：价位吸收分析
+
+实现 stock_level_microstructure；
+
+对典型案例（肉眼见的支撑/阻力）做 sanity check。
+
+阶段 4：策略实现 & 回测
+
+写 strategy_bollinger_microstructure.py；
+
+在日线回测框架里先跑穿。
+
+阶段 5：前端 UI & 实盘观察
+
+Streamlit 增加：
+
+资金质量分数 + 价位吸收可视化；
+
+某只股票近期关键价位附近的大单行为。

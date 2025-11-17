@@ -99,8 +99,6 @@ def _transform_raw_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def update_concepts_cache() -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if not _has_pywencai():
         print("[concepts_cache] missing dependency: please install pywencai")
         return 0
@@ -136,8 +134,6 @@ def _transform_hk_raw_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def update_hk_industry_cache() -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if not _has_pywencai():
         print("[hk_industry_cache] missing dependency: please install pywencai")
         return 0
@@ -165,8 +161,6 @@ def update_hk_industry_cache() -> int:
 
 def validate_concepts_cache_count() -> None:
     eng = get_engine()
-    if eng is None:
-        return
     if not _table_exists(eng, "concepts_cache"):
         print("[concepts_cache] table not exists")
         return
@@ -184,8 +178,6 @@ def validate_concepts_cache_count() -> None:
 
 def reconcile_concepts_cache_with_universe() -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if not _table_exists(eng, "concepts_cache"):
         return 0
     with eng.connect() as conn:
@@ -214,8 +206,6 @@ def reconcile_concepts_cache_with_universe() -> int:
 
 def purge_non_universe_from_concepts_cache() -> int:
     eng = get_engine()
-    if eng is None:
-        return 0
     if not _table_exists(eng, "concepts_cache"):
         return 0
     with eng.connect() as conn:
