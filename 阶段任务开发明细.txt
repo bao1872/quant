@@ -1,507 +1,588 @@
-一、目标概述
+一、阶段 3 开发任务规划（围绕 Tier 1 特征）
+任务 1：新建「进池 ML 样本表」
 
-围绕 stock_bollinger_data + 逐笔数据，构建一套完整的：
+建议新建一张表，比如：
 
-股性活跃选股池：
+CREATE TABLE stock_pool_ml_samples (
+    ts_code            VARCHAR(20),
+    pool_date          DATE,        -- 进池日 T0
+    current_date       DATE,        -- 当前样本日 t
 
-条件：近期曾 v_price_position > 99、曾 price_position > 50，代表放量+强势。
+    -- Tier1 特征（先打平存成列）
+    days_since_pool            INT,
+    ret_since_pool             DOUBLE PRECISION,
+    max_down_since_pool        DOUBLE PRECISION,
+    big_net_ratio_since_pool   DOUBLE PRECISION,
+    support_ratio_since_pool   DOUBLE PRECISION,
 
-资金质量评估（日度）：
+    ret_1d                     DOUBLE PRECISION,
+    price_pos_t                DOUBLE PRECISION,
+    band_width_t               DOUBLE PRECISION,
+    rel_amount_t               DOUBLE PRECISION,
+    big_net_ratio_t            DOUBLE PRECISION,
+    ofi_t                      DOUBLE PRECISION,
+    big_net_close_ratio_t      DOUBLE PRECISION,
 
-评价过去几天拉升是“高质量资金”还是“杂散资金”，用于在股池里排序、过滤。
+    pool_price_pos             DOUBLE PRECISION,
+    pool_rel_amount            DOUBLE PRECISION,
+    pool_big_net_ratio_t0      DOUBLE PRECISION,
+    pool_fund_quality_score    DOUBLE PRECISION,
 
-关键价位（支撑/阻力）资金吸收分析：
+    big_net_ratio_recent       DOUBLE PRECISION,
+    support_ratio_recent       DOUBLE PRECISION,
 
-对阿布价位 / 重要价位附近，统计大单吸筹/出货情况，判断真正的强支撑/重阻力。
+    -- 预留 label 列（阶段 3 先可以留空，阶段 4 再填）
+    label_good_entry           SMALLINT,
 
-最终策略：
+    PRIMARY KEY (ts_code, pool_date, current_date)
+);
 
-只在：
 
-股性活跃
+你也可以先不建表，先写入 CSV；但最终建议入库，方便后续训练/诊断。
 
-资金质量高
+任务 2：数据读取层（Data Access Layer）
 
-下方有强支撑吸筹、上方无明显重阻力出货
-的标的上找买点。
+在新模块里实现：
 
-二、数据与新表设计
-2.1 已有表（只引用）
+fetch_active_episodes(start_date, end_date)
 
-stock_bollinger_data
+从 stock_active_pool 取出所有 (ts_code, pool_date)；
 
-字段（简化）：ts_code, trade_date, price_position, band_width_zscore, v_price_position, v_band_width_zscore, ...
+load_time_series_for_stock(ts_code, min_date, max_date)
+
+一次性从：
 
 stock_daily
 
-ts_code, trade_date, open, high, low, close, vol, amount, ...
-
-tick 数据 & 价位表
-
-tick：逐笔（以你现有 parquet / 表为准）
-
-abu_price_levels（或你现有的阿布价位表）
-
-ts_code, trade_date / calc_date, level_price, level_type (support/resistance/flip), ...
-
-2.2 新增一：股性活跃选股池表 stock_active_pool
-
-作用：记录每天盘后筛出来的“活跃标的池”。
-
-表结构建议：
-
-stock_active_pool
------------------
-ts_code        VARCHAR
-trade_date     DATE      -- 信号日期（T 日）
-window_days    INT       -- 回看窗口，比如 20
-has_high_vpos  BOOLEAN   -- 该窗口内是否出现 v_price_position > 99
-has_high_ppos  BOOLEAN   -- 该窗口内是否出现 price_position > 50 or 70
-max_vpos       FLOAT
-max_ppos       FLOAT
-avg_amount     NUMERIC   -- 窗口内日均成交额
-remarks        TEXT      -- 预留
-PRIMARY KEY (ts_code, trade_date)
-
-2.3 新增二：日度微结构摘要 stock_microstructure_daily
-
-作用：对每只股票、每天的逐笔成交做资金结构汇总，用于资金质量和后续分析。
-
-表结构建议：
+stock_bollinger_data
 
 stock_microstructure_daily
---------------------------
-ts_code           VARCHAR
-trade_date        DATE
-total_value       NUMERIC    -- 全日成交额
-total_volume      BIGINT
-vwap              NUMERIC    -- 全日 VWAP
-
-big_buy_value     NUMERIC    -- 大单买入额
-big_sell_value    NUMERIC    -- 大单卖出额
-big_net_value     NUMERIC    -- 大单净额
-big_net_ratio     NUMERIC    -- big_net_value / total_value
-big_buy_ratio     NUMERIC    -- big_buy_value / total_value
-big_sell_ratio    NUMERIC    -- big_sell_value / total_value
-
-big_net_open      NUMERIC    -- 09:30-10:00
-big_net_mid       NUMERIC    -- 10:00-14:00
-big_net_close     NUMERIC    -- 14:00-15:00
-
-order_flow_imbalance  NUMERIC  -- (主动买额 - 主动卖额) / 总成交额
-
-created_at        TIMESTAMP
-PRIMARY KEY (ts_code, trade_date)
-
-
-大单阈值建议按 每只股票、最近 60 日 tick 的成交额 P90/P95 计算，可先写死一个阈值，后面再优化。
-
-2.4 新增三：资金质量评分表 stock_fund_quality
-
-作用：以“最近一段上涨窗口”为单位，对资金质量打分。
 
 stock_fund_quality
-------------------
-ts_code              VARCHAR
-window_start         DATE
-window_end           DATE
-window_days          INT
+把这只股票在 [min_date, max_date] 的数据读出来，合并成一个 DataFrame。
 
-price_return         NUMERIC      -- 涨幅（close_end / close_start - 1）
-big_net_sum          NUMERIC      -- 窗口大单净流入
-turnover_ratio       NUMERIC      -- 窗口总成交额 / 自由流通市值
-
-pos_days_ratio       NUMERIC      -- 大单净流入为正的天数占比
-trend_corr           NUMERIC      -- 累计净流入 vs 收盘价的相关
-
-big_cost_gain        NUMERIC      -- 成本区浮盈：close_end / big_buy_vwap - 1
-support_ratio        NUMERIC      -- 回调段中大单净流入 >= 0 的比例
-
-fund_quality_score   NUMERIC      -- 综合得分，0~1 或 z-score
-created_at           TIMESTAMP
-
-PRIMARY KEY (ts_code, window_end)
-
-2.5 新增四：价位微结构表 stock_level_microstructure
-
-作用：对每个关键价位、每次测试，统计资金吸收情况（支撑/阻力）。
-
-stock_level_microstructure
---------------------------
-ts_code          VARCHAR
-trade_date       DATE
-level_price      NUMERIC
-level_type       VARCHAR   -- 'support' / 'resistance' / 'flip'
-test_id          INT       -- 当日同一价位的第几次测试
-
-band_pct         NUMERIC   -- 观察带宽相对比例
-vol_total        BIGINT
-value_total      NUMERIC
-
-big_buy_value    NUMERIC
-big_sell_value   NUMERIC
-big_net_value    NUMERIC
-big_net_ratio    NUMERIC
-
-order_flow_imbalance NUMERIC
-
-max_penetration  NUMERIC   -- 相对 level 的最大穿透幅度（support 用向下，resistance 用向上）
-time_above_level_ratio  NUMERIC
-time_below_level_ratio  NUMERIC
-
-future_return_30m  NUMERIC
-future_return_1d   NUMERIC
-
-support_absorption_score_test         NUMERIC  -- 对 support type 有效
-resistance_sell_absorption_score_test NUMERIC  -- 对 resistance type 有效
-flip_support_score_test               NUMERIC  -- 对 flip type 回踩时
-
-created_at       TIMESTAMP
-PRIMARY KEY (ts_code, trade_date, level_price, test_id)
-
-三、模块与函数设计
-
-下面按照你项目风格，给出推荐的模块 / 函数。
-
-3.1 股性活跃选股池（基于 stock_bollinger_data）
-
-文件建议： factors/active_pool.py
+任务 3：特征工程核心函数（对单个进池事件计算 Tier1）
 
 核心函数：
 
-def build_active_pool(trade_date: date, window_days: int = 20) -> None:
-    """
-    从 stock_bollinger_data 构建某日的股性活跃池，写入 stock_active_pool。
-    条件：
-      - 过去 window_days 内曾经 v_price_position > 99
-      - 且曾经 price_position > 50 或 70
-      - 过滤 ST、退市、日均成交额过低的票
-    """
-
-
-逻辑要点：
-
-从 stock_bollinger_data 查询 [trade_date - window_days + 1, trade_date] 范围内数据；
-
-group by ts_code：
-
-max_vpos = max(v_price_position)
-
-max_ppos = max(price_position)
-
-avg_amount 从 stock_daily 聚合；
-
-条件：
-
-max_vpos > 99
-
-max_ppos > 50（或 70，可配）
-
-avg_amount > 某阈值（如 3000 万）
-
-将满足条件的 ts_code 写入 stock_active_pool。
-
-3.2 日度微结构摘要（逐笔 → stock_microstructure_daily）
-
-文件建议： microstructure/daily_summary.py
-
-3.2.1 逐笔增强 &单日指标
-def summarize_microstructure_for_stock(
+def compute_tier1_features_for_episode(
     ts_code: str,
-    trade_date: date,
-    big_trade_threshold: float,
-) -> dict:
+    pool_date: date,
+    df: pd.DataFrame,
+    max_tracking_days: int = 10,
+) -> pd.DataFrame:
     """
-    读取某只股票某一天的 tick 数据，计算:
-      - total_value, total_volume, vwap
-      - big_buy_value, big_sell_value, big_net_value, big_net_ratio
-      - big_net_open/mid/close
-      - order_flow_imbalance
-    返回字典，后续写库。
-    """
-
-
-要点：
-
-从 TickStore 或 tick 表读出该日 tick；
-
-为每条成交打上：
-
-trade_value = price * volume
-
-side（主动买/卖）——用你已有逻辑；
-
-time_bucket（09:30–10:00 / 10:00–14:00 / 14:00–15:00）；
-
-根据 big_trade_threshold 判断大单；
-
-按上面表结构聚合。
-
-3.2.2 批量任务（对股池）
-def build_microstructure_daily(trade_date: date, only_active_pool: bool = True) -> None:
-    """
-    对 trade_date 的股票，批量生成 daily microstructure，写入 stock_microstructure_daily。
-    默认只对 stock_active_pool 里的股票处理。
-    """
-
-3.3 资金质量评分（stock_fund_quality）
-
-文件建议： microstructure/fund_quality.py
-
-3.3.1 确定上涨窗口
-def detect_rise_window(ts_code: str, trade_date: date, max_lookback: int = 20) -> tuple[date, date]:
-    """
-    从 stock_daily / stock_bollinger_data 中，识别出以 trade_date 为末日的
-    最近一段“上涨窗口”[window_start, trade_date]。
-    简化版可以用：
-      - close_trade_date > close_{trade_date-k}
-      - 中间最大回撤 < 某阈值
-    """
-
-3.3.2 在窗口上计算资金质量
-def compute_fund_quality_for_window(
-    ts_code: str,
-    window_start: date,
-    window_end: date,
-) -> dict:
-    """
-    从 stock_microstructure_daily + stock_daily + basic 表读取数据，计算：
-      - price_return, big_net_sum, turnover_ratio
-      - pos_days_ratio, trend_corr
-      - big_cost_gain（大单成本区浮盈）
-      - support_ratio（回调段中大单净流入 >= 0 的比例）
-      - fund_quality_score（按权重综合）
-    返回字典。
+    输入：
+        - 单只股票 ts_code
+        - pool_date 进池日 T0
+        - df: 该股的时间序列数据（含 daily + boll + micro + fund_quality），按 trade_date 升序
+    输出：
+        - 一个 DataFrame，每一行是 (ts_code, pool_date, current_date) 的 Tier1 特征
+          current_date 从 T0 开始，到 T0+max_tracking_days（有交易才算）
     """
 
 
-具体指标实现参考：
+这部分就是我下面给你的“完整代码”的重点。
 
-price_return = close_end / close_start - 1
+任务 4：批量构建样本集
 
-big_net_sum = Σ big_net_value_d
+函数：
 
-turnover_ratio = Σ total_value_d / free_float_value
-
-pos_days_ratio = (big_net_value_d > 0 的天数) / 窗口长度
-
-trend_corr：对 [累计 big_net_value_d] 和 close_d 做相关系数
-
-big_buy_vwap：窗口内所有大买单的加权价；
-big_cost_gain = close_end / big_buy_vwap - 1
-
-support_ratio：在窗口内所有“回调段”中，big_net_pullback >= 0 的段数比率
-（回调段可以先简单定义为连续多日收盘回落 2%～4% 的片段）
-
-fund_quality_score：
-
-先对上述指标做标准化（在同一日或滚动窗口内），再用权重线性组合。
-
-3.3.3 批量任务
-def build_fund_quality(trade_date: date) -> None:
-    """
-    对 trade_date 当天 stock_active_pool 中的每只标的：
-      1）识别上涨窗口
-      2）计算资金质量指标
-      3）写入 stock_fund_quality
-    """
-
-3.4 价位资金吸收（stock_level_microstructure）
-
-文件建议： microstructure/level_absorption.py
-
-3.4.1 对单个价位、单次测试做分析
-def analyze_level_absorption_for_test(
-    ticks: pd.DataFrame,
-    level_price: float,
-    level_type: str,
-    band_pct: float = 0.005,
-    future_horizon_minutes: int = 30,
-) -> dict:
-    """
-    针对某只股票某日 tick 中的一次“价位测试”，计算：
-      - vol_total, value_total
-      - big_buy_value / big_sell_value / big_net_value / big_net_ratio
-      - order_flow_imbalance
-      - max_penetration（最大穿透幅）
-      - time_above_level_ratio / time_below_level_ratio
-      - future_return_30m, future_return_1d
-      - support_absorption_score_test / resistance_sell_absorption_score_test / flip_support_score_test
-    """
-
-
-处理流程：
-
-确定观察带：
-[L*(1-band_pct), L*(1+band_pct)]；
-
-识别“测试片段”：
-
-价格从带外进入→在带内停留→离开带内
-
-给每个片段一个 test_id；
-
-对每个片段在带内的 tick 做聚合，计算上述字段；
-
-分别按 level_type 推出对应 score（公式参考你前面认同的那套）：
-
-支撑吸收：大单净买 + 不被深穿 + 后续反弹；
-
-阻力卖出吸收：大单净卖 + 多次冲不过 + 后续回落；
-
-flip 支撑：阻力上方变为支撑后的回踩吸筹质量。
-
-3.4.2 批量处理（某标的一天）
-def build_level_microstructure_for_stock(
-    ts_code: str,
-    trade_date: date,
-    band_pct: float = 0.005,
+def build_pool_ml_samples(
+    start_date: date,
+    end_date: date,
+    max_tracking_days: int = 10,
+    chunk_size: int = 100
 ) -> None:
     """
-    读取：
-      - 当日 tick
-      - 当日或最近一次的阿布价位（abu_price_levels）
-    对每个 level, 对所有测试片段调用 analyze_level_absorption_for_test，
-    并写入 stock_level_microstructure。
+    对 [start_date, end_date] 内所有进池事件：
+      - 读取对应股票的时间序列数据
+      - 调用 compute_tier1_features_for_episode
+      - 合并后批量写入 stock_pool_ml_samples
     """
 
-3.4.3 全市场任务（可只对活跃池）
-def build_level_microstructure(trade_date: date) -> None:
+
+逻辑：
+
+先找出这一段内所有 (ts_code, pool_date)；
+
+对每个 ts_code 分组，按股票为单位读数据 + 多个 pool_date 循环处理；
+
+分批 to_sql(if_exists="append") 写入。
+
+任务 5（后续）：label 计算（阶段 4 再做）
+
+你之后只需要在这个模块里再加一个函数：
+add_labels_to_pool_ml_samples(label_horizon, up_thres, down_thres)
+按你之后定义的好买点规则（未来 H 日收益/回撤）去填 label_good_entry。
+
+二、核心部分完整代码示例（Tier 1 特征）
+
+建议文件路径：ml/pool_ml_dataset.py
+
+你可以直接复制这一整段作为新文件，
+然后按照你实际的表名/字段稍微对齐一下。
+
+# ml/pool_ml_dataset.py
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from db.connection import get_engine  # 按你项目已有的方式导入
+
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------
+# 配置
+# -----------------------------
+
+@dataclass
+class PoolMLConfig:
+    max_tracking_days: int = 10  # 每次进池事件最多跟踪多少交易日
+    recent_window_days: int = 3  # big_net_ratio_recent / support_ratio_recent 的名义窗口（实际会截断）
+
+
+# -----------------------------
+# 数据读取层
+# -----------------------------
+
+def fetch_active_episodes(
+    engine: Engine,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
     """
-    对 trade_date 的股票（建议只对 active_pool + 有 Abu 价位的票）批量执行。
+    从 stock_active_pool 中读取 [start_date, end_date] 内所有进池事件。
+    返回列：ts_code, pool_date
+    """
+    sql = text(
+        """
+        SELECT ts_code,
+               trade_date AS pool_date
+        FROM stock_active_pool
+        WHERE trade_date BETWEEN :start_date AND :end_date
+        ORDER BY ts_code, pool_date
+        """
+    )
+    df = pd.read_sql(sql, engine, params={"start_date": start_date, "end_date": end_date})
+    return df
+
+
+def load_time_series_for_stock(
+    engine: Engine,
+    ts_code: str,
+    min_date: date,
+    max_date: date,
+) -> pd.DataFrame:
+    """
+    一次性加载该股票在 [min_date, max_date] 区间的：
+      - 日线（stock_daily）
+      - 布林数据（stock_bollinger_data）
+      - 日度微结构（stock_microstructure_daily）
+      - 资金质量（stock_fund_quality，只需要拿离当前日期最近的一条）
+    合并成按 trade_date 升序的 DataFrame。
     """
 
-四、策略层设计（选股+择时）
+    # 1. 日线
+    sql_daily = text(
+        """
+        SELECT ts_code, trade_date, open, high, low, close, amount
+        FROM stock_daily
+        WHERE ts_code = :ts_code AND trade_date BETWEEN :min_date AND :max_date
+        ORDER BY trade_date
+        """
+    )
+    df_daily = pd.read_sql(
+        sql_daily,
+        engine,
+        params={"ts_code": ts_code, "min_date": min_date, "max_date": max_date},
+    )
+    if df_daily.empty:
+        return df_daily
 
-文件建议： strategy/strategy_bollinger_microstructure.py
+    df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"])
+    df_daily.set_index("trade_date", inplace=True)
+    df_daily.sort_index(inplace=True)
 
-4.1 选股（盘后）
+    # 计算 1 日收益 和 20 日均成交额
+    df_daily["ret_1d"] = df_daily["close"] / df_daily["close"].shift(1) - 1
+    df_daily["ma_amount_20"] = df_daily["amount"].rolling(20, min_periods=1).mean()
 
-选股逻辑（T 日盘后）：
+    # 2. 布林
+    sql_boll = text(
+        """
+        SELECT ts_code, trade_date, price_position, band_width
+        FROM stock_bollinger_data
+        WHERE ts_code = :ts_code AND trade_date BETWEEN :min_date AND :max_date
+        """
+    )
+    df_boll = pd.read_sql(
+        sql_boll,
+        engine,
+        params={"ts_code": ts_code, "min_date": min_date, "max_date": max_date},
+    )
+    df_boll["trade_date"] = pd.to_datetime(df_boll["trade_date"])
+    df_boll.set_index("trade_date", inplace=True)
+    df_boll = df_boll[["price_position", "band_width"]]
 
-从以下表 join：
+    # 3. 日度微结构
+    sql_micro = text(
+        """
+        SELECT ts_code, trade_date,
+               big_net_value,
+               total_value,
+               buy_value,
+               sell_value,
+               big_net_open,
+               big_net_close
+        FROM stock_microstructure_daily
+        WHERE ts_code = :ts_code AND trade_date BETWEEN :min_date AND :max_date
+        """
+    )
+    df_micro = pd.read_sql(
+        sql_micro,
+        engine,
+        params={"ts_code": ts_code, "min_date": min_date, "max_date": max_date},
+    )
+    if df_micro.empty:
+        # 若完全没有微结构数据，构造空列（后续直接填 0）
+        df_micro = pd.DataFrame(
+            columns=[
+                "big_net_value",
+                "total_value",
+                "buy_value",
+                "sell_value",
+                "big_net_open",
+                "big_net_close",
+            ]
+        )
+    else:
+        df_micro["trade_date"] = pd.to_datetime(df_micro["trade_date"])
+        df_micro.set_index("trade_date", inplace=True)
+        df_micro = df_micro[
+            [
+                "big_net_value",
+                "total_value",
+                "buy_value",
+                "sell_value",
+                "big_net_open",
+                "big_net_close",
+            ]
+        ]
 
-stock_active_pool（T 日）
+    # 4. 资金质量（只需要一个“截止某日最近”）
+    #   简单做法：在合并后对每个 trade_date 选 window_end <= trade_date 的最近一条
+    sql_fq = text(
+        """
+        SELECT ts_code, window_end, fund_quality_score
+        FROM stock_fund_quality
+        WHERE ts_code = :ts_code AND window_end <= :max_date
+        ORDER BY window_end
+        """
+    )
+    df_fq = pd.read_sql(sql_fq, engine, params={"ts_code": ts_code, "max_date": max_date})
+    if not df_fq.empty:
+        df_fq["window_end"] = pd.to_datetime(df_fq["window_end"])
+        df_fq.set_index("window_end", inplace=True)
+        # 右对齐到 daily 的 trade_date：每一天用“之前最近的 window_end”
+        df_fq = df_fq[["fund_quality_score"]]
+        df_fq = df_fq.reindex(df_daily.index, method="ffill")
+    else:
+        df_fq = pd.DataFrame(index=df_daily.index, data={"fund_quality_score": np.nan})
 
-stock_fund_quality（以 window_end <= T 的最近一条）
+    # 合并：daily 作为主表
+    df = df_daily.join(df_boll, how="left")
+    df = df.join(df_micro, how="left")
+    df = df.join(df_fq, how="left")
 
-stock_level_microstructure（最近 N 日统计）
+    # 微结构缺失填 0
+    for col in [
+        "big_net_value",
+        "total_value",
+        "buy_value",
+        "sell_value",
+        "big_net_open",
+        "big_net_close",
+    ]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
 
-筛选条件示例：
+    # 价格 & 布林缺失直接保持 NaN，后面计算时注意处理
+    return df
 
-股性活跃：
 
-stock_active_pool 里存在；
+# -----------------------------
+# 特征计算核心：单个进池事件
+# -----------------------------
 
-资金质量：
+def _safe_div(a: float, b: float) -> float:
+    if b is None or b == 0 or np.isnan(b):
+        return 0.0
+    return float(a) / float(b)
 
-fund_quality_score 在当日所有候选中处于前 30%；
 
-支撑吸筹：
+def compute_tier1_features_for_episode(
+    ts_code: str,
+    pool_date: date,
+    df: pd.DataFrame,
+    cfg: PoolMLConfig,
+) -> pd.DataFrame:
+    """
+    对单只股票 df（包含从 min_date 到 max_date 的时间序列）中的
+    某一次进池事件 (ts_code, pool_date) 计算 Tier1 特征。
+    df 的 index 是 trade_date（datetime64[ns]），按升序排列。
 
-下方某个主要支撑位（如最近的阿布支撑）
-support_absorption_score_L 在历史分位数 Top 30%，
-并且当前收盘价距离该支撑位不太远。
+    返回列：
+      ts_code, pool_date, current_date, 以及所有 Tier1 特征。
+    """
+    if df.empty:
+        return pd.DataFrame()
 
-阻力压制不强：
+    # 保证 index 是 Timestamp
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("df.index must be DatetimeIndex with trade_date")
 
-上方最近主要阻力位的 resistance_sell_absorption_score_L 不高；
+    # pool_date 转成 Timestamp
+    pool_ts = pd.to_datetime(pool_date)
 
-或已翻转为 flip 支撑，且 flip_support_score_L 高。
+    if pool_ts not in df.index:
+        # 这个进池日没有日线数据，直接跳过
+        logger.warning("pool_date %s not in daily index for %s", pool_date, ts_code)
+        return pd.DataFrame()
 
-输出：
-T+1 观察 + 允许建仓的 候选列表，包含：
+    # 取 T0 行
+    pool_idx = df.index.get_loc(pool_ts)
+    pool_row = df.iloc[pool_idx]
 
-ts_code
+    # 进池当天的特征
+    pool_price_pos = float(pool_row.get("price_position", np.nan))
+    pool_rel_amount = _safe_div(pool_row["amount"], pool_row["ma_amount_20"])
+    pool_total_value_t0 = float(pool_row.get("total_value", 0.0))
+    pool_big_net_value_t0 = float(pool_row.get("big_net_value", 0.0))
+    pool_big_net_ratio_t0 = _safe_div(pool_big_net_value_t0, pool_total_value_t0)
+    pool_fund_quality_score = float(pool_row.get("fund_quality_score", np.nan))
 
-理想支撑价位（买点参考）
+    # 整体时间序列，用于“自进池以来”的累积
+    close_series = df["close"]
+    ret_1d_series = df["ret_1d"]
+    big_net_series = df["big_net_value"]
+    total_value_series = df["total_value"]
 
-资金质量分数 & 支撑/阻力情况。
+    # 从 pool_idx 开始，最多跟踪 cfg.max_tracking_days 个“交易日”
+    max_idx = min(pool_idx + cfg.max_tracking_days, len(df) - 1)
 
-4.2 择时 & 交易规则（框架）
+    rows = []
 
-可以先在日线回测层实现简单版本：
+    for idx in range(pool_idx, max_idx + 1):
+        current_ts = df.index[idx]
+        current_row = df.iloc[idx]
 
-入场（T+1）：
+        # 1) Episode 状态：相对 T0
+        days_since_pool = idx - pool_idx  # 0 = T0 本身
+        close_t = float(current_row["close"])
+        close_T0 = float(pool_row["close"])
+        ret_since_pool = _safe_div(close_t, close_T0) - 1.0
 
-若 T+1 日开盘价在支撑位附近（比如 |open - L| / L < 0.5%），则按开盘价建仓；
+        # 自进池以来的最大回撤
+        window_close = close_series.iloc[pool_idx : idx + 1]
+        min_close_since_pool = float(window_close.min())
+        max_down_since_pool = _safe_div(min_close_since_pool, close_T0) - 1.0
 
-或在 T+1 日低价不跌破支撑位太多、收盘在 L 上方则以收盘价建仓。
+        # 自进池以来的资金累积
+        window_big_net = big_net_series.iloc[pool_idx : idx + 1]
+        window_total_value = total_value_series.iloc[pool_idx : idx + 1]
+        big_net_sum_since_pool = float(window_big_net.sum())
+        total_value_sum_since_pool = float(window_total_value.sum())
+        big_net_ratio_since_pool = _safe_div(big_net_sum_since_pool, total_value_sum_since_pool)
 
-止盈：
+        # 自进池以来的 support_ratio_since_pool
+        window_ret = ret_1d_series.iloc[pool_idx : idx + 1]
+        # 回调日：ret_1d < 0 且有微结构
+        down_mask = window_ret < 0
+        down_dates = window_ret.index[down_mask]
+        if len(down_dates) == 0:
+            support_ratio_since_pool = 0.0
+        else:
+            bn_down = big_net_series.reindex(down_dates).fillna(0.0)
+            support_days = (bn_down >= 0).sum()
+            support_ratio_since_pool = float(support_days) / float(len(down_dates))
 
-第一档：价格回到布林中轨 price_position >= 50 卖一半；
+        # 2) 当前这一天 t 的当下状态（价格 / 布林 / 量能 / 资金）
+        # 单日收益
+        ret_1d = float(current_row.get("ret_1d", np.nan))
 
-第二档：价格接近上轨 price_position >= 80 或上方阻力位附近全部卖出。
+        price_pos_t = float(current_row.get("price_position", np.nan))
+        band_width_t = float(current_row.get("band_width", np.nan))
 
-止损：
+        amount_t = float(current_row.get("amount", 0.0))
+        ma_amount_20_t = float(current_row.get("ma_amount_20", 0.0))
+        rel_amount_t = _safe_div(amount_t, ma_amount_20_t)
 
-跌破支撑位一定比例（如 1–2%）+ 当日支撑位附近 big_net_ratio < 0、order_flow_imbalance << 0 → 止损；
+        big_net_t = float(current_row.get("big_net_value", 0.0))
+        total_value_t = float(current_row.get("total_value", 0.0))
+        buy_value_t = float(current_row.get("buy_value", 0.0))
+        sell_value_t = float(current_row.get("sell_value", 0.0))
+        big_net_ratio_t = _safe_div(big_net_t, total_value_t)
+        ofi_t = _safe_div(buy_value_t - sell_value_t, total_value_t)
 
-或固定 -5% + 时间止损（超过 10 日未触达中轨）。
+        big_net_close_t = float(current_row.get("big_net_close", 0.0))
+        big_net_close_ratio_t = _safe_div(big_net_close_t, total_value_t)
 
-后续可以在 tick 回测引擎中实现更精细的 “在支撑带内看逐笔实时吸筹再决策”。
+        # 3) 最近 few 天的微结构（动态窗口）
+        # recent_window = [max(T0, t - recent_window_days + 1), t]
+        recent_window_len = cfg.recent_window_days
+        recent_start_idx = max(pool_idx, idx - recent_window_len + 1)
+        # 注意：iloc 是左闭右闭，+1
+        recent_big_net = big_net_series.iloc[recent_start_idx : idx + 1]
+        recent_total_value = total_value_series.iloc[recent_start_idx : idx + 1]
+        recent_big_net_sum = float(recent_big_net.sum())
+        recent_total_value_sum = float(recent_total_value.sum())
+        big_net_ratio_recent = _safe_div(recent_big_net_sum, recent_total_value_sum)
 
-五、调度与运行流程（APScheduler）
+        recent_ret = ret_1d_series.iloc[recent_start_idx : idx + 1]
+        recent_down_dates = recent_ret.index[recent_ret < 0]
+        if len(recent_down_dates) == 0:
+            support_ratio_recent = 0.0
+        else:
+            bn_recent_down = big_net_series.reindex(recent_down_dates).fillna(0.0)
+            recent_support_days = (bn_recent_down >= 0).sum()
+            support_ratio_recent = float(recent_support_days) / float(len(recent_down_dates))
 
-在你现有 scheduler 中加一个盘后任务链：
+        # 4) 组装一行
+        rows.append(
+            {
+                "ts_code": ts_code,
+                "pool_date": pool_ts.date(),
+                "current_date": current_ts.date(),
 
-def run_post_close_jobs(trade_date: date | None = None) -> None:
-    d = trade_date or get_latest_trading_date()
+                "days_since_pool": days_since_pool,
+                "ret_since_pool": ret_since_pool,
+                "max_down_since_pool": max_down_since_pool,
+                "big_net_ratio_since_pool": big_net_ratio_since_pool,
+                "support_ratio_since_pool": support_ratio_since_pool,
 
-    # 1. 更新日线 & 布林表（你已经有）
-    job_update_ohlc(d)
-    job_update_bollinger(d)
+                "ret_1d": ret_1d,
+                "price_pos_t": price_pos_t,
+                "band_width_t": band_width_t,
+                "rel_amount_t": rel_amount_t,
+                "big_net_ratio_t": big_net_ratio_t,
+                "ofi_t": ofi_t,
+                "big_net_close_ratio_t": big_net_close_ratio_t,
 
-    # 2. 构建股性活跃池
-    build_active_pool(d)
+                "pool_price_pos": pool_price_pos,
+                "pool_rel_amount": pool_rel_amount,
+                "pool_big_net_ratio_t0": pool_big_net_ratio_t0,
+                "pool_fund_quality_score": pool_fund_quality_score,
 
-    # 3. 对活跃池生成日度微结构摘要
-    build_microstructure_daily(d, only_active_pool=True)
+                "big_net_ratio_recent": big_net_ratio_recent,
+                "support_ratio_recent": support_ratio_recent,
 
-    # 4. 对活跃池计算资金质量
-    build_fund_quality(d)
+                # label 暂时留空（后续阶段 4 再填）
+                "label_good_entry": None,
+            }
+        )
 
-    # 5. 对活跃池 + 有阿布价位的票构建价位微结构
-    build_level_microstructure(d)
+    return pd.DataFrame(rows)
 
-    # 6. 生成 T+1 策略候选股票列表（可以落库或输出到某表）
-    build_strategy_candidates(d)
 
-六、建议的开发顺序（可分阶段）
+# -----------------------------
+# 批量构建样本集
+# -----------------------------
 
-阶段 1：股池 & 日度微结构
+def build_pool_ml_samples(
+    start_date: date,
+    end_date: date,
+    cfg: PoolMLConfig | None = None,
+    engine: Engine | None = None,
+    max_tracking_days: int | None = None,
+) -> None:
+    """
+    对 [start_date, end_date] 内所有进池事件，构建 Tier1 特征样本，并写入 stock_pool_ml_samples。
 
-实现 build_active_pool；
+    注意：
+      - 为了减少重复 IO，将以 ts_code 为单位批量处理：
+        先取该 ts_code 所有 pool_date，再一次性加载时间序列。
+    """
+    if cfg is None:
+        cfg = PoolMLConfig()
 
-实现 stock_microstructure_daily 相关代码；
+    if max_tracking_days is not None:
+        cfg.max_tracking_days = max_tracking_days
 
-检查日度指标是否合理。
+    if engine is None:
+        engine = get_engine()
 
-阶段 2：资金质量评分
+    episodes = fetch_active_episodes(engine, start_date, end_date)
+    if episodes.empty:
+        logger.warning("No active pool episodes between %s and %s", start_date, end_date)
+        return
 
-实现上涨窗口识别；
+    # 按 ts_code 分组处理
+    grouped = episodes.groupby("ts_code")
 
-实现 stock_fund_quality；
+    all_feature_rows: List[pd.DataFrame] = []
 
-做简单统计：资金质量高 vs 低 的未来收益分布。
+    for ts_code, group in grouped:
+        pool_dates: List[date] = sorted(group["pool_date"].tolist())
 
-阶段 3：价位吸收分析
+        # 为了覆盖所有 episode 的跟踪期，扩展加载区间
+        min_pool_date = min(pool_dates)
+        max_pool_date = max(pool_dates)
+        min_date = min_pool_date  # 可以再往前扩一些，用于 pre-history 特征
+        max_date = max_pool_date + timedelta(days=cfg.max_tracking_days + 5)
 
-实现 stock_level_microstructure；
+        logger.info(
+            "Loading time series for %s from %s to %s",
+            ts_code,
+            min_date,
+            max_date,
+        )
+        df = load_time_series_for_stock(engine, ts_code, min_date, max_date)
+        if df.empty:
+            continue
 
-对典型案例（肉眼见的支撑/阻力）做 sanity check。
+        for pool_date in pool_dates:
+            feat_df = compute_tier1_features_for_episode(ts_code, pool_date, df, cfg)
+            if feat_df is not None and not feat_df.empty:
+                all_feature_rows.append(feat_df)
 
-阶段 4：策略实现 & 回测
+    if not all_feature_rows:
+        logger.warning("No features generated for given date range.")
+        return
 
-写 strategy_bollinger_microstructure.py；
+    result_df = pd.concat(all_feature_rows, ignore_index=True)
 
-在日线回测框架里先跑穿。
+    # 写入数据库
+    logger.info("Writing %d rows into stock_pool_ml_samples", len(result_df))
+    result_df.to_sql(
+        "stock_pool_ml_samples",
+        engine,
+        if_exists="append",
+        index=False,
+    )
 
-阶段 5：前端 UI & 实盘观察
+    logger.info("Done building stock_pool_ml_samples for [%s, %s]", start_date, end_date)
 
-Streamlit 增加：
 
-资金质量分数 + 价位吸收可视化；
-
-某只股票近期关键价位附近的大单行为。
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    # 简单测试入口：按需改动日期
+    eng = get_engine()
+    cfg = PoolMLConfig(max_tracking_days=10, recent_window_days=3)
+    build_pool_ml_samples(
+        start_date=date(2023, 1, 1),
+        end_date=date(2023, 3, 31),
+        cfg=cfg,
+        engine=eng,
+    )
