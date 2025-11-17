@@ -9,7 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 from data.basic_universe import ensure_stock_basic_a_share
 from db.connection import get_engine
 from sqlalchemy import inspect
-from data.jobs import job_update_ohlc, job_collect_ticks_once, job_finalize_ticks_and_levels
+from data.jobs import job_update_ohlc, job_collect_full_day_ticks, job_finalize_ticks_and_levels
 
 
 def is_trading_day(d: date) -> bool:
@@ -36,7 +36,7 @@ def run_post_close_jobs(trade_date: date | None = None) -> None:
         return
     ensure_stock_basic_a_share()
     job_update_ohlc(td)
-    job_collect_ticks_once(td, limit=None)
+    job_collect_full_day_ticks(td)
     job_finalize_ticks_and_levels(td)
 
 

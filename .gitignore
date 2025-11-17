@@ -5,3 +5,4 @@ config.py
 data/tick/*
 *.txt
 *.ymal
+.trae/

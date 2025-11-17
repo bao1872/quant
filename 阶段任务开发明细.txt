@@ -1,588 +1,106 @@
-一、阶段 3 开发任务规划（围绕 Tier 1 特征）
-任务 1：新建「进池 ML 样本表」
+1. scheduler.py 引用不存在的 job（需要改代码）
 
-建议新建一张表，比如：
+当前 scheduler.py 里：
 
-CREATE TABLE stock_pool_ml_samples (
-    ts_code            VARCHAR(20),
-    pool_date          DATE,        -- 进池日 T0
-    current_date       DATE,        -- 当前样本日 t
-
-    -- Tier1 特征（先打平存成列）
-    days_since_pool            INT,
-    ret_since_pool             DOUBLE PRECISION,
-    max_down_since_pool        DOUBLE PRECISION,
-    big_net_ratio_since_pool   DOUBLE PRECISION,
-    support_ratio_since_pool   DOUBLE PRECISION,
-
-    ret_1d                     DOUBLE PRECISION,
-    price_pos_t                DOUBLE PRECISION,
-    band_width_t               DOUBLE PRECISION,
-    rel_amount_t               DOUBLE PRECISION,
-    big_net_ratio_t            DOUBLE PRECISION,
-    ofi_t                      DOUBLE PRECISION,
-    big_net_close_ratio_t      DOUBLE PRECISION,
-
-    pool_price_pos             DOUBLE PRECISION,
-    pool_rel_amount            DOUBLE PRECISION,
-    pool_big_net_ratio_t0      DOUBLE PRECISION,
-    pool_fund_quality_score    DOUBLE PRECISION,
-
-    big_net_ratio_recent       DOUBLE PRECISION,
-    support_ratio_recent       DOUBLE PRECISION,
-
-    -- 预留 label 列（阶段 3 先可以留空，阶段 4 再填）
-    label_good_entry           SMALLINT,
-
-    PRIMARY KEY (ts_code, pool_date, current_date)
-);
+from data.jobs import job_update_ohlc, job_collect_ticks_once, job_finalize_ticks_and_levels
+...
+def run_post_close_jobs() -> None:
+    ...
+    ensure_stock_basic_a_share()
+    job_update_ohlc(td)
+    job_collect_ticks_once(td, limit=None)
+    job_finalize_ticks_and_levels(td)
 
 
-你也可以先不建表，先写入 CSV；但最终建议入库，方便后续训练/诊断。
+但在 data/jobs.py 中：
 
-任务 2：数据读取层（Data Access Layer）
+有 job_update_ohlc(trade_date)
 
-在新模块里实现：
+有 job_collect_full_day_ticks(trade_date)
 
-fetch_active_episodes(start_date, end_date)
+有 job_finalize_ticks_and_levels(trade_date)
 
-从 stock_active_pool 取出所有 (ts_code, pool_date)；
+没有 job_collect_ticks_once
 
-load_time_series_for_stock(ts_code, min_date, max_date)
+也就是说：scheduler 现在跑起来会 ImportError。
 
-一次性从：
+✅ 建议修改
 
-stock_daily
+根据 jobs.py 的实现，你应该想要的是「收盘后全市场 full-day tick」，那就把调度器改成用 job_collect_full_day_ticks：
 
-stock_bollinger_data
+# scheduler.py
+from data.basic_universe import ensure_stock_basic_a_share
+from data.jobs import (
+    job_update_ohlc,
+    job_collect_full_day_ticks,      # ✅ 改成这个
+    job_finalize_ticks_and_levels,
+)
 
-stock_microstructure_daily
-
-stock_fund_quality
-把这只股票在 [min_date, max_date] 的数据读出来，合并成一个 DataFrame。
-
-任务 3：特征工程核心函数（对单个进池事件计算 Tier1）
-
-核心函数：
-
-def compute_tier1_features_for_episode(
-    ts_code: str,
-    pool_date: date,
-    df: pd.DataFrame,
-    max_tracking_days: int = 10,
-) -> pd.DataFrame:
-    """
-    输入：
-        - 单只股票 ts_code
-        - pool_date 进池日 T0
-        - df: 该股的时间序列数据（含 daily + boll + micro + fund_quality），按 trade_date 升序
-    输出：
-        - 一个 DataFrame，每一行是 (ts_code, pool_date, current_date) 的 Tier1 特征
-          current_date 从 T0 开始，到 T0+max_tracking_days（有交易才算）
-    """
+def run_post_close_jobs() -> None:
+    td = date.today()
+    if not is_trading_day(td):
+        print(f"{td} is not trading day, skip jobs.")
+        return
+    ensure_stock_basic_a_share()
+    job_update_ohlc(td)
+    job_collect_full_day_ticks(td)    # ✅ 去掉 limit 这个参数
+    job_finalize_ticks_and_levels(td)
 
 
-这部分就是我下面给你的“完整代码”的重点。
+然后可以给 jobs.py 里 job 的 docstring 顺便更新一下（把 job_collect_ticks_once 改成 job_collect_full_day_ticks），避免以后混淆。
 
-任务 4：批量构建样本集
+2. 对本地 config.py 的硬依赖（设计没问题，但建议补模板）
 
-函数：
+很多模块都写了：
 
-def build_pool_ml_samples(
-    start_date: date,
-    end_date: date,
-    max_tracking_days: int = 10,
-    chunk_size: int = 100
-) -> None:
-    """
-    对 [start_date, end_date] 内所有进池事件：
-      - 读取对应股票的时间序列数据
-      - 调用 compute_tier1_features_for_episode
-      - 合并后批量写入 stock_pool_ml_samples
-    """
+from config import (
+    DATABASE_URL,
+    TICK_BASE_DIR,
+    MARKET_SZ, MARKET_SH,
+    STOCK_POOL_LIMIT, TICK_COUNT_LIMIT,
+    Settings,
+)
 
 
-逻辑：
+而 .gitignore 里忽略了 config.py：
 
-先找出这一段内所有 (ts_code, pool_date)；
+config.py
+data/tick/*
 
-对每个 ts_code 分组，按股票为单位读数据 + 多个 pool_date 循环处理；
 
-分批 to_sql(if_exists="append") 写入。
+这意味着：
 
-任务 5（后续）：label 计算（阶段 4 再做）
+repo 本身是无法直接跑的，必须你本地提供 config.py
 
-你之后只需要在这个模块里再加一个函数：
-add_labels_to_pool_ml_samples(label_horizon, up_thres, down_thres)
-按你之后定义的好买点规则（未来 H 日收益/回撤）去填 label_good_entry。
+对第三方/未来自己回头看，门槛会比较高
 
-二、核心部分完整代码示例（Tier 1 特征）
+✅ 建议
 
-建议文件路径：ml/pool_ml_dataset.py
+在仓库里加一个 config_example.py（或 config_template.py），示意出必须提供的字段 & 类型，例如：
 
-你可以直接复制这一整段作为新文件，
-然后按照你实际的表名/字段稍微对齐一下。
-
-# ml/pool_ml_dataset.py
-
-from __future__ import annotations
-
-import logging
+# config_example.py
 from dataclasses import dataclass
-from datetime import date, timedelta
-from typing import List, Tuple
 
-import numpy as np
-import pandas as pd
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
+DATABASE_URL = "postgresql+psycopg2://user:pass@host:5432/quant"
+TICK_BASE_DIR = "/data/ticks"
 
-from db.connection import get_engine  # 按你项目已有的方式导入
+# pytdx 市场号
+MARKET_SZ = 0
+MARKET_SH = 1
 
-
-logger = logging.getLogger(__name__)
-
-
-# -----------------------------
-# 配置
-# -----------------------------
+# 全市场限制
+STOCK_POOL_LIMIT = None      # 或者 500
+TICK_COUNT_LIMIT = 20000
 
 @dataclass
-class PoolMLConfig:
-    max_tracking_days: int = 10  # 每次进池事件最多跟踪多少交易日
-    recent_window_days: int = 3  # big_net_ratio_recent / support_ratio_recent 的名义窗口（实际会截断）
+class Settings:
+    stock_pool_limit: int | None = STOCK_POOL_LIMIT
+    tick_count_limit: int = TICK_COUNT_LIMIT
+    tick_base_dir: str = TICK_BASE_DIR
 
 
-# -----------------------------
-# 数据读取层
-# -----------------------------
+在 README 里写一句：
 
-def fetch_active_episodes(
-    engine: Engine,
-    start_date: date,
-    end_date: date,
-) -> pd.DataFrame:
-    """
-    从 stock_active_pool 中读取 [start_date, end_date] 内所有进池事件。
-    返回列：ts_code, pool_date
-    """
-    sql = text(
-        """
-        SELECT ts_code,
-               trade_date AS pool_date
-        FROM stock_active_pool
-        WHERE trade_date BETWEEN :start_date AND :end_date
-        ORDER BY ts_code, pool_date
-        """
-    )
-    df = pd.read_sql(sql, engine, params={"start_date": start_date, "end_date": end_date})
-    return df
+拷贝 config_example.py 为 config.py，按自己环境修改。
 
-
-def load_time_series_for_stock(
-    engine: Engine,
-    ts_code: str,
-    min_date: date,
-    max_date: date,
-) -> pd.DataFrame:
-    """
-    一次性加载该股票在 [min_date, max_date] 区间的：
-      - 日线（stock_daily）
-      - 布林数据（stock_bollinger_data）
-      - 日度微结构（stock_microstructure_daily）
-      - 资金质量（stock_fund_quality，只需要拿离当前日期最近的一条）
-    合并成按 trade_date 升序的 DataFrame。
-    """
-
-    # 1. 日线
-    sql_daily = text(
-        """
-        SELECT ts_code, trade_date, open, high, low, close, amount
-        FROM stock_daily
-        WHERE ts_code = :ts_code AND trade_date BETWEEN :min_date AND :max_date
-        ORDER BY trade_date
-        """
-    )
-    df_daily = pd.read_sql(
-        sql_daily,
-        engine,
-        params={"ts_code": ts_code, "min_date": min_date, "max_date": max_date},
-    )
-    if df_daily.empty:
-        return df_daily
-
-    df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"])
-    df_daily.set_index("trade_date", inplace=True)
-    df_daily.sort_index(inplace=True)
-
-    # 计算 1 日收益 和 20 日均成交额
-    df_daily["ret_1d"] = df_daily["close"] / df_daily["close"].shift(1) - 1
-    df_daily["ma_amount_20"] = df_daily["amount"].rolling(20, min_periods=1).mean()
-
-    # 2. 布林
-    sql_boll = text(
-        """
-        SELECT ts_code, trade_date, price_position, band_width
-        FROM stock_bollinger_data
-        WHERE ts_code = :ts_code AND trade_date BETWEEN :min_date AND :max_date
-        """
-    )
-    df_boll = pd.read_sql(
-        sql_boll,
-        engine,
-        params={"ts_code": ts_code, "min_date": min_date, "max_date": max_date},
-    )
-    df_boll["trade_date"] = pd.to_datetime(df_boll["trade_date"])
-    df_boll.set_index("trade_date", inplace=True)
-    df_boll = df_boll[["price_position", "band_width"]]
-
-    # 3. 日度微结构
-    sql_micro = text(
-        """
-        SELECT ts_code, trade_date,
-               big_net_value,
-               total_value,
-               buy_value,
-               sell_value,
-               big_net_open,
-               big_net_close
-        FROM stock_microstructure_daily
-        WHERE ts_code = :ts_code AND trade_date BETWEEN :min_date AND :max_date
-        """
-    )
-    df_micro = pd.read_sql(
-        sql_micro,
-        engine,
-        params={"ts_code": ts_code, "min_date": min_date, "max_date": max_date},
-    )
-    if df_micro.empty:
-        # 若完全没有微结构数据，构造空列（后续直接填 0）
-        df_micro = pd.DataFrame(
-            columns=[
-                "big_net_value",
-                "total_value",
-                "buy_value",
-                "sell_value",
-                "big_net_open",
-                "big_net_close",
-            ]
-        )
-    else:
-        df_micro["trade_date"] = pd.to_datetime(df_micro["trade_date"])
-        df_micro.set_index("trade_date", inplace=True)
-        df_micro = df_micro[
-            [
-                "big_net_value",
-                "total_value",
-                "buy_value",
-                "sell_value",
-                "big_net_open",
-                "big_net_close",
-            ]
-        ]
-
-    # 4. 资金质量（只需要一个“截止某日最近”）
-    #   简单做法：在合并后对每个 trade_date 选 window_end <= trade_date 的最近一条
-    sql_fq = text(
-        """
-        SELECT ts_code, window_end, fund_quality_score
-        FROM stock_fund_quality
-        WHERE ts_code = :ts_code AND window_end <= :max_date
-        ORDER BY window_end
-        """
-    )
-    df_fq = pd.read_sql(sql_fq, engine, params={"ts_code": ts_code, "max_date": max_date})
-    if not df_fq.empty:
-        df_fq["window_end"] = pd.to_datetime(df_fq["window_end"])
-        df_fq.set_index("window_end", inplace=True)
-        # 右对齐到 daily 的 trade_date：每一天用“之前最近的 window_end”
-        df_fq = df_fq[["fund_quality_score"]]
-        df_fq = df_fq.reindex(df_daily.index, method="ffill")
-    else:
-        df_fq = pd.DataFrame(index=df_daily.index, data={"fund_quality_score": np.nan})
-
-    # 合并：daily 作为主表
-    df = df_daily.join(df_boll, how="left")
-    df = df.join(df_micro, how="left")
-    df = df.join(df_fq, how="left")
-
-    # 微结构缺失填 0
-    for col in [
-        "big_net_value",
-        "total_value",
-        "buy_value",
-        "sell_value",
-        "big_net_open",
-        "big_net_close",
-    ]:
-        if col in df.columns:
-            df[col] = df[col].fillna(0.0)
-
-    # 价格 & 布林缺失直接保持 NaN，后面计算时注意处理
-    return df
-
-
-# -----------------------------
-# 特征计算核心：单个进池事件
-# -----------------------------
-
-def _safe_div(a: float, b: float) -> float:
-    if b is None or b == 0 or np.isnan(b):
-        return 0.0
-    return float(a) / float(b)
-
-
-def compute_tier1_features_for_episode(
-    ts_code: str,
-    pool_date: date,
-    df: pd.DataFrame,
-    cfg: PoolMLConfig,
-) -> pd.DataFrame:
-    """
-    对单只股票 df（包含从 min_date 到 max_date 的时间序列）中的
-    某一次进池事件 (ts_code, pool_date) 计算 Tier1 特征。
-    df 的 index 是 trade_date（datetime64[ns]），按升序排列。
-
-    返回列：
-      ts_code, pool_date, current_date, 以及所有 Tier1 特征。
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    # 保证 index 是 Timestamp
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("df.index must be DatetimeIndex with trade_date")
-
-    # pool_date 转成 Timestamp
-    pool_ts = pd.to_datetime(pool_date)
-
-    if pool_ts not in df.index:
-        # 这个进池日没有日线数据，直接跳过
-        logger.warning("pool_date %s not in daily index for %s", pool_date, ts_code)
-        return pd.DataFrame()
-
-    # 取 T0 行
-    pool_idx = df.index.get_loc(pool_ts)
-    pool_row = df.iloc[pool_idx]
-
-    # 进池当天的特征
-    pool_price_pos = float(pool_row.get("price_position", np.nan))
-    pool_rel_amount = _safe_div(pool_row["amount"], pool_row["ma_amount_20"])
-    pool_total_value_t0 = float(pool_row.get("total_value", 0.0))
-    pool_big_net_value_t0 = float(pool_row.get("big_net_value", 0.0))
-    pool_big_net_ratio_t0 = _safe_div(pool_big_net_value_t0, pool_total_value_t0)
-    pool_fund_quality_score = float(pool_row.get("fund_quality_score", np.nan))
-
-    # 整体时间序列，用于“自进池以来”的累积
-    close_series = df["close"]
-    ret_1d_series = df["ret_1d"]
-    big_net_series = df["big_net_value"]
-    total_value_series = df["total_value"]
-
-    # 从 pool_idx 开始，最多跟踪 cfg.max_tracking_days 个“交易日”
-    max_idx = min(pool_idx + cfg.max_tracking_days, len(df) - 1)
-
-    rows = []
-
-    for idx in range(pool_idx, max_idx + 1):
-        current_ts = df.index[idx]
-        current_row = df.iloc[idx]
-
-        # 1) Episode 状态：相对 T0
-        days_since_pool = idx - pool_idx  # 0 = T0 本身
-        close_t = float(current_row["close"])
-        close_T0 = float(pool_row["close"])
-        ret_since_pool = _safe_div(close_t, close_T0) - 1.0
-
-        # 自进池以来的最大回撤
-        window_close = close_series.iloc[pool_idx : idx + 1]
-        min_close_since_pool = float(window_close.min())
-        max_down_since_pool = _safe_div(min_close_since_pool, close_T0) - 1.0
-
-        # 自进池以来的资金累积
-        window_big_net = big_net_series.iloc[pool_idx : idx + 1]
-        window_total_value = total_value_series.iloc[pool_idx : idx + 1]
-        big_net_sum_since_pool = float(window_big_net.sum())
-        total_value_sum_since_pool = float(window_total_value.sum())
-        big_net_ratio_since_pool = _safe_div(big_net_sum_since_pool, total_value_sum_since_pool)
-
-        # 自进池以来的 support_ratio_since_pool
-        window_ret = ret_1d_series.iloc[pool_idx : idx + 1]
-        # 回调日：ret_1d < 0 且有微结构
-        down_mask = window_ret < 0
-        down_dates = window_ret.index[down_mask]
-        if len(down_dates) == 0:
-            support_ratio_since_pool = 0.0
-        else:
-            bn_down = big_net_series.reindex(down_dates).fillna(0.0)
-            support_days = (bn_down >= 0).sum()
-            support_ratio_since_pool = float(support_days) / float(len(down_dates))
-
-        # 2) 当前这一天 t 的当下状态（价格 / 布林 / 量能 / 资金）
-        # 单日收益
-        ret_1d = float(current_row.get("ret_1d", np.nan))
-
-        price_pos_t = float(current_row.get("price_position", np.nan))
-        band_width_t = float(current_row.get("band_width", np.nan))
-
-        amount_t = float(current_row.get("amount", 0.0))
-        ma_amount_20_t = float(current_row.get("ma_amount_20", 0.0))
-        rel_amount_t = _safe_div(amount_t, ma_amount_20_t)
-
-        big_net_t = float(current_row.get("big_net_value", 0.0))
-        total_value_t = float(current_row.get("total_value", 0.0))
-        buy_value_t = float(current_row.get("buy_value", 0.0))
-        sell_value_t = float(current_row.get("sell_value", 0.0))
-        big_net_ratio_t = _safe_div(big_net_t, total_value_t)
-        ofi_t = _safe_div(buy_value_t - sell_value_t, total_value_t)
-
-        big_net_close_t = float(current_row.get("big_net_close", 0.0))
-        big_net_close_ratio_t = _safe_div(big_net_close_t, total_value_t)
-
-        # 3) 最近 few 天的微结构（动态窗口）
-        # recent_window = [max(T0, t - recent_window_days + 1), t]
-        recent_window_len = cfg.recent_window_days
-        recent_start_idx = max(pool_idx, idx - recent_window_len + 1)
-        # 注意：iloc 是左闭右闭，+1
-        recent_big_net = big_net_series.iloc[recent_start_idx : idx + 1]
-        recent_total_value = total_value_series.iloc[recent_start_idx : idx + 1]
-        recent_big_net_sum = float(recent_big_net.sum())
-        recent_total_value_sum = float(recent_total_value.sum())
-        big_net_ratio_recent = _safe_div(recent_big_net_sum, recent_total_value_sum)
-
-        recent_ret = ret_1d_series.iloc[recent_start_idx : idx + 1]
-        recent_down_dates = recent_ret.index[recent_ret < 0]
-        if len(recent_down_dates) == 0:
-            support_ratio_recent = 0.0
-        else:
-            bn_recent_down = big_net_series.reindex(recent_down_dates).fillna(0.0)
-            recent_support_days = (bn_recent_down >= 0).sum()
-            support_ratio_recent = float(recent_support_days) / float(len(recent_down_dates))
-
-        # 4) 组装一行
-        rows.append(
-            {
-                "ts_code": ts_code,
-                "pool_date": pool_ts.date(),
-                "current_date": current_ts.date(),
-
-                "days_since_pool": days_since_pool,
-                "ret_since_pool": ret_since_pool,
-                "max_down_since_pool": max_down_since_pool,
-                "big_net_ratio_since_pool": big_net_ratio_since_pool,
-                "support_ratio_since_pool": support_ratio_since_pool,
-
-                "ret_1d": ret_1d,
-                "price_pos_t": price_pos_t,
-                "band_width_t": band_width_t,
-                "rel_amount_t": rel_amount_t,
-                "big_net_ratio_t": big_net_ratio_t,
-                "ofi_t": ofi_t,
-                "big_net_close_ratio_t": big_net_close_ratio_t,
-
-                "pool_price_pos": pool_price_pos,
-                "pool_rel_amount": pool_rel_amount,
-                "pool_big_net_ratio_t0": pool_big_net_ratio_t0,
-                "pool_fund_quality_score": pool_fund_quality_score,
-
-                "big_net_ratio_recent": big_net_ratio_recent,
-                "support_ratio_recent": support_ratio_recent,
-
-                # label 暂时留空（后续阶段 4 再填）
-                "label_good_entry": None,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-# -----------------------------
-# 批量构建样本集
-# -----------------------------
-
-def build_pool_ml_samples(
-    start_date: date,
-    end_date: date,
-    cfg: PoolMLConfig | None = None,
-    engine: Engine | None = None,
-    max_tracking_days: int | None = None,
-) -> None:
-    """
-    对 [start_date, end_date] 内所有进池事件，构建 Tier1 特征样本，并写入 stock_pool_ml_samples。
-
-    注意：
-      - 为了减少重复 IO，将以 ts_code 为单位批量处理：
-        先取该 ts_code 所有 pool_date，再一次性加载时间序列。
-    """
-    if cfg is None:
-        cfg = PoolMLConfig()
-
-    if max_tracking_days is not None:
-        cfg.max_tracking_days = max_tracking_days
-
-    if engine is None:
-        engine = get_engine()
-
-    episodes = fetch_active_episodes(engine, start_date, end_date)
-    if episodes.empty:
-        logger.warning("No active pool episodes between %s and %s", start_date, end_date)
-        return
-
-    # 按 ts_code 分组处理
-    grouped = episodes.groupby("ts_code")
-
-    all_feature_rows: List[pd.DataFrame] = []
-
-    for ts_code, group in grouped:
-        pool_dates: List[date] = sorted(group["pool_date"].tolist())
-
-        # 为了覆盖所有 episode 的跟踪期，扩展加载区间
-        min_pool_date = min(pool_dates)
-        max_pool_date = max(pool_dates)
-        min_date = min_pool_date  # 可以再往前扩一些，用于 pre-history 特征
-        max_date = max_pool_date + timedelta(days=cfg.max_tracking_days + 5)
-
-        logger.info(
-            "Loading time series for %s from %s to %s",
-            ts_code,
-            min_date,
-            max_date,
-        )
-        df = load_time_series_for_stock(engine, ts_code, min_date, max_date)
-        if df.empty:
-            continue
-
-        for pool_date in pool_dates:
-            feat_df = compute_tier1_features_for_episode(ts_code, pool_date, df, cfg)
-            if feat_df is not None and not feat_df.empty:
-                all_feature_rows.append(feat_df)
-
-    if not all_feature_rows:
-        logger.warning("No features generated for given date range.")
-        return
-
-    result_df = pd.concat(all_feature_rows, ignore_index=True)
-
-    # 写入数据库
-    logger.info("Writing %d rows into stock_pool_ml_samples", len(result_df))
-    result_df.to_sql(
-        "stock_pool_ml_samples",
-        engine,
-        if_exists="append",
-        index=False,
-    )
-
-    logger.info("Done building stock_pool_ml_samples for [%s, %s]", start_date, end_date)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    # 简单测试入口：按需改动日期
-    eng = get_engine()
-    cfg = PoolMLConfig(max_tracking_days=10, recent_window_days=3)
-    build_pool_ml_samples(
-        start_date=date(2023, 1, 1),
-        end_date=date(2023, 3, 31),
-        cfg=cfg,
-        engine=eng,
-    )
+长期可以考虑用 .env + pydantic 或 python-dotenv 做配置管理，但不是当下刚需。

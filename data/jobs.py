@@ -3,7 +3,7 @@
 定时任务入口：
 
 - job_update_ohlc: 盘前/盘后更新日线 & 分钟线
-- job_collect_ticks_once: 测试用 tick 抓取
+- job_collect_full_day_ticks: 收盘后全市场 full-day tick 抓取
 - job_finalize_ticks_and_levels: 收盘后（或盘前）计算关键位
 """
 
