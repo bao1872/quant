@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import joblib
 import numpy as np
@@ -13,6 +13,8 @@ import time
 import os
 
 from ml.pool_data_loader import PoolDataRangeConfig, load_pool_merged_dataset, clean_features
+USE_DROP_TAIL_FEATURES = False
+EXP_NAME = "xgb_from_pool_ret10d"
 
 
 @dataclass
@@ -69,11 +71,37 @@ def quantile_backtest(df: pd.DataFrame, pred_col: str, label_col: str, n_quantil
     return pivot
 
 
-def train_from_pool():
+def compute_feature_importance(model: XGBRegressor, feature_cols: List[str], top_k: int = 30) -> pd.DataFrame:
+    booster = model.get_booster()
+    def to_name_dict(raw_score: Dict[str, float]) -> Dict[str, float]:
+        return {feature_cols[i]: raw_score.get(f"f{i}") for i in range(len(feature_cols)) if raw_score.get(f"f{i}") is not None}
+    imp_types = ["weight", "gain", "cover", "total_gain", "total_cover"]
+    frames = []
+    for t in imp_types:
+        raw = booster.get_score(importance_type=t)
+        mapped = to_name_dict(raw)
+        if mapped:
+            frames.append(pd.Series(mapped, name=t))
+    if not frames:
+        print("[feat] no importance info", flush=True)
+        return pd.DataFrame()
+    df_imp = pd.concat(frames, axis=1).fillna(0.0)
+    sort_col = "gain" if "gain" in df_imp.columns else df_imp.columns[0]
+    df_sorted = df_imp.sort_values(sort_col, ascending=False)
+    print(f"[feat] top {top_k} features by {sort_col}:", flush=True)
+    head = df_sorted.head(top_k)
+    for idx in head.index:
+        gv = float(head.loc[idx].get("gain", 0.0)) if "gain" in head.columns else float('nan')
+        wv = float(head.loc[idx].get("weight", 0.0)) if "weight" in head.columns else float('nan')
+        print(f"  {idx:35s} gain={gv:.6f}  weight={wv:.1f}", flush=True)
+    return df_imp
+
+def train_from_pool(drop_tail: bool | None = None):
     dr = PoolDataRangeConfig(start_date=dt.date(2024, 11, 15), end_date=dt.date.today(), label_col="y_ret_10d")
     print("[train] load start", flush=True)
     t0 = time.perf_counter()
-    df, feature_cols, label_col = load_pool_merged_dataset(dr, enable_3day_features=False)
+    use_drop = USE_DROP_TAIL_FEATURES if drop_tail is None else drop_tail
+    df, feature_cols, label_col = load_pool_merged_dataset(dr, enable_3day_features=False, verbose=False, drop_tail=use_drop)
     t1 = time.perf_counter()
     print("[train] load done shape=", df.shape, "features=", len(feature_cols), "elapsed=", round(t1 - t0, 3), "s", flush=True)
     t2 = time.perf_counter()
@@ -88,6 +116,12 @@ def train_from_pool():
     model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
     t5 = time.perf_counter()
     print("[train] fit done elapsed=", round(t5 - t4, 3), "s", flush=True)
+    df_imp = compute_feature_importance(model, feature_cols, top_k=30)
+    if not df_imp.empty:
+        os.makedirs("data", exist_ok=True)
+        fi_path = os.path.join("data", "feature_importance_xgb_from_pool_ret10d.csv")
+        df_imp.sort_values("gain", ascending=False).to_csv(fi_path)
+        print("[feat] feature importance saved to", fi_path, flush=True)
     df_eval = df.copy()
     X_all = df_eval[feature_cols].to_numpy(dtype=float)
     t6 = time.perf_counter()
@@ -107,12 +141,30 @@ def train_from_pool():
         print(q_ret.mean())
     bundle = {"model": model, "feature_cols": feature_cols, "label_col": label_col, "train_end": cfg.train_end, "valid_end": cfg.valid_end}
     t12 = time.perf_counter()
-    dirp = os.path.dirname(cfg.model_path)
-    if dirp:
-        os.makedirs(dirp, exist_ok=True)
-    joblib.dump(bundle, cfg.model_path)
+    os.makedirs("models", exist_ok=True)
+    model_path = os.path.join("models", f"{EXP_NAME}.pkl") if drop_tail is None else os.path.join("models", f"xgb_from_pool_ret10d_{'drop_tail' if use_drop else 'full'}.pkl")
+    joblib.dump(bundle, model_path)
     t13 = time.perf_counter()
-    print("[train] saved", cfg.model_path, "elapsed=", round(t13 - t12, 3), "s", flush=True)
+    print("[train] saved", model_path, "elapsed=", round(t13 - t12, 3), "s", flush=True)
+    print("[train] done", flush=True)
+
+def run_summary_only():
+    dr = PoolDataRangeConfig(start_date=dt.date(2024, 11, 15), end_date=dt.date.today(), label_col="y_ret_10d")
+    df, feature_cols, label_col = load_pool_merged_dataset(dr, enable_3day_features=False, verbose=False)
+    df = clean_features(df, feature_cols)
+    cfg = TrainConfig()
+    bundle = joblib.load(cfg.model_path)
+    model = bundle["model"]
+    X_all = df[feature_cols].to_numpy(dtype=float)
+    df_eval = df.copy()
+    df_eval["pred_ret_10d"] = model.predict(X_all)
+    df_test = df_eval[df_eval["trade_date"] > bundle["valid_end"]].copy()
+    ic_series = calc_daily_ic(df_test, "pred_ret_10d", label_col)
+    q_ret = quantile_backtest(df_test, "pred_ret_10d", label_col, n_quantiles=5)
+    (X_train, _), (X_valid, _), (X_test, _) = time_split(df, label_col, feature_cols, cfg)
+    print("[summary] train", X_train.shape[0], "valid", X_valid.shape[0], "test", X_test.shape[0], flush=True)
+    print("[summary] ic_mean", float(ic_series.mean()), "ic_std", float(ic_series.std()), flush=True)
+    print("[summary] q_mean", q_ret.mean().to_dict(), flush=True)
 
 
 if __name__ == "__main__":

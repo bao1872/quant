@@ -1,196 +1,118 @@
-一、开发步骤（按文件改）
+一、要做的事一共 3 步
 
-只动一个文件：ml/pool_data_loader.py
+在日频特征里计算 20 日平均成交额列（amount_20d_avg）
 
-做三件事：
+在训练样本构建阶段加一条过滤条件：amount_20d_avg ≥ 1e8
 
-在文件顶部增加一个 关键时序特征列表 KEY_TS_FEATURES。
+在每日选股 / 算仓位时，同样先用这个条件过滤
 
-新增函数 add_lag1_and_delta_features，按 ts_code 分组计算 lag1 和 delta1。
+下面分别说。
 
-在 load_pool_merged_dataset 里，在 concat 完所有 chunk 后调用这个函数，再选数值特征列。
+二、Step 1：计算 20 日平均成交额 amount_20d_avg
+方案 A：在数据库里用 SQL 窗口函数计算（推荐）
 
-⚠️ KEY_TS_FEATURES 里的名字要和你表里的列名对上，不对的列函数会自动跳过，我这里先给一个推荐列表，你可以按自己实际字段改。
+假设你日频表里已经有：
 
-二、修改代码示例（贴进去就能用）
+表：stock_tick_daily_features 或 stock_kline / stock_bollinger_data
 
-下面是基于你当前仓库结构写的 核心代码补丁。
-你可以直接在 ml/pool_data_loader.py 里按位置修改。
+字段：ts_code, trade_date, amount_sum（或 amount）
 
-1. 顶部增加关键特征列表
+可以在建表或建视图的时候加一列：
 
-在 from db.connection import get_engine 下面，加上：
+ALTER TABLE stock_tick_daily_features
+    ADD COLUMN amount_20d_avg NUMERIC;
 
-from db.connection import get_engine
+UPDATE stock_tick_daily_features AS t
+SET amount_20d_avg = sub.amount_20d_avg
+FROM (
+    SELECT
+        ts_code,
+        trade_date,
+        AVG(amount_sum) OVER (
+            PARTITION BY ts_code
+            ORDER BY trade_date
+            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ) AS amount_20d_avg
+    FROM stock_tick_daily_features
+) AS sub
+WHERE t.ts_code = sub.ts_code
+  AND t.trade_date = sub.trade_date;
 
-# ========= 关键时序特征（只对这些列做 lag1 + delta1） =========
-# 请根据你实际的字段名调整：
-# - price_position / v_price_position / band_width_zscore / v_band_width_zscore 是 stock_bollinger_data 里的
-# - active_buy_vol_ratio 假设是你在 tick 聚合表里算好的“主买占比”
-KEY_TS_FEATURES: List[str] = [
-    "price_position",
-    "v_price_position",
-    "band_width_zscore",
-    "v_band_width_zscore",
-    # 如果你的 tick 日表里叫别的名字，比如 main_buy_vol_ratio，就把这行改成真实列名
-    "active_buy_vol_ratio",
-]
-# ============================================================
 
+说明：
 
-如果暂时不确定 tick 那个字段叫什么，可以先只保留前 4 个布林特征，把 active_buy_vol_ratio 先注释掉。
+这就是严格的“过去 20 个交易日（含当日）平均成交额”；
 
-2. 在文件中间新增：add_lag1_and_delta_features
+如果你更谨慎，可以改成用到 t-1 为止（排除当日）：ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING；
 
-建议放在 load_pool_merged_dataset 定义前面，比如紧跟在 _date_chunks 或 load_pool_merged_dataset_iter 之后。
+用的是窗口函数，不会用到未来数据。
 
-def add_lag1_and_delta_features(
-    df: pd.DataFrame,
-    key_features: List[str],
-) -> pd.DataFrame:
-    """
-    只对少数关键特征增加简单时间序列信息：
-      对每个特征 col in key_features：
-        col_lag1   = 前 1 个交易日的值（按 ts_code 分组）
-        col_delta1 = col - col_lag1  （当天相对昨天的变化）
+之后，ETL 定时任务跑完 tick 日聚合后，可以顺带跑这个 UPDATE，或者做成视图。
 
-    要求 df 至少包含：
-      - ts_code
-      - trade_date
-      - key_features 中的部分列（缺的会自动跳过）
-    """
-    if df.empty:
-        return df
+方案 B：在加载特征的 Python 里滚动计算
 
-    # 先按 ts_code, trade_date 排序，保证 shift/rolling 顺序正确
-    df = df.sort_values(["ts_code", "trade_date"]).copy()
+如果你倾向在 Python 里做（比如已经读了一个大 df），伪代码如下：
 
-    grouped = df.groupby("ts_code", sort=False)
-
-    for col in key_features:
-        if col not in df.columns:
-            # 某些特征可能在当前样本期内缺失，这里直接跳过
-            print(f"[lag] skip feature={col}, not in df.columns", flush=True)
-            continue
-
-        lag_col = f"{col}_lag1"
-        delta_col = f"{col}_delta1"
-
-        # t-1
-        df[lag_col] = grouped[col].shift(1)
-
-        # 当天相对昨天变化
-        df[delta_col] = df[col] - df[lag_col]
-
+def add_amount_20d_avg(df: pd.DataFrame) -> pd.DataFrame:
+    # df 至少包含: ts_code, trade_date, amount_sum
+    df = df.sort_values(["ts_code", "trade_date"])
+    df["amount_20d_avg"] = (
+        df.groupby("ts_code")["amount_sum"]
+          .transform(lambda s: s.rolling(20, min_periods=10).mean())
+    )
     return df
 
-3. 修改 load_pool_merged_dataset：插入调用
 
-你当前的 load_pool_merged_dataset 大致是这样（我从你仓库里读出来的）：
+然后在你 load 日频特征的地方，加上这一行即可。
 
-def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, List[str], str]:
-    frames = []
-    total_rows = 0
-    for df in load_pool_merged_dataset_iter(dr, chunk_days=30):
-        frames.append(df)
-        total_rows += len(df)
-    df = pd.concat(frames, ignore_index=True)
-    if dr.label_col in df.columns:
-        df[dr.label_col] = pd.to_numeric(df[dr.label_col], errors="coerce")
-    print("[load_pool] concat rows=", total_rows, flush=True)
-    if df.empty:
-        raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if dr.label_col not in numeric_cols:
-        raise RuntimeError("Label column not found in numeric columns.")
-    feature_cols = [c for c in numeric_cols if c != dr.label_col and not c.startswith("y_")]
-    return df, feature_cols, dr.label_col
+三、Step 2：训练样本构建时加流动性过滤
+
+你现在 Stock Pool Ml Samples 是从 stock_bollinger_data + tick 特征合并出来的，对吧。
+
+在你构建样本/载入样本时，加一条过滤：
+
+# 假设 df_pool 里已经 merge 进了 amount_20d_avg
+LIQ_THRES = 1e8  # 1 亿
+
+before = len(df_pool)
+df_pool = df_pool[df_pool["amount_20d_avg"] >= LIQ_THRES].copy()
+after = len(df_pool)
+
+print(f"[build_pool] liquidity filter: {before} -> {after} rows "
+      f"(amount_20d_avg >= {LIQ_THRES:.0f})")
 
 
-请改成下面这版（只改这一处）：
+要注意两点：
 
-def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, List[str], str]:
-    frames = []
-    total_rows = 0
-    for df_chunk in load_pool_merged_dataset_iter(dr, chunk_days=30):
-        frames.append(df_chunk)
-        total_rows += len(df_chunk)
+只用历史数据算的 20 日平均（前面已经保证了）；
 
-    df = pd.concat(frames, ignore_index=True)
-    print("[load_pool] concat rows=", total_rows, flush=True)
+训练阶段和实盘阶段用完全一致的过滤逻辑，避免 train-test mismatch。
 
-    if df.empty:
-        raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
+如果你是在 SQL 里先筛选股票池再写入 stock_pool_ml_samples，也可以直接写：
 
-    # label 转成数值
-    if dr.label_col in df.columns:
-        df[dr.label_col] = pd.to_numeric(df[dr.label_col], errors="coerce")
+WHERE amount_20d_avg >= 100000000
 
-    # ===== 在这里增加：关键特征的 lag1 + delta1 =====
-    df = add_lag1_and_delta_features(df, KEY_TS_FEATURES)
-    # =================================================
+四、Step 3：实盘选股 / 仓位控制时加这个条件
 
-    # 选数值列
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if dr.label_col not in numeric_cols:
-        raise RuntimeError("Label column not found in numeric columns.")
+当你每天做“选股 + 算仓位”时，在那一步的 universe 过滤里，加一条简单规则：
 
-    # 特征列 = 所有数值列 - 标签列 - 其他 y_* 标签
-    feature_cols = [
-        c for c in numeric_cols
-        if c != dr.label_col and not c.startswith("y_")
-    ]
-
-    return df, feature_cols, dr.label_col
+def filter_universe_liquidity(df_today, thres=1e8):
+    """
+    df_today: 当日候选股票的截面数据
+              必须包含 amount_20d_avg（可以是 t 或 t-1）
+    """
+    mask = df_today["amount_20d_avg"] >= thres
+    df_filt = df_today[mask].copy()
+    print(
+        f"[universe] liquidity filter: {len(df_today)} -> {len(df_filt)} "
+        f"(amount_20d_avg >= {thres:.0f})"
+    )
+    return df_filt
 
 
-这样做的顺序是：
+然后在你的选股逻辑里：
 
-所有 chunk 合并 → df
+df_today = load_today_features(...)
+df_today = filter_universe_liquidity(df_today, thres=1e8)
 
-转 label 类型
-
-增加 lag1/delta1 这几个新列
-
-然后统一选数值列作为特征
-
-三、训练脚本可以保持现状（用 A 的配置）
-
-你的 ml/train_xgb_from_pool.py 里，A 实验那套配置已经验证过效果不错：
-
-单日特征
-
-label clipping（1%/99%）
-
-当前 XGB 参数
-
-在刚才这套修改完成后：
-
-feature_cols 会多出少量 *_lag1 和 *_delta1 列（数量很有限）；
-
-训练脚本逻辑不需要改，只要重新 python -m ml.train_xgb_from_pool 跑一遍即可。
-
-建议你暂时先继续使用：
-
-单日 + lag1 + delta1
-
-label clipping（你 log 里那组 q1/q99 区间就可以）
-
-四、你接下来可以这样操作
-
-按上面的代码片段，修改 ml/pool_data_loader.py：
-
-加 KEY_TS_FEATURES；
-
-加 add_lag1_and_delta_features；
-
-在 load_pool_merged_dataset 中插入调用。
-
-确认 KEY_TS_FEATURES 里所有列在 df.columns 里都存在；
-
-如果某列不存在，会打印 [lag] skip feature=xxx，不影响运行。
-
-跑训练：
-
-cd d:\quant
-python -m ml.train_xgb_from_pool
+# 再按 pred_ret_10d 排序，选择 top N，算权重等

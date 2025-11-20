@@ -11,6 +11,7 @@ import time
 import datetime as dt
 
 from db.connection import get_engine
+from ml.feature_config import DROP_CANDIDATE_FEATURES
 
 # ========= 关键时序特征（只对这些列做 lag1 + delta1） =========
 # 请根据你实际的字段名调整：
@@ -55,7 +56,7 @@ def _date_chunks(start_date: dt.date, end_date: dt.date, chunk_days: int = 30) -
     return chunks
 
 
-def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30):
+def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30, verbose: bool = True):
     eng = get_engine()
     sql_s = (
         "SELECT ts_code, trade_date::date AS trade_date, " + dr.label_col + " AS " + dr.label_col +
@@ -74,11 +75,13 @@ def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30)
         "ON t.ts_code=s.ts_code AND t.trade_date=s.trade_date"
     )
     chunks = _date_chunks(dr.start_date, dr.end_date, chunk_days)
-    print("[load_pool] query start", dr.start_date, dr.end_date, "chunks=", len(chunks), flush=True)
+    if verbose:
+        print("[load_pool] query start", dr.start_date, dr.end_date, "chunks=", len(chunks), flush=True)
     with eng.connect() as conn:
         for i, (s, e) in enumerate(chunks, start=1):
             t0 = time.perf_counter()
-            print("[load_pool] chunk", i, "/", len(chunks), "samples query", s, e, flush=True)
+            if verbose:
+                print("[load_pool] chunk", i, "/", len(chunks), "samples query", s, e, flush=True)
             df_s = pd.read_sql(text(sql_s), conn, params={"start_date": s, "end_date": e}, parse_dates=["trade_date"])
             df_s = df_s.loc[:, ~df_s.columns.duplicated()]
             if df_s.empty:
@@ -89,32 +92,37 @@ def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30)
             df_b = df_b.loc[:, ~df_b.columns.duplicated()]
             df_sb = pd.merge(df_s, df_b, on=["ts_code", "trade_date"], how="inner", suffixes=("", "_b"))
             t1 = time.perf_counter()
-            print("[load_pool] chunk", i, "/", len(chunks), "s+b rows=", len(df_sb), "elapsed=", round(t1 - t0, 3), "s", flush=True)
+            if verbose:
+                print("[load_pool] chunk", i, "/", len(chunks), "s+b rows=", len(df_sb), "elapsed=", round(t1 - t0, 3), "s", flush=True)
             t2 = time.perf_counter()
-            print("[load_pool] chunk", i, "/", len(chunks), "t query", s, e, flush=True)
+            if verbose:
+                print("[load_pool] chunk", i, "/", len(chunks), "t query", s, e, flush=True)
             df_t = pd.read_sql(text(sql_t), conn, params={"start_date": s, "end_date": e}, parse_dates=["trade_date"])
             df_t = df_t.loc[:, ~df_t.columns.duplicated()]
             t3 = time.perf_counter()
-            print("[load_pool] chunk", i, "/", len(chunks), "t rows=", len(df_t), "elapsed=", round(t3 - t2, 3), "s", flush=True)
+            if verbose:
+                print("[load_pool] chunk", i, "/", len(chunks), "t rows=", len(df_t), "elapsed=", round(t3 - t2, 3), "s", flush=True)
             df = pd.merge(df_sb, df_t, on=["ts_code", "trade_date"], how="left")
             df = df.loc[:, ~df.columns.duplicated()]
             df["trade_date"] = df["trade_date"].dt.date
             if dr.label_col in df.columns:
                 df[dr.label_col] = pd.to_numeric(df[dr.label_col], errors="coerce")
-            print("[load_pool] chunk", i, "/", len(chunks), "merge rows=", len(df), flush=True)
+            if verbose:
+                print("[load_pool] chunk", i, "/", len(chunks), "merge rows=", len(df), flush=True)
             yield df
 
 
-def load_pool_merged_dataset(dr: PoolDataRangeConfig, enable_3day_features: bool = False) -> Tuple[pd.DataFrame, List[str], str]:
+def load_pool_merged_dataset(dr: PoolDataRangeConfig, enable_3day_features: bool = False, verbose: bool = True, drop_tail: bool = False) -> Tuple[pd.DataFrame, List[str], str]:
     frames = []
     total_rows = 0
-    for df in load_pool_merged_dataset_iter(dr, chunk_days=30):
+    for df in load_pool_merged_dataset_iter(dr, chunk_days=30, verbose=verbose):
         frames.append(df)
         total_rows += len(df)
     df = pd.concat(frames, ignore_index=True)
     if dr.label_col in df.columns:
         df[dr.label_col] = pd.to_numeric(df[dr.label_col], errors="coerce")
-    print("[load_pool] concat rows=", total_rows, flush=True)
+    if verbose:
+        print("[load_pool] concat rows=", total_rows, flush=True)
     if df.empty:
         raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
     if enable_3day_features:
@@ -123,7 +131,14 @@ def load_pool_merged_dataset(dr: PoolDataRangeConfig, enable_3day_features: bool
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if dr.label_col not in numeric_cols:
         raise RuntimeError("Label column not found in numeric columns.")
-    feature_cols = [c for c in numeric_cols if c != dr.label_col and not c.startswith("y_")]
+    if drop_tail:
+        feature_cols = [c for c in numeric_cols if c != dr.label_col and not c.startswith("y_") and c not in DROP_CANDIDATE_FEATURES]
+        if verbose:
+            print("[load_pool] drop_tail=True features=", len(feature_cols), "/", len(numeric_cols) - 1, flush=True)
+    else:
+        feature_cols = [c for c in numeric_cols if c != dr.label_col and not c.startswith("y_")]
+        if verbose:
+            print("[load_pool] drop_tail=False features=", len(feature_cols), "/", len(numeric_cols) - 1, flush=True)
     return df, feature_cols, dr.label_col
 
 
