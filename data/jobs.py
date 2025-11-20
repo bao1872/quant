@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import date as _date
 from datetime import timedelta as _timedelta
+from datetime import time as _time
 
 from .updater import update_daily_bars, update_minute_bars, collect_full_day_ticks
 from .concepts_cache import update_concepts_cache, update_hk_industry_cache, validate_concepts_cache_count
@@ -27,6 +28,9 @@ from datetime import date as date_cls
 from dataclasses import dataclass
 import numpy as np
 import logging
+from pathlib import Path
+from config import TICK_BASE_DIR
+import pyarrow.parquet as pq
 
 
 def job_update_ohlc(trade_date: _date) -> None:
@@ -43,6 +47,429 @@ def job_finalize_ticks_and_levels(trade_date: _date) -> None:
     print(f"[job_finalize_ticks_and_levels] trade_date={trade_date}")
     provider = AbuPriceLevelProvider()
     provider.precompute(trade_date)
+
+
+def _list_tick_parquet_for_date(d: _date) -> list[Path]:
+    base = Path(TICK_BASE_DIR)
+    if not base.exists():
+        return []
+    pat = f"{pd.Timestamp(d).strftime('%Y%m%d')}_交易数据.parquet"
+    return list(base.rglob(pat))
+
+
+def _scan_fs_tick_dates() -> list[_date]:
+    base = Path(TICK_BASE_DIR)
+    if not base.exists():
+        return []
+    dates: set[_date] = set()
+    for p in base.rglob("*_交易数据.parquet"):
+        name = p.name
+        s = name.split("_")[0]
+        if len(s) == 8 and s.isdigit():
+            y = int(s[0:4]); m = int(s[4:6]); d = int(s[6:8])
+            dates.add(_date(y, m, d))
+    return sorted(list(dates))
+
+
+def _tick_daily_features_group(g: pd.DataFrame) -> pd.Series:
+    g = g.sort_values("datetime")
+    price = pd.to_numeric(g["price"], errors="coerce").astype(float)
+    vol = pd.to_numeric(g["volume"], errors="coerce").astype(float)
+    amt = pd.to_numeric(g.get("amount", 0.0), errors="coerce").astype(float)
+    n = len(g)
+    if n == 0:
+        return pd.Series(dtype=float)
+    open_p = float(price.iloc[0])
+    close_p = float(price.iloc[-1])
+    high_p = float(price.max())
+    low_p = float(price.min())
+    intraday_ret = (close_p / open_p - 1.0) if open_p > 0 else np.nan
+    hl_range = (high_p / low_p - 1.0) if low_p > 0 else np.nan
+    if n > 1:
+        log_p = np.log(price.replace(0, np.nan)).ffill().bfill()
+        log_ret = log_p.diff().dropna()
+        rv = float(np.sqrt((log_ret ** 2).sum()))
+        up_moves_ratio = float((log_ret > 0).mean())
+    else:
+        rv = 0.0
+        up_moves_ratio = 0.0
+    vol_sum = float(vol.sum())
+    amount_sum = float(amt.sum())
+    num_trades = int(n)
+    avg_trade_size = float(vol_sum / num_trades) if num_trades > 0 else 0.0
+    median_trade_size = float(np.median(vol)) if num_trades > 0 else 0.0
+    if vol_sum > 0:
+        vwap = float(np.sum(price * vol) / vol_sum)
+    else:
+        vwap = np.nan
+    close_vs_vwap = (close_p / vwap - 1.0) if (vwap is not None and vwap > 0) else np.nan
+    close_vs_low = (close_p / low_p - 1.0) if low_p > 0 else np.nan
+    close_vs_high = (close_p / high_p - 1.0) if high_p > 0 else np.nan
+    t = pd.to_datetime(g["datetime"]).dt.time
+    morning_mask = t < _time(11, 30)
+    afternoon_mask = t >= _time(13, 0)
+    vol_morning = float(vol[morning_mask].sum())
+    vol_afternoon = float(vol[afternoon_mask].sum())
+    open_vol_ratio = vol_morning / vol_sum if vol_sum > 0 else 0.0
+    close_vol_ratio = vol_afternoon / vol_sum if vol_sum > 0 else 0.0
+    if morning_mask.any():
+        g_m = price[morning_mask]
+        open_m = float(g_m.iloc[0])
+        close_m = float(g_m.iloc[-1])
+        return_morning = (close_m / open_m - 1.0) if open_m > 0 else 0.0
+    else:
+        return_morning = 0.0
+    if afternoon_mask.any():
+        g_a = price[afternoon_mask]
+        open_a = float(g_a.iloc[0])
+        close_a = float(g_a.iloc[-1])
+        return_afternoon = (close_a / open_a - 1.0) if open_a > 0 else 0.0
+    else:
+        return_afternoon = 0.0
+    if "side" in g.columns:
+        s = g["side"].astype(str).str.upper().str.strip()
+    else:
+        s = pd.Series(["N"] * n, index=g.index)
+    buy_mask = s.str.startswith("B")
+    sell_mask = s.str.startswith("S")
+    active_buy_vol = float(vol[buy_mask].sum())
+    active_sell_vol = float(vol[sell_mask].sum())
+    active_buy_count = int(buy_mask.sum())
+    active_sell_count = int(sell_mask.sum())
+    total_bs_vol = active_buy_vol + active_sell_vol
+    total_bs_count = active_buy_count + active_sell_count
+    active_buy_vol_ratio = (active_buy_vol / total_bs_vol) if total_bs_vol > 0 else np.nan
+    active_buy_count_ratio = (active_buy_count / total_bs_count) if total_bs_count > 0 else np.nan
+    order_imbalance = ((active_buy_vol - active_sell_vol) / total_bs_vol) if total_bs_vol > 0 else np.nan
+    price_change_rate = (float((price.diff().fillna(0) != 0).sum()) / float(num_trades)) if num_trades > 0 else 0.0
+    return pd.Series(
+        {
+            "open_price": open_p,
+            "close_price": close_p,
+            "high_price": high_p,
+            "low_price": low_p,
+            "intraday_ret": intraday_ret,
+            "hl_range": hl_range,
+            "rv": rv,
+            "up_moves_ratio": up_moves_ratio,
+            "vol_sum": vol_sum,
+            "amount_sum": amount_sum,
+            "num_trades": num_trades,
+            "avg_trade_size": avg_trade_size,
+            "median_trade_size": median_trade_size,
+            "vol_morning": vol_morning,
+            "vol_afternoon": vol_afternoon,
+            "open_vol_ratio": open_vol_ratio,
+            "close_vol_ratio": close_vol_ratio,
+            "return_morning": return_morning,
+            "return_afternoon": return_afternoon,
+            "vwap": vwap,
+            "close_vs_vwap": close_vs_vwap,
+            "close_vs_low": close_vs_low,
+            "close_vs_high": close_vs_high,
+            "price_change_rate": price_change_rate,
+            "active_buy_vol": active_buy_vol,
+            "active_sell_vol": active_sell_vol,
+            "active_buy_count": active_buy_count,
+            "active_sell_count": active_sell_count,
+            "active_buy_vol_ratio": active_buy_vol_ratio,
+            "active_buy_count_ratio": active_buy_count_ratio,
+            "order_imbalance": order_imbalance,
+        }
+    )
+
+
+def job_build_tick_daily_features(trade_date: _date) -> int:
+    print(f"[job_build_tick_daily_features] trade_date={trade_date}")
+    files = _list_tick_parquet_for_date(trade_date)
+    if not files:
+        eng = get_engine()
+        with eng.begin() as conn:
+            inspector = inspect(conn)
+            if inspector.has_table("stock_tick_daily_features", schema="public"):
+                conn.execute(text("delete from stock_tick_daily_features where trade_date = :d"), {"d": trade_date})
+        print("[job_build_tick_daily_features] no files")
+        return 0
+    rows = []
+    bar = tqdm(total=len(files), desc="tick_feat_files", unit="file")
+    for f in files:
+        df = pd.read_parquet(f)
+        if df is None or df.empty:
+            bar.update(1)
+            continue
+        code = f.parent.name
+        market = f.parent.parent.name
+        ts = f"{code}.{market}"
+        df["ts_code"] = ts
+        df["trade_date"] = pd.Timestamp(trade_date)
+        if "datetime" not in df.columns:
+            if "trade_time" in df.columns:
+                df["datetime"] = pd.to_datetime(df["trade_time"])
+            else:
+                df["datetime"] = pd.Timestamp(trade_date)
+        df["price"] = pd.to_numeric(df.get("price", 0.0), errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", 0.0), errors="coerce")
+        df["amount"] = pd.to_numeric(df.get("amount", 0.0), errors="coerce")
+        if "side" not in df.columns:
+            df["side"] = "N"
+        rows.append(df[["ts_code", "trade_date", "datetime", "price", "volume", "amount", "side"]])
+        bar.update(1)
+    bar.close()
+    if not rows:
+        print("[job_build_tick_daily_features] empty rows")
+        return 0
+    df_all = pd.concat(rows, ignore_index=True)
+    feat_df = (
+        df_all.groupby(["ts_code", "trade_date"], group_keys=False)
+        .apply(lambda g: _tick_daily_features_group(g[["datetime", "price", "volume", "amount", "side"]]))
+        .reset_index()
+    )
+    eng = get_engine()
+    with eng.begin() as conn:
+        inspector = inspect(conn)
+        if inspector.has_table("stock_tick_daily_features", schema="public"):
+            conn.execute(text("delete from stock_tick_daily_features where trade_date = :d"), {"d": trade_date})
+        feat_df.to_sql("stock_tick_daily_features", con=conn, if_exists="append", index=False)
+    print(f"[job_build_tick_daily_features] inserted rows={len(feat_df)}")
+    return len(feat_df)
+
+
+def job_build_missing_tick_daily_features_for_date(trade_date: _date) -> int:
+    eng = get_engine()
+    files = _list_tick_parquet_for_date(trade_date)
+    if not files:
+        return 0
+    pairs = []
+    for f in files:
+        code = f.parent.name
+        market = f.parent.parent.name
+        ts = f"{code}.{market}"
+        pairs.append((ts, f))
+    df_pairs = pd.DataFrame(pairs, columns=["ts_code", "path"]).drop_duplicates(subset=["ts_code"], keep="last")
+    ts_available = df_pairs["ts_code"].astype(str).tolist()
+    with eng.connect() as conn:
+        inspector = inspect(conn)
+        has_table = inspector.has_table("stock_tick_daily_features", schema="public")
+        existing = pd.DataFrame()
+        if has_table:
+            existing = pd.read_sql(
+                text("select ts_code, num_trades, vol_sum, vwap from stock_tick_daily_features where trade_date=:d"),
+                conn,
+                params={"d": trade_date},
+            )
+    if existing.empty:
+        missing_ts = ts_available
+    else:
+        existing_ts = existing["ts_code"].astype(str).tolist()
+        num_trades = pd.to_numeric(existing.get("num_trades", pd.Series(index=existing.index)), errors="coerce")
+        vol_sum = pd.to_numeric(existing.get("vol_sum", pd.Series(index=existing.index)), errors="coerce")
+        vwap = pd.to_numeric(existing.get("vwap", pd.Series(index=existing.index)), errors="coerce")
+        null_mask = num_trades.isna() | vol_sum.isna() | vwap.isna()
+        need_fix = existing.loc[null_mask, "ts_code"].astype(str).tolist()
+        missing_ts = sorted(list(set(ts_available) - set(existing_ts)) | set(need_fix))
+    if not missing_ts:
+        return 0
+    df_sel = df_pairs[df_pairs["ts_code"].isin(missing_ts)]
+    bar = tqdm(total=len(df_sel), desc="tick_feat_missing", unit="stk")
+    rows = []
+    for _, r in df_sel.iterrows():
+        f = Path(str(r["path"]))
+        df = pd.read_parquet(f)
+        if df is None or df.empty:
+            bar.update(1)
+            continue
+        ts = str(r["ts_code"]) 
+        df["ts_code"] = ts
+        df["trade_date"] = pd.Timestamp(trade_date)
+        if "datetime" not in df.columns:
+            if "trade_time" in df.columns:
+                df["datetime"] = pd.to_datetime(df["trade_time"])
+            else:
+                df["datetime"] = pd.Timestamp(trade_date)
+        df["price"] = pd.to_numeric(df.get("price", 0.0), errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", 0.0), errors="coerce")
+        df["amount"] = pd.to_numeric(df.get("amount", 0.0), errors="coerce")
+        if "side" not in df.columns:
+            df["side"] = "N"
+        rows.append(df[["ts_code", "trade_date", "datetime", "price", "volume", "amount", "side"]])
+        bar.update(1)
+    bar.close()
+    if not rows:
+        return 0
+    df_all = pd.concat(rows, ignore_index=True)
+    feat_df = (
+        df_all.groupby(["ts_code", "trade_date"], group_keys=False)
+        .apply(_tick_daily_features_group)
+        .reset_index()
+    )
+    with eng.begin() as conn:
+        inspector = inspect(conn)
+        if inspector.has_table("stock_tick_daily_features", schema="public"):
+            conn.execute(
+                text("delete from stock_tick_daily_features where trade_date=:d and ts_code = any(:codes)"),
+                {"d": trade_date, "codes": missing_ts},
+            )
+        feat_df.to_sql("stock_tick_daily_features", con=conn, if_exists="append", index=False)
+    return len(feat_df)
+
+
+def job_init_tick_daily_features() -> int:
+    eng = get_engine()
+    with eng.connect() as conn:
+        inspector = inspect(conn)
+        has_table = inspector.has_table("stock_tick_daily_features", schema="public")
+        cnt = 0
+        if has_table:
+            dfc = pd.read_sql(text("select count(1) as c from stock_tick_daily_features"), conn)
+            if not dfc.empty:
+                cnt = int(pd.to_numeric(dfc["c"], errors="coerce").fillna(0).iloc[0])
+    if cnt > 0:
+        return 0
+    days = _scan_fs_tick_dates()
+    if not days:
+        return 0
+    bar = tqdm(total=len(days), desc="tick_feat_init_days", unit="day")
+    total = 0
+    for d in days:
+        total += job_build_missing_tick_daily_features_for_date(d)
+        bar.update(1)
+    bar.close()
+    return total
+
+
+def job_build_missing_tick_daily_features_by_stock() -> int:
+    eng = get_engine()
+    from data.updater import _get_all_stock_codes
+    ts_codes = _get_all_stock_codes(None)
+    if not ts_codes:
+        return 0
+    store = TickStore()
+    bar_stk = tqdm(total=len(ts_codes), desc="tick_feat_stocks", unit="stk")
+    total_rows = 0
+    with eng.begin() as conn:
+        inspector = inspect(conn)
+        has_table = inspector.has_table("stock_tick_daily_features", schema="public")
+        if not has_table:
+            conn.execute(
+                text(
+                    """
+                    create table if not exists public.stock_tick_daily_features (
+                        ts_code text not null,
+                        trade_date date not null,
+                        open_price double precision,
+                        close_price double precision,
+                        high_price double precision,
+                        low_price double precision,
+                        intraday_ret double precision,
+                        hl_range double precision,
+                        rv double precision,
+                        up_moves_ratio double precision,
+                        vol_sum double precision,
+                        amount_sum double precision,
+                        num_trades integer,
+                        avg_trade_size double precision,
+                        median_trade_size double precision,
+                        vol_morning double precision,
+                        vol_afternoon double precision,
+                        open_vol_ratio double precision,
+                        close_vol_ratio double precision,
+                        return_morning double precision,
+                        return_afternoon double precision,
+                        vwap double precision,
+                        close_vs_vwap double precision,
+                        close_vs_low double precision,
+                        close_vs_high double precision,
+                        price_change_rate double precision,
+                        active_buy_vol double precision,
+                        active_sell_vol double precision,
+                        active_buy_count integer,
+                        active_sell_count integer,
+                        active_buy_vol_ratio double precision,
+                        active_buy_count_ratio double precision,
+                        order_imbalance double precision
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "create index if not exists idx_stdf_ts_date on public.stock_tick_daily_features(ts_code, trade_date)"
+                )
+            )
+    days = _scan_fs_tick_dates()
+    if not days:
+        bar_stk.close()
+        return 0
+    start_date = days[0]
+    end_date = days[-1]
+    for ts in ts_codes:
+        bar_stk.set_description(f"tick_feat_stocks {ts}")
+        idx_rows = store.list_tick_files(ts, start_date, end_date)
+        if not idx_rows:
+            bar_stk.update(1)
+            continue
+        fs_dates = sorted(list({r.trade_date for r in idx_rows}))
+        with eng.connect() as conn:
+            inspector = inspect(conn)
+            has_table = inspector.has_table("stock_tick_daily_features", schema="public")
+            existing = pd.DataFrame()
+            if has_table:
+                existing = pd.read_sql(
+                    text("select trade_date, num_trades, vol_sum, vwap from stock_tick_daily_features where ts_code=:ts and trade_date>=:d1 and trade_date<=:d2"),
+                    conn,
+                    params={"ts": ts, "d1": start_date, "d2": end_date},
+                    parse_dates=["trade_date"],
+                )
+        if existing.empty:
+            missing_dates = fs_dates
+        else:
+            existing["trade_date"] = pd.to_datetime(existing["trade_date"]).dt.date
+            ok_mask = (~pd.isna(existing.get("num_trades"))) & (~pd.isna(existing.get("vol_sum"))) & (~pd.isna(existing.get("vwap")))
+            ok_dates = set(existing.loc[ok_mask, "trade_date"].tolist())
+            null_dates = set(existing.loc[~ok_mask, "trade_date"].tolist())
+            fs_set = set(fs_dates)
+            missing_dates = sorted(list((fs_set - ok_dates) | null_dates))
+        if not missing_dates:
+            bar_stk.update(1)
+            continue
+        rows = []
+        for r in idx_rows:
+            if r.trade_date in missing_dates:
+                df = pd.read_parquet(r.file_path)
+                if df is None or df.empty:
+                    continue
+                df["ts_code"] = ts
+                df["trade_date"] = pd.Timestamp(r.trade_date)
+                if "datetime" not in df.columns:
+                    if "trade_time" in df.columns:
+                        df["datetime"] = pd.to_datetime(df["trade_time"])
+                    else:
+                        df["datetime"] = pd.Timestamp(r.trade_date)
+                df["price"] = pd.to_numeric(df.get("price", 0.0), errors="coerce")
+                df["volume"] = pd.to_numeric(df.get("volume", 0.0), errors="coerce")
+                df["amount"] = pd.to_numeric(df.get("amount", 0.0), errors="coerce")
+                if "side" not in df.columns:
+                    df["side"] = "N"
+                rows.append(df[["ts_code", "trade_date", "datetime", "price", "volume", "amount", "side"]])
+        if not rows:
+            bar_stk.update(1)
+            continue
+        df_all = pd.concat(rows, ignore_index=True)
+        feat_df = (
+            df_all.groupby(["ts_code", "trade_date"], group_keys=False)
+            .apply(lambda g: _tick_daily_features_group(g[["datetime", "price", "volume", "amount", "side"]]))
+            .reset_index()
+        )
+        with eng.begin() as conn:
+            conn.execute(
+                text("delete from stock_tick_daily_features where ts_code=:ts and trade_date = any(:dates)"),
+                {"ts": ts, "dates": missing_dates},
+            )
+            feat_df.to_sql("stock_tick_daily_features", con=conn, if_exists="append", index=False)
+        total_rows += len(feat_df)
+        bar_stk.update(1)
+    bar_stk.close()
+    return total_rows
 
 
 def job_update_concepts() -> None:
@@ -76,11 +503,20 @@ def job_update_bollinger(trade_date: _date) -> None:
         if dc_s is not None and cols_s:
             df_s = pd.read_sql(f"select distinct {dc_s} as d from stock_bollinger_data", conn)
             sbd_dates = set(pd.to_datetime(df_s["d"]).dt.date.tolist()) if not df_s.empty else set()
-    missing_hist = sorted(daily_dates - sbd_dates - {trade_date})
+        cols_c = _table_columns(eng, "concept_bollinger_data")
+        dc_c = "trade_date" if "trade_date" in cols_c else ("date" if "date" in cols_c else None)
+        cbd_dates = set()
+        if dc_c is not None and cols_c:
+            df_c = pd.read_sql(f"select distinct {dc_c} as d from concept_bollinger_data", conn)
+            cbd_dates = set(pd.to_datetime(df_c["d"]).dt.date.tolist()) if not df_c.empty else set()
+    earliest_sbd_default = _date(2025, 4, 16)
+    earliest_sbd = (min(sbd_dates) if sbd_dates else earliest_sbd_default)
+    missing_hist = sorted(d for d in (daily_dates - sbd_dates - {trade_date}) if d >= earliest_sbd_default)
+    missing_concepts = sorted(d for d in (sbd_dates - cbd_dates) if d >= earliest_sbd)
     if missing_hist:
-        print(f"[job_update_bollinger] backfill_missing_days={len(missing_hist)}")
+        print(f"[job_update_bollinger] backfill_missing_stock_days={len(missing_hist)}")
         with eng.begin() as conn:
-            bar = tqdm(total=len(missing_hist), desc="backfill", unit="day")
+            bar = tqdm(total=len(missing_hist), desc="backfill_stock", unit="day")
             ins_s = 0
             ins_c = 0
             for d0 in missing_hist:
@@ -88,7 +524,17 @@ def job_update_bollinger(trade_date: _date) -> None:
                 ins_c += compute_concept_bollinger_for_date(d0, conn=conn)
                 bar.update(1)
             bar.close()
-        print(f"[job_update_bollinger] backfill inserted stock_rows={ins_s} concept_rows={ins_c}")
+        print(f"[job_update_bollinger] backfill_stock inserted stock_rows={ins_s} concept_rows={ins_c}")
+    if missing_concepts:
+        print(f"[job_update_bollinger] backfill_missing_concept_days={len(missing_concepts)}")
+        bar2 = tqdm(total=len(missing_concepts), desc="backfill_concept", unit="day")
+        ins_c2 = 0
+        for d1 in missing_concepts:
+            with eng.begin() as conn:
+                ins_c2 += compute_concept_bollinger_for_date(d1, conn=conn)
+            bar2.update(1)
+        bar2.close()
+        print(f"[job_update_bollinger] backfill_concept inserted concept_rows={ins_c2}")
     
     with eng.begin() as conn:
         cols_s = _table_columns(eng, "stock_bollinger_data")
@@ -697,6 +1143,165 @@ class PoolMLConfig:
     recent_window_days: int = 3
 
 
+@dataclass
+class BestEntryLabelConfig:
+    max_entry_days: int = 5
+    max_holding_days: int = 10
+    take_profit: float = 0.10
+    stop_loss: float = -0.05
+    dd_penalty: float = 0.5
+    score_threshold: float = 0.02
+
+def simulate_trade_for_entry(price_series: pd.Series, entry_date: _date, cfg: BestEntryLabelConfig) -> dict | None:
+    entry_ts = pd.Timestamp(entry_date)
+    after_entry = price_series.loc[price_series.index >= entry_ts]
+    if after_entry.empty or len(after_entry) < 2:
+        return None
+    window = after_entry.iloc[: cfg.max_holding_days + 1]
+    entry_price = float(window.iloc[0])
+    if entry_price <= 0:
+        return None
+    max_price = entry_price
+    max_dd = 0.0
+    exit_price = None
+    for i in range(1, len(window)):
+        price_t = float(window.iloc[i])
+        if price_t <= 0:
+            continue
+        if price_t > max_price:
+            max_price = price_t
+        dd_t = (max_price - price_t) / max_price
+        if dd_t > max_dd:
+            max_dd = dd_t
+        ret_t = price_t / entry_price - 1.0
+        if ret_t >= cfg.take_profit or ret_t <= cfg.stop_loss:
+            exit_price = price_t
+            break
+    if exit_price is None:
+        exit_price = float(window.iloc[-1])
+        if exit_price > max_price:
+            max_price = exit_price
+        dd_t = (max_price - exit_price) / max_price
+        if dd_t > max_dd:
+            max_dd = dd_t
+    trade_ret = exit_price / entry_price - 1.0
+    score = trade_ret - cfg.dd_penalty * max_dd
+    return {"trade_ret": trade_ret, "max_dd": max_dd, "score": score}
+
+def _load_episode_samples(engine, ts_code: str, pool_date: _date) -> pd.DataFrame:
+    sql = text("""
+    SELECT * FROM stock_pool_ml_samples
+    WHERE ts_code = :ts_code AND pool_date = :pool_date
+    ORDER BY current_date
+    """)
+    df = pd.read_sql(sql, con=engine, params={"ts_code": ts_code, "pool_date": pool_date}, parse_dates=["pool_date", "current_date"])
+    if df.empty:
+        return df
+    df["pool_date"] = pd.to_datetime(df["pool_date"]).dt.date
+    df["current_date"] = pd.to_datetime(df["current_date"]).dt.date
+    return df
+
+def _load_price_series_for_episode(engine, ts_code: str, pool_date: _date, cfg: BestEntryLabelConfig) -> pd.Series:
+    end_date = pd.to_datetime(pool_date) + pd.Timedelta(days=cfg.max_entry_days + cfg.max_holding_days + 5)
+    sql = text("""
+    SELECT trade_date, close FROM stock_daily
+    WHERE ts_code = :ts_code AND trade_date >= :start_date AND trade_date <= :end_date
+    ORDER BY trade_date
+    """)
+    df = pd.read_sql(sql, con=engine, params={"ts_code": ts_code, "start_date": pool_date, "end_date": end_date.date()}, parse_dates=["trade_date"])
+    if df.empty:
+        return pd.Series(dtype=float)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.normalize()
+    s = df.set_index("trade_date")["close"].astype(float)
+    s.index = pd.DatetimeIndex(s.index)
+    return s
+
+def compute_labels_for_episode(engine, ts_code: str, pool_date: _date, cfg: BestEntryLabelConfig) -> pd.DataFrame:
+    samples = _load_episode_samples(engine, ts_code, pool_date)
+    if samples.empty:
+        return samples
+    prices = _load_price_series_for_episode(engine, ts_code, pool_date, cfg)
+    samples["y_trade_ret"] = pd.NA
+    samples["y_max_dd"] = pd.NA
+    samples["y_score"] = pd.NA
+    samples["y_is_best"] = 0
+    if prices.empty:
+        return samples
+    mask = samples["days_since_pool"].between(0, cfg.max_entry_days)
+    scores: list[tuple[int, float]] = []
+    for idx, row in samples.loc[mask].iterrows():
+        entry_date = pd.to_datetime(row["current_date"]).date()
+        res = simulate_trade_for_entry(prices, entry_date, cfg)
+        if res is None:
+            continue
+        samples.at[idx, "y_trade_ret"] = res["trade_ret"]
+        samples.at[idx, "y_max_dd"] = res["max_dd"]
+        samples.at[idx, "y_score"] = res["score"]
+        scores.append((idx, float(res["score"])) )
+    if scores:
+        scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
+        best_idx, best_score = scores_sorted[0]
+        if best_score is not None and best_score >= cfg.score_threshold:
+            samples.at[best_idx, "y_is_best"] = 1
+    return samples
+
+def job_label_best_entry_for_date(pool_date: _date, cfg: BestEntryLabelConfig | None = None, batch_size: int = 200) -> None:
+    eng = get_engine()
+    if cfg is None:
+        cfg = BestEntryLabelConfig()
+    with eng.begin() as conn:
+        inspector = inspect(conn)
+        if inspector.has_table("stock_pool_ml_samples", schema="public"):
+            conn.execute(text("alter table stock_pool_ml_samples add column if not exists y_trade_ret double precision"))
+            conn.execute(text("alter table stock_pool_ml_samples add column if not exists y_max_dd double precision"))
+            conn.execute(text("alter table stock_pool_ml_samples add column if not exists y_score double precision"))
+            conn.execute(text("alter table stock_pool_ml_samples add column if not exists y_is_best integer"))
+    start_d = pool_date - _timedelta(days=9)
+    sql_eps = text("""
+    SELECT DISTINCT ts_code, pool_date FROM stock_pool_ml_samples
+    WHERE pool_date >= :d1 AND pool_date <= :d2
+    ORDER BY pool_date, ts_code
+    """)
+    with eng.connect() as conn:
+        eps_df = pd.read_sql(sql_eps, con=conn, params={"d1": start_d, "d2": pool_date}, parse_dates=["pool_date"])
+    if eps_df.empty:
+        return
+    eps_df["pool_date"] = pd.to_datetime(eps_df["pool_date"]).dt.date
+    eps_df = eps_df.sort_values(["ts_code", "pool_date"]).drop_duplicates(subset=["ts_code"], keep="last")
+    episodes = list(eps_df[["ts_code", "pool_date"]].itertuples(index=False, name=None))
+    bar = tqdm(total=len(episodes), desc="label_best_entry", unit="ep")
+    updates: list[dict] = []
+    with eng.begin() as conn:
+        upd_sql = text(
+            """
+            UPDATE stock_pool_ml_samples
+            SET y_trade_ret = :y_trade_ret, y_max_dd = :y_max_dd, y_score = :y_score, y_is_best = :y_is_best
+            WHERE ts_code = :ts_code AND pool_date = :pool_date AND "current_date" = :current_date
+            """
+        )
+        for ts_code, pd0 in episodes:
+            labeled = compute_labels_for_episode(eng, ts_code, pd0, cfg)
+            if labeled.empty:
+                bar.update(1)
+                continue
+            for _, r in labeled.iterrows():
+                updates.append({
+                    "y_trade_ret": (None if pd.isna(r.get("y_trade_ret")) else float(r.get("y_trade_ret"))),
+                    "y_max_dd": (None if pd.isna(r.get("y_max_dd")) else float(r.get("y_max_dd"))),
+                    "y_score": (None if pd.isna(r.get("y_score")) else float(r.get("y_score"))),
+                    "y_is_best": int(r.get("y_is_best", 0) or 0),
+                    "ts_code": str(r.get("ts_code")),
+                    "pool_date": pd.to_datetime(r.get("pool_date")).date(),
+                    "current_date": pd.to_datetime(r.get("current_date")).date(),
+                })
+                if len(updates) >= batch_size:
+                    conn.execute(upd_sql, updates)
+                    updates = []
+            bar.update(1)
+        if updates:
+            conn.execute(upd_sql, updates)
+    bar.close()
+
 def compute_tier1_features_for_episode(ts_code: str, pool_date: _date, df: pd.DataFrame, cfg: PoolMLConfig) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -792,7 +1397,6 @@ def compute_tier1_features_for_episode(ts_code: str, pool_date: _date, df: pd.Da
             "pool_fund_quality_score": pool_fund_quality_score,
             "big_net_ratio_recent": big_net_ratio_recent,
             "support_ratio_recent": support_ratio_recent,
-            "label_good_entry": None,
         })
     return pd.DataFrame(rows)
 
@@ -800,9 +1404,9 @@ def compute_tier1_features_for_episode(ts_code: str, pool_date: _date, df: pd.Da
 def build_pool_ml_samples(start_date: _date, end_date: _date, max_tracking_days: int = 10) -> int:
     eng = get_engine()
     cfg = PoolMLConfig(max_tracking_days=max_tracking_days, recent_window_days=3)
-    all_rows: list[pd.DataFrame] = []
     date_list = pd.date_range(start=start_date, end=end_date).date.tolist()
     bar_days = tqdm(total=len(date_list), desc="ml_samples_days", unit="day")
+    total_n = 0
     for cur_d in date_list:
         episodes = fetch_active_episodes(cur_d - _timedelta(days=max_tracking_days), cur_d)
         if not episodes.empty:
@@ -831,76 +1435,346 @@ def build_pool_ml_samples(start_date: _date, end_date: _date, max_tracking_days:
             day_df = pd.concat(out_rows, ignore_index=True)
             day_df["current_date"] = pd.to_datetime(day_df["current_date"]).dt.date
             day_df = day_df.sort_values(["ts_code", "pool_date", "current_date"]).drop_duplicates(subset=["ts_code", "current_date"], keep="last")
-            all_rows.append(day_df)
+            with eng.begin() as conn:
+                inspector = inspect(conn)
+                if not inspector.has_table("stock_pool_ml_features", schema="public"):
+                    conn.execute(text(
+                        """
+                        create table if not exists public.stock_pool_ml_features (
+                            ts_code text not null,
+                            pool_date date not null,
+                            current_date date not null,
+                            days_since_pool integer,
+                            ret_since_pool double precision,
+                            max_down_since_pool double precision,
+                            big_net_ratio_since_pool double precision,
+                            support_ratio_since_pool double precision,
+                            ret_1d double precision,
+                            price_pos_t double precision,
+                            band_width_t double precision,
+                            rel_amount_t double precision,
+                            big_net_ratio_t double precision,
+                            ofi_t double precision,
+                            big_net_close_ratio_t double precision,
+                            pool_price_pos double precision,
+                            pool_rel_amount double precision,
+                            pool_big_net_ratio_t0 double precision,
+                            pool_fund_quality_score double precision,
+                            big_net_ratio_recent double precision,
+                            support_ratio_recent double precision,
+                            primary key (ts_code, current_date)
+                        )
+                        """
+                    ))
+                conn.execute(text("delete from stock_pool_ml_features where \"current_date\"=:d"), {"d": cur_d})
+                day_df.to_sql("stock_pool_ml_features", conn, if_exists="append", index=False)
+            total_n += len(day_df)
         bar_days.update(1)
     bar_days.close()
-    if not all_rows:
-        return 0
-    result_df = pd.concat(all_rows, ignore_index=True)
-    result_df["current_date"] = pd.to_datetime(result_df["current_date"]).dt.date
-    result_df["pool_date"] = pd.to_datetime(result_df["pool_date"]).dt.date
-    result_df = result_df.sort_values(["ts_code", "pool_date", "current_date"]).drop_duplicates(subset=["ts_code", "current_date"], keep="last")
+    return total_n
+ 
+    
+def job_label_forward_returns_for_range(start_date: _date, end_date: _date, forward_days: int = 10) -> int:
+    eng = get_engine()
     with eng.begin() as conn:
-        inspector = inspect(conn)
-        if inspector.has_table("stock_pool_ml_samples", schema="public"):
-            conn.execute(text("delete from stock_pool_ml_samples where \"current_date\">=:d1 and \"current_date\"<=:d2"), {"d1": start_date, "d2": end_date})
-        result_df.to_sql("stock_pool_ml_samples", conn, if_exists="append", index=False)
-    return len(result_df)
+        conn.execute(text("alter table stock_bollinger_data add column if not exists y_ret_10d double precision"))
+        conn.execute(text("alter table stock_bollinger_data add column if not exists y_ret_max_10d double precision"))
+        conn.execute(text("alter table stock_bollinger_data add column if not exists y_ret_min_10d double precision"))
+        conn.execute(text("create index if not exists idx_sbd_ts_date on public.stock_bollinger_data(ts_code, trade_date)"))
+        conn.execute(text("create index if not exists idx_sd_ts_date on public.stock_daily(ts_code, trade_date)"))
+    with eng.connect() as conn:
+        df_days = pd.read_sql(
+            text(
+                "select distinct trade_date from stock_bollinger_data where trade_date>=:d1 and trade_date<=:d2 order by trade_date"
+            ),
+            conn,
+            params={"d1": start_date, "d2": end_date},
+            parse_dates=["trade_date"],
+        )
+    if df_days.empty:
+        return 0
+    df_days["trade_date"] = pd.to_datetime(df_days["trade_date"]).dt.date
+    total_updates = 0
+    bar_days = tqdm(total=len(df_days), desc="label_forward_days", unit="day")
+    for _, rday in df_days.iterrows():
+        d = rday["trade_date"]
+        d2q = pd.to_datetime(d) + pd.Timedelta(days=forward_days * 6)
+        d2q = d2q.date()
+        sql = f"""
+        select sd.ts_code,
+               sd.trade_date,
+               sd.close as c0,
+               lead(sd.close, {forward_days}) over (partition by sd.ts_code order by sd.trade_date) as cN,
+               max(sd.close) over (partition by sd.ts_code order by sd.trade_date rows between 1 following and {forward_days} following) as maxf,
+               min(sd.close) over (partition by sd.ts_code order by sd.trade_date rows between 1 following and {forward_days} following) as minf
+        from stock_daily sd
+        where sd.trade_date>=:d and sd.trade_date<=:d2
+          and sd.ts_code in (select ts_code from stock_bollinger_data where trade_date=:d)
+        order by sd.ts_code, sd.trade_date
+        """
+        with eng.connect() as conn:
+            df = pd.read_sql(text(sql), conn, params={"d": d, "d2": d2q}, parse_dates=["trade_date"])
+        if df.empty:
+            bar_days.update(1)
+            continue
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+        if "cN" in df.columns:
+            df_day = df[df["trade_date"] == d].copy()
+            df_day["y_ret_10d"] = pd.to_numeric(df_day["cN"], errors="coerce") / pd.to_numeric(df_day["c0"], errors="coerce") - 1.0
+            df_day["y_ret_max_10d"] = pd.to_numeric(df_day["maxf"], errors="coerce") / pd.to_numeric(df_day["c0"], errors="coerce") - 1.0
+            df_day["y_ret_min_10d"] = pd.to_numeric(df_day["minf"], errors="coerce") / pd.to_numeric(df_day["c0"], errors="coerce") - 1.0
+            out = df_day[["ts_code", "trade_date", "y_ret_10d", "y_ret_max_10d", "y_ret_min_10d"]].copy()
+        else:
+            def _calc(g: pd.DataFrame) -> pd.DataFrame:
+                c = pd.to_numeric(g["c0"], errors="coerce")
+                y10 = c.shift(-forward_days) / c - 1.0
+                cf = c.shift(-1)
+                maxf = cf.iloc[::-1].rolling(forward_days).max().iloc[::-1]
+                minf = cf.iloc[::-1].rolling(forward_days).min().iloc[::-1]
+                return pd.DataFrame({
+                    "ts_code": g["ts_code"],
+                    "trade_date": g["trade_date"],
+                    "y_ret_10d": y10,
+                    "y_ret_max_10d": maxf / c - 1.0,
+                    "y_ret_min_10d": minf / c - 1.0,
+                })
+            out_all = df.groupby("ts_code", sort=False).apply(_calc).reset_index(drop=True)
+            out = out_all[out_all["trade_date"] == d].copy()
+        rows = out.to_dict(orient="records")
+        for rr in rows:
+            rr["ts_code"] = str(rr["ts_code"]) 
+            rr["trade_date"] = pd.to_datetime(rr["trade_date"]).date()
+            rr["y_ret_10d"] = None if pd.isna(rr.get("y_ret_10d")) else float(rr.get("y_ret_10d"))
+            rr["y_ret_max_10d"] = None if pd.isna(rr.get("y_ret_max_10d")) else float(rr.get("y_ret_max_10d"))
+            rr["y_ret_min_10d"] = None if pd.isna(rr.get("y_ret_min_10d")) else float(rr.get("y_ret_min_10d"))
+        if rows:
+            with eng.begin() as conn:
+                conn.execute(
+                    text(
+                        "create temporary table tmp_forward_labels (ts_code text, trade_date date, y_ret_10d double precision, y_ret_max_10d double precision, y_ret_min_10d double precision) on commit drop"
+                    )
+                )
+                out.to_sql("tmp_forward_labels", conn, if_exists="append", index=False)
+                conn.execute(
+                    text(
+                        """
+                        update stock_bollinger_data s
+                        set y_ret_10d=t.y_ret_10d,
+                            y_ret_max_10d=t.y_ret_max_10d,
+                            y_ret_min_10d=t.y_ret_min_10d
+                        from tmp_forward_labels t
+                        where s.ts_code=t.ts_code and s.trade_date=t.trade_date
+                        """
+                    )
+                )
+            total_updates += len(rows)
+        bar_days.update(1)
+    bar_days.close()
+    return total_updates
+
+def job_label_forward_returns_auto(forward_days: int = 10) -> int:
+    eng = get_engine()
+    with eng.connect() as conn:
+        rng = conn.execute(text("select min(trade_date) as d1, max(trade_date) as d2 from stock_bollinger_data")).mappings().first()
+    d1 = rng["d1"]
+    d2 = rng["d2"]
+    if d1 is None or d2 is None:
+        return 0
+    return job_label_forward_returns_for_range(d1, d2, forward_days=forward_days)
+
+def build_bollinger_training_dataset(start_date: _date, end_date: _date, window_L: int = 20) -> pd.DataFrame:
+    eng = get_engine()
+    with eng.connect() as conn:
+        df = pd.read_sql(
+            text(
+                """
+                select ts_code, trade_date, band_width_zscore, v_band_width_zscore, price_position, v_price_position, y_ret_10d
+                from stock_bollinger_data
+                where trade_date>=:d1 and trade_date<=:d2
+                order by ts_code, trade_date
+                """
+            ),
+            conn,
+            params={"d1": start_date, "d2": end_date},
+            parse_dates=["trade_date"],
+        )
+    if df.empty:
+        return pd.DataFrame()
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    def _feat(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.sort_values("trade_date").reset_index(drop=True)
+        bw = pd.to_numeric(g["band_width_zscore"], errors="coerce")
+        vbw = pd.to_numeric(g["v_band_width_zscore"], errors="coerce")
+        pp = pd.to_numeric(g["price_position"], errors="coerce")
+        vpp = pd.to_numeric(g["v_price_position"], errors="coerce")
+        y = pd.to_numeric(g["y_ret_10d"], errors="coerce")
+        def slope5(s: pd.Series) -> pd.Series:
+            x = np.arange(len(s))
+            m = s.rolling(5).apply(lambda z: float(((x[-5:] * z).sum() - x[-5:].mean() * z.sum()) / ((x[-5:] ** 2).sum() - x[-5:].mean() * x[-5:].sum())), raw=False)
+            return m
+        def slope3(s: pd.Series) -> pd.Series:
+            x = np.arange(len(s))
+            m = s.rolling(3).apply(lambda z: float(((x[-3:] * z).sum() - x[-3:].mean() * z.sum()) / ((x[-3:] ** 2).sum() - x[-3:].mean() * x[-3:].sum())), raw=False)
+            return m
+        df_out = pd.DataFrame({
+            "ts_code": g["ts_code"],
+            "trade_date": g["trade_date"],
+            "y_ret_10d": y,
+            "bw_min": bw.rolling(window_L).min(),
+            "bw_max": bw.rolling(window_L).max(),
+            "bw_mean": bw.rolling(window_L).mean(),
+            "bw_std": bw.rolling(window_L).std(ddof=0),
+            "bw_slope_5": slope5(bw),
+            "vbw_min": vbw.rolling(window_L).min(),
+            "vbw_max": vbw.rolling(window_L).max(),
+            "vbw_mean": vbw.rolling(window_L).mean(),
+            "vbw_std": vbw.rolling(window_L).std(ddof=0),
+            "vbw_slope_5": slope5(vbw),
+            "pp_min": pp.rolling(window_L).min(),
+            "pp_max": pp.rolling(window_L).max(),
+            "pp_mean": pp.rolling(window_L).mean(),
+            "pp_std": pp.rolling(window_L).std(ddof=0),
+            "pp_slope_3": slope3(pp),
+            "pp_slope_5": slope5(pp),
+            "vpp_min": vpp.rolling(window_L).min(),
+            "vpp_max": vpp.rolling(window_L).max(),
+            "vpp_mean": vpp.rolling(window_L).mean(),
+            "vpp_std": vpp.rolling(window_L).std(ddof=0),
+            "vpp_slope_3": slope3(vpp),
+            "vpp_slope_5": slope5(vpp),
+        })
+        df_out = df_out.dropna(subset=["y_ret_10d"]) 
+        return df_out
+    feats = df.groupby("ts_code", sort=False).apply(_feat).reset_index(drop=True)
+    return feats
+
+def job_backfill_labels_upto_date(target_date: _date, forward_days: int = 10) -> int:
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("create index if not exists idx_sbd_trade_date on public.stock_bollinger_data(trade_date)"))
+    with eng.connect() as conn:
+        cols = pd.read_sql(
+            text("select column_name from information_schema.columns where table_schema='public' and table_name='stock_bollinger_data'"),
+            conn,
+        )
+    need_cols = {"y_ret_10d", "y_ret_max_10d", "y_ret_min_10d"}
+    have_cols = set(cols["column_name"].tolist()) if not cols.empty else set()
+    to_add = list(need_cols - have_cols)
+    if to_add:
+        with eng.begin() as conn:
+            if "y_ret_10d" in to_add:
+                conn.execute(text("alter table stock_bollinger_data add column if not exists y_ret_10d double precision"))
+            if "y_ret_max_10d" in to_add:
+                conn.execute(text("alter table stock_bollinger_data add column if not exists y_ret_max_10d double precision"))
+            if "y_ret_min_10d" in to_add:
+                conn.execute(text("alter table stock_bollinger_data add column if not exists y_ret_min_10d double precision"))
+    with eng.connect() as conn:
+        days_all = pd.read_sql(
+            text("select distinct trade_date from stock_bollinger_data where trade_date<=:d order by trade_date"),
+            conn,
+            params={"d": target_date},
+            parse_dates=["trade_date"],
+        )
+    if days_all.empty:
+        return 0
+    days_all["trade_date"] = pd.to_datetime(days_all["trade_date"]).dt.date
+    missing_days = []
+    with eng.connect() as conn:
+        bar_scan = tqdm(total=len(days_all), desc="scan_missing_days", unit="day")
+        for _, r in days_all.iterrows():
+            d = r["trade_date"]
+            df1 = pd.read_sql(
+                text("select 1 as x from stock_bollinger_data where trade_date=:d and (y_ret_10d is null or y_ret_max_10d is null or y_ret_min_10d is null) limit 1"),
+                conn,
+                params={"d": d},
+            )
+            if not df1.empty:
+                missing_days.append(d)
+            bar_scan.update(1)
+        bar_scan.close()
+    df_days = pd.DataFrame({"trade_date": missing_days})
+    if df_days.empty:
+        return 0
+    total = 0
+    bar = tqdm(total=len(df_days), desc="backfill_labels_days", unit="day")
+    for _, r in df_days.iterrows():
+        d = r["trade_date"]
+        total += job_label_forward_returns_for_range(d, d, forward_days=forward_days)
+        bar.update(1)
+    bar.close()
+    return total
+def job_clear_bollinger_labels_before_date(target_date: _date) -> int:
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("create index if not exists idx_sbd_trade_date on public.stock_bollinger_data(trade_date)"))
+    with eng.connect() as conn:
+        days = pd.read_sql(
+            text("select distinct trade_date from stock_bollinger_data where trade_date<:d order by trade_date"),
+            conn,
+            params={"d": target_date},
+            parse_dates=["trade_date"],
+        )
+    if days.empty:
+        return 0
+    days["trade_date"] = pd.to_datetime(days["trade_date"]).dt.date
+    total = 0
+    bar = tqdm(total=len(days), desc="clear_labels_days", unit="day")
+    for _, r in days.iterrows():
+        d = r["trade_date"]
+        with eng.begin() as conn:
+            res = conn.execute(
+                text("update stock_bollinger_data set y_ret_10d=null, y_ret_max_10d=null, y_ret_min_10d=null where trade_date=:d"),
+                {"d": d},
+            )
+            total += res.rowcount or 0
+        bar.update(1)
+    bar.close()
+    return total
+
 if __name__ == "__main__":
     from datetime import date as date_cls
     import pandas as pd
     print("请选择功能：")
-    print("1 构建股性活跃池")
-    print("2 构建日度微结构摘要")
-    print("3 运行当日布林更新")
-    print("4 回补布林两年窗口")
-    print("5 构建进池ML样本集")
-    print("6 构建资金质量（事件日）")
-    
+    print("1 增量更新日线")
+    print("2 运行当日布林更新")
+    print("3 回补布林两年窗口")
+    print("4 回补标签至目标日")
+    print("5 清空Bollinger标签")
+    print("6 构建/补齐Tick特征")
     choice = input("输入选项编号：").strip()
     if choice == "1":
-        ds = input("输入测试日期(YYYY-MM-DD，留空为今天)：").strip()
+        ds = input("输入更新日期(YYYY-MM-DD，留空为今天)：").strip()
         d = date_cls.today() if ds == "" else pd.to_datetime(ds).date()
-        ws = input("窗口天数(默认20)：").strip()
-        window_days = 20 if ws == "" else int(ws)
-        pt = input("price_position阈值(默认50)：").strip()
-        ppos_threshold = 50.0 if pt == "" else float(pt)
-        ma = input("日均成交额阈值(默认100000000)：").strip()
-        min_avg_amount = 100000000.0 if ma == "" else float(ma)
-        n = build_active_pool(d, window_days=window_days, ppos_threshold=ppos_threshold, min_avg_amount=min_avg_amount)
-        print(f"active_pool rows: {n}")
+        job_update_ohlc(d)
     elif choice == "2":
         ds = input("输入测试日期(YYYY-MM-DD，留空为今天)：").strip()
         d = date_cls.today() if ds == "" else pd.to_datetime(ds).date()
-        oa = input("仅处理活跃池(Y/N，默认Y)：").strip().upper()
-        only_active = (oa == "" or oa == "Y")
-        qs = input("分位数q(默认0.9)：").strip()
-        q = 0.9 if qs == "" else float(qs)
-        n = build_microstructure_daily(d, only_active_pool=only_active, q=q)
-        print(f"microstructure_daily rows: {n}")
-    elif choice == "3":
-        ds = input("输入测试日期(YYYY-MM-DD，留空为今天)：").strip()
-        d = date_cls.today() if ds == "" else pd.to_datetime(ds).date()
         job_update_bollinger(d)
-    elif choice == "4":
+    elif choice == "3":
         ws = input("zscore窗口(默认120)：").strip()
         z = 120 if ws == "" else int(ws)
         job_backfill_bollinger_from_db(z_window=z)
+    elif choice == "4":
+        ds = input("目标日期(YYYY-MM-DD)：").strip()
+        fd = input("前向天数(默认10)：").strip()
+        d = pd.to_datetime(ds).date()
+        f = 10 if fd == "" else int(fd)
+        job_backfill_labels_upto_date(d, forward_days=f)
     elif choice == "5":
-        ds1 = input("开始日期(YYYY-MM-DD)：").strip()
-        ds2 = input("结束日期(YYYY-MM-DD)：").strip()
-        td = input("跟踪交易日数(默认10)：").strip()
-        start_d = pd.to_datetime(ds1).date()
-        end_d = pd.to_datetime(ds2).date()
-        mt = 10 if td == "" else int(td)
-        n = build_pool_ml_samples(start_d, end_d, max_tracking_days=mt)
-        print(f"pool_ml_samples rows: {n}")
+        ds = input("目标日期(YYYY-MM-DD)：").strip()
+        dts = pd.to_datetime(ds, errors="coerce")
+        if pd.isna(dts):
+            print("无效日期格式：YYYY-MM-DD")
+        else:
+            d = dts.date()
+            n = job_clear_bollinger_labels_before_date(d)
+            print(f"已清空至目标日前标签行数={n}")
     elif choice == "6":
-        ds = input("输入事件日(YYYY-MM-DD，留空为今天)：").strip()
-        d = date_cls.today() if ds == "" else pd.to_datetime(ds).date()
-        n = build_fund_quality(d)
-        print(f"fund_quality rows: {n}")
-    
+        n = job_build_missing_tick_daily_features_by_stock()
+        if n == 0:
+            print("未发现缺失或未找到tick文件")
+        else:
+            print(f"已补齐缺失Tick特征行数={n}")
     else:
         print("无效选项")
-    

@@ -28,14 +28,19 @@ from .pytdx_source import PytdxDataSource
 from . import repository
 from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT, Settings
 
+_BASICS_CACHE: List[str] | None = None
+
 
 def _get_all_stock_codes(settings: Optional[Settings] = None) -> List[str]:
-    basics = repository.get_all_stock_basics()
-    codes = [s.ts_code for s in basics]
+    global _BASICS_CACHE
+    if _BASICS_CACHE is None:
+        basics = repository.get_all_stock_basics()
+        _BASICS_CACHE = [s.ts_code for s in basics]
+    codes = _BASICS_CACHE
     limit = settings.stock_pool_limit if settings is not None else STOCK_POOL_LIMIT
-    if limit is not None:
+    if limit is not None and codes is not None:
         return codes[:limit]
-    return codes
+    return codes or []
 
 
 def update_daily_bars(
@@ -165,9 +170,8 @@ def update_stock_basic(settings: Optional[Settings] = None) -> int:
     n = repository.upsert_stock_basic(df_filt)
     return n
 
-def collect_full_day_ticks(trade_date: date, settings: Optional[Settings] = None) -> None:
-    basics = repository.get_all_stock_basics()
-    ts_codes = [s.ts_code for s in basics]
+def collect_full_day_ticks(trade_date: date, settings: Optional[Settings] = None, ts_codes: Optional[List[str]] = None) -> None:
+    ts_codes = ts_codes or _get_all_stock_codes(settings)
     from .tick_store import TickStore
     store = TickStore(settings=settings)
     store.defer_index = True
@@ -179,4 +183,4 @@ def collect_full_day_ticks(trade_date: date, settings: Optional[Settings] = None
                 continue
             store.save_ticks(ts_code, trade_date, df_tick, already_sorted=True)
     print("[collect_full_day_ticks] Done.")
-    store.flush_index_for_date(trade_date)
+    # 本地存储模式：不刷新数据库索引

@@ -176,15 +176,18 @@ def main() -> None:
     else:
         batches = _batch_dates(missing, batch_size=100)
         print(f"[backfill_history] tick_missing_dates={len(missing)} batches={len(batches)} range={missing.min()}~{missing.max()}")
-        from data.updater import collect_full_day_ticks
+        from data.updater import collect_full_day_ticks, _get_all_stock_codes
+        from data.jobs import job_build_tick_daily_features
+        codes_cache = _get_all_stock_codes(None)
         for b in batches:
             b_start = b[0]
             b_end = b[-1]
             print(f"[backfill_tick_batch] start={b_start} end={b_end} size={len(b)}")
             for d in tqdm(b, desc="ticks_days", unit="day"):
-                collect_full_day_ticks(d)
+                collect_full_day_ticks(d, ts_codes=codes_cache)
                 n, total = _count_tick_stats_for_date_fs(d)
                 print(f"[verify] date={d} files={n} records={total}")
+                job_build_tick_daily_features(d)
 
     # job_finalize_ticks_and_levels(today)
     elapsed = perf_counter() - start_time

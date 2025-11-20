@@ -51,7 +51,12 @@ _engine = None
 def _get_real_engine():
     global _engine
     if _engine is None:
-        _engine = create_engine(DATABASE_URL, future=True)
+        _engine = create_engine(
+            DATABASE_URL,
+            future=True,
+            pool_pre_ping=True,
+            pool_reset_on_return="rollback",
+        )
     return _engine
 
 def get_session():

@@ -16,8 +16,6 @@ from typing import List, Optional
 import pandas as pd
 
 from config import TICK_BASE_DIR, Settings
-from sqlalchemy import text, inspect
-from db.connection import get_engine
 from db.models import TickFileIndex
 
 
@@ -95,16 +93,7 @@ class TickStore:
             "time_end": time_end,
             "checksum": None,
         }
-        if self.defer_index:
-            self._pending_index.append(row)
-            return
-        eng = get_engine()
-        with eng.begin() as conn:
-            inspector = inspect(conn)
-            has_tbl = inspector.has_table("tick_file_index", schema="public")
-            if has_tbl:
-                conn.execute(text("delete from tick_file_index where ts_code=:ts and trade_date=:d"), {"ts": ts_code, "d": trade_date})
-            pd.DataFrame([row]).to_sql("tick_file_index", conn, if_exists="append", index=False)
+        self._pending_index.append(row)
 
     def flush_index_for_date(self, trade_date: date) -> int:
         if not self._pending_index:
@@ -112,15 +101,7 @@ class TickStore:
         rows = [r for r in self._pending_index if r["trade_date"] == trade_date]
         if not rows:
             return 0
-        eng = get_engine()
-        with eng.begin() as conn:
-            inspector = inspect(conn)
-            has_tbl = inspector.has_table("tick_file_index", schema="public")
-            if has_tbl:
-                ts_set = sorted(list({r["ts_code"] for r in rows}))
-                for ts in ts_set:
-                    conn.execute(text("delete from tick_file_index where ts_code=:ts and trade_date=:d"), {"ts": ts, "d": trade_date})
-            pd.DataFrame(rows).to_sql("tick_file_index", conn, if_exists="append", index=False)
+        # 本地模式：不写入数据库索引，直接丢弃待提交列表
         self._pending_index = [r for r in self._pending_index if r["trade_date"] != trade_date]
         return len(rows)
 
@@ -145,8 +126,6 @@ class TickStore:
             df.to_parquet(p, engine="pyarrow", compression="snappy")
 
     def normalize_file_names_and_update_index(self) -> int:
-        from db.connection import get_engine
-        from sqlalchemy import text
         n = 0
         renames: list[tuple[str, str, str, date]] = []
         for market_dir in self.base_dir.iterdir():
@@ -174,14 +153,6 @@ class TickStore:
                         f.rename(new_path)
                         n += 1
                         renames.append((str(f), str(new_path), f"{code_dir.name}.{market_dir.name}", dt))
-        eng = get_engine()
-        if eng is not None and renames:
-            with eng.begin() as conn:
-                inspector = inspect(conn)
-                has_tbl = inspector.has_table("tick_file_index", schema="public")
-                if has_tbl:
-                    for _, new_path, ts, dt in renames:
-                        conn.execute(text("update tick_file_index set file_path=:p where ts_code=:ts and trade_date=:d"), {"p": new_path, "ts": ts, "d": dt})
         return n
 
     def load_ticks(
@@ -239,28 +210,44 @@ class TickStore:
         return pd.DataFrame()
 
     def list_tick_files(self, ts_code: str, start_date: date, end_date: date) -> List[TickFileIndex]:
-        eng = get_engine()
-        with eng.connect() as conn:
-            inspector = inspect(conn)
-            has_tbl = inspector.has_table("tick_file_index", schema="public")
-            if not has_tbl:
-                return []
-            q = text(
-                "select ts_code, trade_date, market, file_path, record_cnt, time_start, time_end, checksum "
-                "from tick_file_index where ts_code=:ts and trade_date>=:d1 and trade_date<=:d2 order by trade_date"
-            )
-            df = pd.read_sql(q, conn, params={"ts": ts_code, "d1": start_date, "d2": end_date})
         rows: List[TickFileIndex] = []
-        for _, r in df.iterrows():
+        code, exch = ts_code.split(".")
+        base_dirs = [
+            self.base_dir / exch.upper() / code,
+            self.base_dir / exch.lower() / code,
+            self.base_dir / code,
+        ]
+        import pyarrow.parquet as pq
+        for d in pd.date_range(start_date, end_date, freq="D"):
+            dt = d.date()
+            ymd = dt.strftime("%Y%m%d")
+            ymd_dash = dt.strftime("%Y-%m-%d")
+            found = None
+            for bd in base_dirs:
+                p1 = bd / f"{ymd}_交易数据.parquet"
+                p2 = bd / f"{ymd_dash}_交易数据.parquet"
+                if p1.exists():
+                    found = p1
+                    break
+                if p2.exists():
+                    found = p2
+                    break
+            if found is None:
+                continue
+            try:
+                pf = pq.ParquetFile(str(found))
+                cnt = int(pf.metadata.num_rows or 0)
+            except Exception:
+                cnt = 0
             rows.append(
                 TickFileIndex(
-                    ts_code=str(r["ts_code"]),
-                    trade_date=r["trade_date"],
-                    market=str(r["market"]),
-                    file_path=str(r["file_path"]),
-                    record_cnt=int(r["record_cnt"] or 0),
-                    time_start=str(r.get("time_start", "")),
-                    time_end=str(r.get("time_end", "")),
+                    ts_code=ts_code,
+                    trade_date=dt,
+                    market=exch.upper(),
+                    file_path=str(found),
+                    record_cnt=cnt,
+                    time_start="",
+                    time_end="",
                     checksum=None,
                 )
             )

@@ -274,7 +274,7 @@ def compute_concept_bollinger_for_date(trade_date: date, conn=None) -> int:
         if not _table_exists(eng, "concepts_cache"):
             return 0
         cc = pd.read_sql(
-            "select ts_code, concepts from concepts_cache",
+            "select ts_code, concepts, industry from concepts_cache",
             conn,
         )
     else:
@@ -282,18 +282,29 @@ def compute_concept_bollinger_for_date(trade_date: date, conn=None) -> int:
             if not _table_exists(eng, "concepts_cache"):
                 return 0
             cc = pd.read_sql(
-                "select ts_code, concepts from concepts_cache",
+                "select ts_code, concepts, industry from concepts_cache",
                 _c,
             )
     cc["concepts"] = cc["concepts"].fillna("")
+    # 概念展开
     rows = cc["concepts"].str.split(";")
     cc_exp = cc.loc[rows.index.repeat(rows.str.len())].copy()
     cc_exp["concept_name"] = np.concatenate(rows.values)
     cc_exp = cc_exp[cc_exp["concept_name"].str.len() > 0]
-    joined = sbd.merge(cc_exp[["ts_code", "concept_name"]], on="ts_code", how="inner")
+    cc_exp["category"] = "concept"
+    # 行业分类
+    ind = cc[["ts_code", "industry"]].dropna(subset=["industry"]).copy()
+    ind = ind[ind["industry"].astype(str).str.len() > 0]
+    ind = ind.rename(columns={"industry": "concept_name"})
+    ind["category"] = "industry"
+    # 合并两类标签
+    tags = pd.concat([cc_exp[["ts_code", "concept_name", "category"]], ind[["ts_code", "concept_name", "category"]]], ignore_index=True)
+    if tags.empty:
+        return 0
+    joined = sbd.merge(tags, on="ts_code", how="inner")
     if joined.empty:
         return 0
-    grp = joined.groupby(["concept_name"], sort=False)
+    grp = joined.groupby(["concept_name", "category"], sort=False)
     out = grp.agg(
         median_bandwidth_zscore=("band_width_zscore", "median"),
         median_price_position=("price_position", "median"),
@@ -304,6 +315,7 @@ def compute_concept_bollinger_for_date(trade_date: date, conn=None) -> int:
     out["trade_date"] = trade_date
     cols = [
         "concept_name",
+        "category",
         "trade_date",
         "median_bandwidth_zscore",
         "median_price_position",
@@ -314,6 +326,14 @@ def compute_concept_bollinger_for_date(trade_date: date, conn=None) -> int:
     out = out[cols]
     cols_exist = _table_columns(eng, "concept_bollinger_data")
     needs_replace_c = (len(cols_exist) > 0) and ("concept_name" not in cols_exist)
+    # 确保存在分类列
+    if conn is None:
+        with eng.begin() as _conn:
+            if _table_exists(eng, "concept_bollinger_data"):
+                _conn.execute(text("alter table concept_bollinger_data add column if not exists category text"))
+    else:
+        if _table_exists(eng, "concept_bollinger_data"):
+            conn.execute(text("alter table concept_bollinger_data add column if not exists category text"))
     if conn is None:
         with eng.begin() as _conn:
             if _table_exists(eng, "concept_bollinger_data") and not needs_replace_c:
@@ -436,21 +456,27 @@ def compute_concept_bollinger_from_db_range(start_date: date, end_date: date, co
     if conn is not None:
         if not _table_exists(eng, "concepts_cache"):
             return 0
-        cc = pd.read_sql("select ts_code, concepts from concepts_cache", conn)
+        cc = pd.read_sql("select ts_code, concepts, industry from concepts_cache", conn)
     else:
         with eng.connect() as _c:
             if not _table_exists(eng, "concepts_cache"):
                 return 0
-            cc = pd.read_sql("select ts_code, concepts from concepts_cache", _c)
+            cc = pd.read_sql("select ts_code, concepts, industry from concepts_cache", _c)
     cc["concepts"] = cc["concepts"].fillna("")
     rows = cc["concepts"].str.split(";")
     cc_exp = cc.loc[rows.index.repeat(rows.str.len())].copy()
     cc_exp["concept_name"] = np.concatenate(rows.values)
     cc_exp = cc_exp[cc_exp["concept_name"].str.len() > 0]
-    joined = sbd.merge(cc_exp[["ts_code", "concept_name"]], on="ts_code", how="inner")
+    cc_exp["category"] = "concept"
+    ind = cc[["ts_code", "industry"]].dropna(subset=["industry"]).copy()
+    ind = ind[ind["industry"].astype(str).str.len() > 0]
+    ind = ind.rename(columns={"industry": "concept_name"})
+    ind["category"] = "industry"
+    tags = pd.concat([cc_exp[["ts_code", "concept_name", "category"]], ind[["ts_code", "concept_name", "category"]]], ignore_index=True)
+    joined = sbd.merge(tags, on="ts_code", how="inner")
     if joined.empty:
         return 0
-    grp = joined.groupby(["concept_name", "trade_date"], sort=False)
+    grp = joined.groupby(["concept_name", "category", "trade_date"], sort=False)
     out = grp.agg(
         median_bandwidth_zscore=("band_width_zscore", "median"),
         median_price_position=("price_position", "median"),
@@ -461,6 +487,14 @@ def compute_concept_bollinger_from_db_range(start_date: date, end_date: date, co
     cols = _table_columns(eng, "concept_bollinger_data")
     needs_replace_c = (len(cols) > 0) and ("concept_name" not in cols)
     date_col_out = "trade_date" if "trade_date" in cols else ("date" if "date" in cols else None)
+    # ensure category column exists
+    if conn is None:
+        with eng.begin() as _conn:
+            if _table_exists(eng, "concept_bollinger_data"):
+                _conn.execute(text("alter table concept_bollinger_data add column if not exists category text"))
+    else:
+        if _table_exists(eng, "concept_bollinger_data"):
+            conn.execute(text("alter table concept_bollinger_data add column if not exists category text"))
     if conn is None:
         with eng.begin() as _conn:
             if _table_exists(eng, "concept_bollinger_data") and not needs_replace_c and date_col_out is not None:
@@ -553,16 +587,22 @@ def compute_concept_bollinger_between(start_date: date, end_date: date) -> int:
     with eng.connect() as conn:
         if not _table_exists(eng, "concepts_cache"):
             return 0
-        cc = pd.read_sql("select ts_code, concepts from concepts_cache", conn)
+        cc = pd.read_sql("select ts_code, concepts, industry from concepts_cache", conn)
     cc["concepts"] = cc["concepts"].fillna("")
     rows = cc["concepts"].str.split(";")
     cc_exp = cc.loc[rows.index.repeat(rows.str.len())].copy()
     cc_exp["concept_name"] = np.concatenate(rows.values)
     cc_exp = cc_exp[cc_exp["concept_name"].str.len() > 0]
-    joined = sbd.merge(cc_exp[["ts_code", "concept_name"]], on="ts_code", how="inner")
+    cc_exp["category"] = "concept"
+    ind = cc[["ts_code", "industry"]].dropna(subset=["industry"]).copy()
+    ind = ind[ind["industry"].astype(str).str.len() > 0]
+    ind = ind.rename(columns={"industry": "concept_name"})
+    ind["category"] = "industry"
+    tags = pd.concat([cc_exp[["ts_code", "concept_name", "category"]], ind[["ts_code", "concept_name", "category"]]], ignore_index=True)
+    joined = sbd.merge(tags, on="ts_code", how="inner")
     if joined.empty:
         return 0
-    grp = joined.groupby(["concept_name", "trade_date"], sort=False)
+    grp = joined.groupby(["concept_name", "category", "trade_date"], sort=False)
     out = grp.agg(
         median_bandwidth_zscore=("band_width_zscore", "median"),
         median_price_position=("price_position", "median"),
@@ -573,6 +613,8 @@ def compute_concept_bollinger_between(start_date: date, end_date: date) -> int:
     cols = _table_columns(eng, "concept_bollinger_data")
     needs_replace_c = (len(cols) > 0) and ("concept_name" not in cols)
     with eng.begin() as conn:
+        if _table_exists(eng, "concept_bollinger_data"):
+            conn.execute(text("alter table concept_bollinger_data add column if not exists category text"))
         if _table_exists(eng, "concept_bollinger_data") and not needs_replace_c:
             date_col_out = "trade_date" if "trade_date" in cols else ("date" if "date" in cols else None)
             if date_col_out is not None:
