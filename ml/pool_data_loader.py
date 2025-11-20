@@ -12,6 +12,20 @@ import datetime as dt
 
 from db.connection import get_engine
 
+# ========= 关键时序特征（只对这些列做 lag1 + delta1） =========
+# 请根据你实际的字段名调整：
+# - price_position / v_price_position / band_width_zscore / v_band_width_zscore 是 stock_bollinger_data 里的
+# - active_buy_vol_ratio 假设是你在 tick 聚合表里算好的“主买占比”
+KEY_TS_FEATURES: List[str] = [
+    "price_position",
+    "v_price_position",
+    "band_width_zscore",
+    "v_band_width_zscore",
+    # 如果你的 tick 日表里叫别的名字，比如 main_buy_vol_ratio，就把这行改成真实列名
+    "active_buy_vol_ratio",
+]
+# ============================================================
+
 LAG_BASE_FEATURES = [
     "price_position",
     "v_price_position",
@@ -91,7 +105,7 @@ def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30)
             yield df
 
 
-def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, List[str], str]:
+def load_pool_merged_dataset(dr: PoolDataRangeConfig, enable_3day_features: bool = False) -> Tuple[pd.DataFrame, List[str], str]:
     frames = []
     total_rows = 0
     for df in load_pool_merged_dataset_iter(dr, chunk_days=30):
@@ -103,7 +117,9 @@ def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, Lis
     print("[load_pool] concat rows=", total_rows, flush=True)
     if df.empty:
         raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
-    df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
+    if enable_3day_features:
+        df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
+    df = add_lag1_and_delta_features(df, KEY_TS_FEATURES)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if dr.label_col not in numeric_cols:
         raise RuntimeError("Label column not found in numeric columns.")
@@ -120,6 +136,22 @@ def clean_features(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
             continue
         q1, q99 = s.quantile([0.01, 0.99])
         df[col] = s.clip(q1, q99).fillna(0.0)
+    return df
+
+
+def add_lag1_and_delta_features(df: pd.DataFrame, key_features: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.sort_values(["ts_code", "trade_date"]).copy()
+    grouped = df.groupby("ts_code", sort=False)
+    for col in key_features:
+        if col not in df.columns:
+            print(f"[lag] skip feature={col}, not in df.columns", flush=True)
+            continue
+        lag_col = f"{col}_lag1"
+        delta_col = f"{col}_delta1"
+        df[lag_col] = grouped[col].shift(1)
+        df[delta_col] = df[col] - df[lag_col]
     return df
 
 

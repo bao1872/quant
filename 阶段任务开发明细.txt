@@ -1,247 +1,196 @@
-一、目标：把特征扩展成「连续 3 个交易日」
+一、开发步骤（按文件改）
 
-对于每个样本（池子里的 ts_code, trade_date）：
+只动一个文件：ml/pool_data_loader.py
 
-不再只用 当天 的特征，
+做三件事：
 
-而是把 t、t-1、t-2 三天的关键信息一起作为输入。
+在文件顶部增加一个 关键时序特征列表 KEY_TS_FEATURES。
 
-具体做法：
+新增函数 add_lag1_and_delta_features，按 ts_code 分组计算 lag1 和 delta1。
 
-选出一批“基础特征”（当日 Bollinger + 当日 tick 聚合）；
+在 load_pool_merged_dataset 里，在 concat 完所有 chunk 后调用这个函数，再选数值特征列。
 
-对每个基础特征，构造：
+⚠️ KEY_TS_FEATURES 里的名字要和你表里的列名对上，不对的列函数会自动跳过，我这里先给一个推荐列表，你可以按自己实际字段改。
 
-col_lag1：前 1 个交易日的值（t-1）
+二、修改代码示例（贴进去就能用）
 
-col_lag2：前 2 个交易日的值（t-2）
+下面是基于你当前仓库结构写的 核心代码补丁。
+你可以直接在 ml/pool_data_loader.py 里按位置修改。
 
-（可选）col_mean3：最近 3 日均值
+1. 顶部增加关键特征列表
 
-在训练数据构建阶段统一增加这些列，模型训练直接使用。
+在 from db.connection import get_engine 下面，加上：
 
-注意：
+from db.connection import get_engine
 
-只用 shift 向后看，不会有未来信息泄露；
-
-最前面两天的样本会有 NaN，我们用你现有的 clean_features 做 clip+填充即可。
-
-二、开发步骤总览
-
-在 ml/pool_data_loader.py 里新增：
-
-一个配置：LAG_BASE_FEATURES（你希望做 3 日扩展的基础列名）
-
-一个函数：add_3day_features(df, lag_base_features, n_lags=2, use_mean3=True)
-
-在构建训练数据的流程里：
-
-在 load_pool_merged_dataset(...) 最后一步、返回前，调用 add_3day_features；
-
-再重新计算 feature_cols（包含新加的 lag 特征）。
-
-train_xgb_from_pool.py 无需修改核心逻辑，只是自动多了特征。
-
-以后做日常预测（daily_predict）时，同样调用 add_3day_features，只取预测日那一行即可。
-
-下面给你可以直接用的核心代码。
-
-三、在 pool_data_loader 里增加 3 日特征
-1）选择基础特征列表
-
-在 ml/pool_data_loader.py 顶部（import 下面）加一段配置：
-
-# 这些是你“希望扩展到 3 日”的基础特征列名
-# 名字要和 stock_bollinger_data / stock_tick_daily_features 里的列一致
-LAG_BASE_FEATURES = [
-    # --- Bollinger 相关 ---
+# ========= 关键时序特征（只对这些列做 lag1 + delta1） =========
+# 请根据你实际的字段名调整：
+# - price_position / v_price_position / band_width_zscore / v_band_width_zscore 是 stock_bollinger_data 里的
+# - active_buy_vol_ratio 假设是你在 tick 聚合表里算好的“主买占比”
+KEY_TS_FEATURES: List[str] = [
     "price_position",
     "v_price_position",
     "band_width_zscore",
     "v_band_width_zscore",
-    # 如果还有其它你很看重的布林特征，也可以加进来
-    # "price_position_ma5",
-    # "band_width_zscore_ma5",
-
-    # --- Tick 日内聚合相关（根据你的表字段来填） ---
-    # 比如：
-    "vwap",
+    # 如果你的 tick 日表里叫别的名字，比如 main_buy_vol_ratio，就把这行改成真实列名
     "active_buy_vol_ratio",
-    "amount_sum",
-    "volume_sum",
-    # ...
 ]
+# ============================================================
 
 
-你可以先只放 4 个布林 + 2~4 个 tick 特征，跑通之后再慢慢加。
+如果暂时不确定 tick 那个字段叫什么，可以先只保留前 4 个布林特征，把 active_buy_vol_ratio 先注释掉。
 
-2）新增函数：add_3day_features
+2. 在文件中间新增：add_lag1_and_delta_features
 
-放在 ml/pool_data_loader.py 里（和 clean_features 同一层级）：
+建议放在 load_pool_merged_dataset 定义前面，比如紧跟在 _date_chunks 或 load_pool_merged_dataset_iter 之后。
 
-def add_3day_features(
+def add_lag1_and_delta_features(
     df: pd.DataFrame,
-    lag_base_features: List[str],
-    n_lags: int = 2,
-    use_mean3: bool = True,
+    key_features: List[str],
 ) -> pd.DataFrame:
     """
-    在 df 上增加“连续3个交易日”的特征：
-      - 对 lag_base_features 中的每个特征 col：
-          col_lag1 = t-1
-          col_lag2 = t-2
-          (可选) col_mean3 = 最近3日窗口均值
+    只对少数关键特征增加简单时间序列信息：
+      对每个特征 col in key_features：
+        col_lag1   = 前 1 个交易日的值（按 ts_code 分组）
+        col_delta1 = col - col_lag1  （当天相对昨天的变化）
 
-    要求 df 至少包含列：
+    要求 df 至少包含：
       - ts_code
       - trade_date
-      - lag_base_features 中的列（有缺失的会跳过）
+      - key_features 中的部分列（缺的会自动跳过）
     """
+    if df.empty:
+        return df
+
+    # 先按 ts_code, trade_date 排序，保证 shift/rolling 顺序正确
     df = df.sort_values(["ts_code", "trade_date"]).copy()
 
-    # 确保 trade_date 是日期类型，后面不做运算，只用于排序
-    # 如果前面已经转过可以略过这一步
-    # df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    grouped = df.groupby("ts_code", sort=False)
 
-    grouped = df.groupby("ts_code")
-
-    for col in lag_base_features:
+    for col in key_features:
         if col not in df.columns:
-            # 某些特征本来就没有，比如 tick 表缺少某列，直接跳过
+            # 某些特征可能在当前样本期内缺失，这里直接跳过
+            print(f"[lag] skip feature={col}, not in df.columns", flush=True)
             continue
 
-        # lag 1, lag 2 ...
-        for lag in range(1, n_lags + 1):
-            new_col = f"{col}_lag{lag}"
-            df[new_col] = grouped[col].shift(lag)
+        lag_col = f"{col}_lag1"
+        delta_col = f"{col}_delta1"
 
-        if use_mean3:
-            # 最近3日滚动均值
-            new_col_mean = f"{col}_mean3"
-            df[new_col_mean] = (
-                grouped[col]
-                .rolling(window=3, min_periods=1)
-                .mean()
-                .reset_index(level=0, drop=True)
-            )
+        # t-1
+        df[lag_col] = grouped[col].shift(1)
+
+        # 当天相对昨天变化
+        df[delta_col] = df[col] - df[lag_col]
 
     return df
 
-3）在 load_pool_merged_dataset 里调用
+3. 修改 load_pool_merged_dataset：插入调用
 
-假设你现在的 load_pool_merged_dataset 大致是这样的（你已经改成了分 chunk + concat 的版本，我直接给“最终拼完 df 后”的处理逻辑）：
+你当前的 load_pool_merged_dataset 大致是这样（我从你仓库里读出来的）：
 
-def load_pool_merged_dataset(
-    engine: Engine,
-    dr: PoolDataRangeConfig,
-) -> Tuple[pd.DataFrame, List[str], str]:
-    """
-    从 stock_pool_ml_samples 出发，join 上:
-      - stock_bollinger_data
-      - stock_tick_daily_features
-    + 增加连续3日特征
-    返回: df, feature_cols, label_col
-    """
-    # 这里假设你已经有一个按 chunk 读取的流程，
-    # 最终得到了一个 concat 完整的 df_all：
-    #   df_all = pd.concat(frames, ignore_index=True)
-    #   df_all["trade_date"] = df_all["trade_date"].dt.date
-    # 我直接从 df_all 开始写：
-
-    # ---- 这是伪代码，替换成你现在实际的 concat 逻辑 ----
-    df_all = ...  # 你现有的 concat 后的 DataFrame
-
-    # 去掉重复列名（如果 s/b/t 有重复字段）
-    df_all = df_all.loc[:, ~df_all.columns.duplicated()]
-
-    # 先增加 3 日特征
-    df_all = add_3day_features(df_all, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
-
-    # 只保留数值列
-    numeric_cols = df_all.select_dtypes(include=[np.number]).columns.tolist()
-    label_col = dr.label_col
-
-    if label_col not in numeric_cols:
-        raise RuntimeError(f"Label column {label_col} not in numeric columns.")
-
-    # 特征列 = 数值列 - 标签
-    feature_cols = [c for c in numeric_cols if c != label_col]
-
-    return df_all, feature_cols, label_col
+def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, List[str], str]:
+    frames = []
+    total_rows = 0
+    for df in load_pool_merged_dataset_iter(dr, chunk_days=30):
+        frames.append(df)
+        total_rows += len(df)
+    df = pd.concat(frames, ignore_index=True)
+    if dr.label_col in df.columns:
+        df[dr.label_col] = pd.to_numeric(df[dr.label_col], errors="coerce")
+    print("[load_pool] concat rows=", total_rows, flush=True)
+    if df.empty:
+        raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if dr.label_col not in numeric_cols:
+        raise RuntimeError("Label column not found in numeric columns.")
+    feature_cols = [c for c in numeric_cols if c != dr.label_col and not c.startswith("y_")]
+    return df, feature_cols, dr.label_col
 
 
-你实际项目里已经有打印日志、按 chunk 读取的实现，只需要在 concat 完的地方插这一句：
+请改成下面这版（只改这一处）：
 
-df_all = add_3day_features(df_all, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
+def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, List[str], str]:
+    frames = []
+    total_rows = 0
+    for df_chunk in load_pool_merged_dataset_iter(dr, chunk_days=30):
+        frames.append(df_chunk)
+        total_rows += len(df_chunk)
 
+    df = pd.concat(frames, ignore_index=True)
+    print("[load_pool] concat rows=", total_rows, flush=True)
 
-然后再 select_dtypes 选特征列即可。
+    if df.empty:
+        raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
 
-四、训练脚本不需要改逻辑
+    # label 转成数值
+    if dr.label_col in df.columns:
+        df[dr.label_col] = pd.to_numeric(df[dr.label_col], errors="coerce")
 
-ml/train_xgb_from_pool.py 里：
+    # ===== 在这里增加：关键特征的 lag1 + delta1 =====
+    df = add_lag1_and_delta_features(df, KEY_TS_FEATURES)
+    # =================================================
 
-df, feature_cols, label_col = load_pool_merged_dataset(engine, data_range)
-df = clean_features(df, feature_cols)
-...
+    # 选数值列
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if dr.label_col not in numeric_cols:
+        raise RuntimeError("Label column not found in numeric columns.")
 
+    # 特征列 = 所有数值列 - 标签列 - 其他 y_* 标签
+    feature_cols = [
+        c for c in numeric_cols
+        if c != dr.label_col and not c.startswith("y_")
+    ]
 
-这一段不用变：
-
-load_pool_merged_dataset 已经帮你把 3 日特征加进来了；
-
-feature_cols 包含了原来的单日+ lag1+lag2+mean3 列；
-
-clean_features 会统一对所有数值列做 clip + 填充。
-
-你只会看到：
-
-日志里的 features= 数量变多；
-
-训练时间稍微长一点；
-
-IC / 分组收益可能有变化（我们希望有提升 😂）。
-
-五、预测时要记得也用 3 日特征（提示一下）
-
-虽然你这一步先专注训练，但为了以后不踩坑，我提前提醒一下：
-
-未来你在 daily_predict.py 里做预测时，不能只查单个交易日 t 再直接加 lag 列；
-
-需要一次拉 [t-2, t] 这三天的特征，调用 add_3day_features，再从中筛出 trade_date == t 的那行来预测。
-
-伪代码示例（以后你要做预测时可以照这个改）：
-
-def load_features_for_date_with_lags(engine, trade_date, feature_cols):
-    start = trade_date - dt.timedelta(days=10)  # 用10天覆盖，里面实际只有3个交易日
-    end = trade_date
-
-    # 从 boll+ticks+pool 里把这段日期的样本拉出来（类似训练时的 join，但只做这几天）
-    df = ...  # join 出 [start, end] 区间的样本
-
-    df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
-
-    # 只保留预测日
-    df_today = df[df["trade_date"] == trade_date].copy()
-
-    X = df_today[feature_cols].to_numpy(dtype=float)
-    return df_today, X
+    return df, feature_cols, dr.label_col
 
 
-训练和预测用同一个 add_3day_features 函数 + 同一批 feature_cols，就不会出现特征错位问题。
+这样做的顺序是：
 
-六、你接下来可以按这个顺序来
+所有 chunk 合并 → df
 
-在 pool_data_loader.py 里加：
+转 label 类型
 
-LAG_BASE_FEATURES 列表；
+增加 lag1/delta1 这几个新列
 
-add_3day_features 函数；
+然后统一选数值列作为特征
 
-在拼完 df_all 的地方调用 add_3day_features，然后重新选 feature_cols；
+三、训练脚本可以保持现状（用 A 的配置）
 
-重新跑一遍 python -m ml.train_xgb_from_pool：
+你的 ml/train_xgb_from_pool.py 里，A 实验那套配置已经验证过效果不错：
 
-看日志里的 features= 是否变多；
+单日特征
 
-看新的 IC & 分组收益有没有变化（可能 IC 会再涨一点，或者 Q5/Q4 更漂亮）；
+label clipping（1%/99%）
+
+当前 XGB 参数
+
+在刚才这套修改完成后：
+
+feature_cols 会多出少量 *_lag1 和 *_delta1 列（数量很有限）；
+
+训练脚本逻辑不需要改，只要重新 python -m ml.train_xgb_from_pool 跑一遍即可。
+
+建议你暂时先继续使用：
+
+单日 + lag1 + delta1
+
+label clipping（你 log 里那组 q1/q99 区间就可以）
+
+四、你接下来可以这样操作
+
+按上面的代码片段，修改 ml/pool_data_loader.py：
+
+加 KEY_TS_FEATURES；
+
+加 add_lag1_and_delta_features；
+
+在 load_pool_merged_dataset 中插入调用。
+
+确认 KEY_TS_FEATURES 里所有列在 df.columns 里都存在；
+
+如果某列不存在，会打印 [lag] skip feature=xxx，不影响运行。
+
+跑训练：
+
+cd d:\quant
+python -m ml.train_xgb_from_pool
