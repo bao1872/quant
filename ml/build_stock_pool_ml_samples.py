@@ -62,6 +62,7 @@ def insert_samples_for_window(window_start: dt.date, window_end: dt.date) -> Non
         "FROM stock_bollinger_data WHERE trade_date >= :start_date AND trade_date <= :end_date AND y_ret_10d IS NOT NULL"
         ") s WHERE band_width_zscore < 0.5 AND v_band_width_zscore < 0.5 "
         "AND price_position_lag1 IS NOT NULL AND price_position > price_position_lag1 "
+        "AND price_position <= 60 AND v_price_position <= 40 "
         "ON CONFLICT (ts_code, trade_date) DO NOTHING"
     )
     with eng.begin() as conn:
@@ -86,6 +87,8 @@ def build_stock_pool_ml_samples(start_date: dt.date, end_date: dt.date, window_d
 if __name__ == "__main__":
     today = dt.date.today()
     eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("TRUNCATE stock_pool_ml_samples"))
     with eng.connect() as conn:
         df_min = pd.read_sql(
             text("SELECT min(b.trade_date) AS d FROM stock_bollinger_data b WHERE y_ret_10d IS NOT NULL AND EXISTS (SELECT 1 FROM stock_tick_daily_features t WHERE t.trade_date=b.trade_date)"),

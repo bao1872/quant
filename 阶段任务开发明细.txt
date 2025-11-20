@@ -1,372 +1,247 @@
-步骤 2：写一个“从样本池构建训练集”的 loader
+一、目标：把特征扩展成「连续 3 个交易日」
 
-逻辑：
+对于每个样本（池子里的 ts_code, trade_date）：
 
-从 stock_pool_ml_samples 按时间区间取样本
+不再只用 当天 的特征，
 
-join 上：
+而是把 t、t-1、t-2 三天的关键信息一起作为输入。
 
-stock_bollinger_data（所有布林特征）
+具体做法：
 
-stock_tick_daily_features（tick 聚合特征）
+选出一批“基础特征”（当日 Bollinger + 当日 tick 聚合）；
 
-得到一个 df：
+对每个基础特征，构造：
 
-包含：ts_code, trade_date, y_ret_10d + 所有数值特征
+col_lag1：前 1 个交易日的值（t-1）
 
-自动选出特征列（所有数值列 - 标签）
+col_lag2：前 2 个交易日的值（t-2）
 
-步骤 3：特征清洗（非常简单的一层）
+（可选）col_mean3：最近 3 日均值
 
-对所有特征：
+在训练数据构建阶段统一增加这些列，模型训练直接使用。
 
-做 1% / 99% 分位数剪裁（防极端值炸掉模型）
+注意：
 
-NaN 填 0（或者中位数）
+只用 shift 向后看，不会有未来信息泄露；
 
-步骤 4：时间切分 + 训练 XGBoost
+最前面两天的样本会有 NaN，我们用你现有的 clean_features 做 clip+填充即可。
 
-按 trade_date 排序
+二、开发步骤总览
 
-用配置里的 train_end / valid_end 切分 train / valid / test
+在 ml/pool_data_loader.py 里新增：
 
-用 XGBRegressor 训练回归模型（预测 y_ret_10d）
+一个配置：LAG_BASE_FEATURES（你希望做 3 日扩展的基础列名）
 
-步骤 5：评估 + 保存模型
+一个函数：add_3day_features(df, lag_base_features, n_lags=2, use_mean3=True)
 
-在 test 区间上做：
+在构建训练数据的流程里：
 
-每日截面 Spearman IC
+在 load_pool_merged_dataset(...) 最后一步、返回前，调用 add_3day_features；
 
-分组回测（按预测值分 5 组，看平均真实 y_ret_10d）
+再重新计算 feature_cols（包含新加的 lag 特征）。
 
-保存模型 + feature_cols 等元信息到一个 pkl（比如 models/xgb_from_pool_ret10d.pkl）
+train_xgb_from_pool.py 无需修改核心逻辑，只是自动多了特征。
 
-二、核心代码 1：样本池数据加载器
+以后做日常预测（daily_predict）时，同样调用 add_3day_features，只取预测日那一行即可。
 
-文件建议：ml/pool_data_loader.py
+下面给你可以直接用的核心代码。
 
-# ml/pool_data_loader.py
+三、在 pool_data_loader 里增加 3 日特征
+1）选择基础特征列表
 
-from __future__ import annotations
+在 ml/pool_data_loader.py 顶部（import 下面）加一段配置：
 
-import datetime as dt
-from dataclasses import dataclass
-from typing import List, Tuple
+# 这些是你“希望扩展到 3 日”的基础特征列名
+# 名字要和 stock_bollinger_data / stock_tick_daily_features 里的列一致
+LAG_BASE_FEATURES = [
+    # --- Bollinger 相关 ---
+    "price_position",
+    "v_price_position",
+    "band_width_zscore",
+    "v_band_width_zscore",
+    # 如果还有其它你很看重的布林特征，也可以加进来
+    # "price_position_ma5",
+    # "band_width_zscore_ma5",
 
-import numpy as np
-import pandas as pd
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+    # --- Tick 日内聚合相关（根据你的表字段来填） ---
+    # 比如：
+    "vwap",
+    "active_buy_vol_ratio",
+    "amount_sum",
+    "volume_sum",
+    # ...
+]
 
 
-@dataclass
-class DBConfig:
-    db_url: str = "postgresql+psycopg2://user:password@localhost:5432/quant"
+你可以先只放 4 个布林 + 2~4 个 tick 特征，跑通之后再慢慢加。
 
+2）新增函数：add_3day_features
 
-def get_engine(cfg: DBConfig) -> Engine:
-    return create_engine(cfg.db_url)
+放在 ml/pool_data_loader.py 里（和 clean_features 同一层级）：
 
+def add_3day_features(
+    df: pd.DataFrame,
+    lag_base_features: List[str],
+    n_lags: int = 2,
+    use_mean3: bool = True,
+) -> pd.DataFrame:
+    """
+    在 df 上增加“连续3个交易日”的特征：
+      - 对 lag_base_features 中的每个特征 col：
+          col_lag1 = t-1
+          col_lag2 = t-2
+          (可选) col_mean3 = 最近3日窗口均值
 
-@dataclass
-class PoolDataRangeConfig:
-    start_date: dt.date
-    end_date: dt.date
-    label_col: str = "y_ret_10d"
+    要求 df 至少包含列：
+      - ts_code
+      - trade_date
+      - lag_base_features 中的列（有缺失的会跳过）
+    """
+    df = df.sort_values(["ts_code", "trade_date"]).copy()
 
+    # 确保 trade_date 是日期类型，后面不做运算，只用于排序
+    # 如果前面已经转过可以略过这一步
+    # df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+
+    grouped = df.groupby("ts_code")
+
+    for col in lag_base_features:
+        if col not in df.columns:
+            # 某些特征本来就没有，比如 tick 表缺少某列，直接跳过
+            continue
+
+        # lag 1, lag 2 ...
+        for lag in range(1, n_lags + 1):
+            new_col = f"{col}_lag{lag}"
+            df[new_col] = grouped[col].shift(lag)
+
+        if use_mean3:
+            # 最近3日滚动均值
+            new_col_mean = f"{col}_mean3"
+            df[new_col_mean] = (
+                grouped[col]
+                .rolling(window=3, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+
+    return df
+
+3）在 load_pool_merged_dataset 里调用
+
+假设你现在的 load_pool_merged_dataset 大致是这样的（你已经改成了分 chunk + concat 的版本，我直接给“最终拼完 df 后”的处理逻辑）：
 
 def load_pool_merged_dataset(
     engine: Engine,
     dr: PoolDataRangeConfig,
 ) -> Tuple[pd.DataFrame, List[str], str]:
     """
-    从 stock_pool_ml_samples 出发，join 上
+    从 stock_pool_ml_samples 出发，join 上:
       - stock_bollinger_data
       - stock_tick_daily_features
-    得到训练用的 df + feature_cols + label_col。
+    + 增加连续3日特征
+    返回: df, feature_cols, label_col
     """
+    # 这里假设你已经有一个按 chunk 读取的流程，
+    # 最终得到了一个 concat 完整的 df_all：
+    #   df_all = pd.concat(frames, ignore_index=True)
+    #   df_all["trade_date"] = df_all["trade_date"].dt.date
+    # 我直接从 df_all 开始写：
 
-    sql = f"""
-    SELECT
-        s.ts_code,
-        s.trade_date::date AS trade_date,
-        s.{dr.label_col}    AS {dr.label_col},
-        b.*,
-        t.*
-    FROM stock_pool_ml_samples s
-    JOIN stock_bollinger_data b
-      ON s.ts_code = b.ts_code
-     AND s.trade_date = b.trade_date
-    LEFT JOIN stock_tick_daily_features t
-      ON s.ts_code = t.ts_code
-     AND s.trade_date = t.trade_date
-    WHERE s.trade_date >= :start_date
-      AND s.trade_date <= :end_date
-      AND s.{dr.label_col} IS NOT NULL
-    ORDER BY s.ts_code, s.trade_date;
-    """
+    # ---- 这是伪代码，替换成你现在实际的 concat 逻辑 ----
+    df_all = ...  # 你现有的 concat 后的 DataFrame
 
-    df = pd.read_sql(
-        sql,
-        engine,
-        params={"start_date": dr.start_date, "end_date": dr.end_date},
-        parse_dates=["trade_date"],
-    )
-    if df.empty:
-        raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
+    # 去掉重复列名（如果 s/b/t 有重复字段）
+    df_all = df_all.loc[:, ~df_all.columns.duplicated()]
 
-    # 去重列名（ts_code/trade_date/y_ret_10d 在 b 中可能重复）
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    df["trade_date"] = df["trade_date"].dt.date
+    # 先增加 3 日特征
+    df_all = add_3day_features(df_all, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
 
     # 只保留数值列
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if dr.label_col not in numeric_cols:
-        raise RuntimeError(f"Label column {dr.label_col} not found in numeric columns.")
+    numeric_cols = df_all.select_dtypes(include=[np.number]).columns.tolist()
+    label_col = dr.label_col
 
-    feature_cols = [c for c in numeric_cols if c != dr.label_col]
+    if label_col not in numeric_cols:
+        raise RuntimeError(f"Label column {label_col} not in numeric columns.")
 
-    return df, feature_cols, dr.label_col
+    # 特征列 = 数值列 - 标签
+    feature_cols = [c for c in numeric_cols if c != label_col]
 
-
-def clean_features(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    """
-    简单特征清洗：
-      - 对每个特征做 1%/99% quantile clip
-      - 用 0 填 NaN（你也可以改成中位数）
-    """
-    df = df.copy()
-    for col in feature_cols:
-        col_series = df[col].astype(float)
-        # 可能有全 NaN 的列，跳过
-        if col_series.notna().sum() == 0:
-            df[col] = 0.0
-            continue
-
-        q1, q99 = col_series.quantile([0.01, 0.99])
-        df[col] = col_series.clip(q1, q99)
-        df[col] = df[col].fillna(0.0)
-
-    return df
+    return df_all, feature_cols, label_col
 
 
-if __name__ == "__main__":
-    db_cfg = DBConfig()
-    engine = get_engine(db_cfg)
+你实际项目里已经有打印日志、按 chunk 读取的实现，只需要在 concat 完的地方插这一句：
 
-    # 样本从 2024-11-15 开始，这里举例取到今天
-    dr = PoolDataRangeConfig(
-        start_date=dt.date(2024, 11, 15),
-        end_date=dt.date.today(),
-        label_col="y_ret_10d",
-    )
-
-    df, feat_cols, label_col = load_pool_merged_dataset(engine, dr)
-    df = clean_features(df, feat_cols)
-
-    print(df.head())
-    print("Feature num:", len(feat_cols), "Label:", label_col)
-
-三、核心代码 2：基于样本池训练 XGBoost
-
-文件建议：ml/train_xgb_from_pool.py
-
-# ml/train_xgb_from_pool.py
-
-from __future__ import annotations
-
-import datetime as dt
-from dataclasses import dataclass
-from typing import List, Tuple
-
-import joblib
-import numpy as np
-import pandas as pd
-from scipy.stats import spearmanr
-from xgboost import XGBRegressor
-
-from ml.pool_data_loader import (
-    DBConfig,
-    PoolDataRangeConfig,
-    get_engine,
-    load_pool_merged_dataset,
-    clean_features,
-)
+df_all = add_3day_features(df_all, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
 
 
-@dataclass
-class TrainConfig:
-    model_path: str = "models/xgb_from_pool_ret10d.pkl"
+然后再 select_dtypes 选特征列即可。
 
-    # 训练/验证/测试时间切分
-    # 注意：必须落在样本的时间范围内（>= 2024-11-15）
-    train_end: dt.date = dt.date(2025, 1, 31)
-    valid_end: dt.date = dt.date(2025, 2, 28)
+四、训练脚本不需要改逻辑
 
-    # XGBoost 参数
-    n_estimators: int = 600
-    max_depth: int = 6
-    learning_rate: float = 0.05
-    subsample: float = 0.8
-    colsample_bytree: float = 0.8
-    reg_lambda: float = 1.0
-    reg_alpha: float = 0.0
+ml/train_xgb_from_pool.py 里：
+
+df, feature_cols, label_col = load_pool_merged_dataset(engine, data_range)
+df = clean_features(df, feature_cols)
+...
 
 
-def time_split(
-    df: pd.DataFrame,
-    label_col: str,
-    feature_cols: List[str],
-    cfg: TrainConfig,
-):
-    df = df.sort_values("trade_date").reset_index(drop=True)
+这一段不用变：
 
-    train_mask = df["trade_date"] <= cfg.train_end
-    valid_mask = (df["trade_date"] > cfg.train_end) & (df["trade_date"] <= cfg.valid_end)
-    test_mask = df["trade_date"] > cfg.valid_end
+load_pool_merged_dataset 已经帮你把 3 日特征加进来了；
 
-    X_train = df.loc[train_mask, feature_cols].to_numpy(dtype=float)
-    y_train = df.loc[train_mask, label_col].to_numpy(dtype=float)
+feature_cols 包含了原来的单日+ lag1+lag2+mean3 列；
 
-    X_valid = df.loc[valid_mask, feature_cols].to_numpy(dtype=float)
-    y_valid = df.loc[valid_mask, label_col].to_numpy(dtype=float)
+clean_features 会统一对所有数值列做 clip + 填充。
 
-    X_test = df.loc[test_mask, feature_cols].to_numpy(dtype=float)
-    y_test = df.loc[test_mask, label_col].to_numpy(dtype=float)
+你只会看到：
 
-    print(
-        f"Train size: {X_train.shape}, "
-        f"Valid size: {X_valid.shape}, "
-        f"Test size: {X_test.shape}"
-    )
-    return (X_train, y_train), (X_valid, y_valid), (X_test, y_test)
+日志里的 features= 数量变多；
 
+训练时间稍微长一点；
 
-def calc_daily_ic(df: pd.DataFrame, pred_col: str, label_col: str) -> pd.Series:
-    """
-    按 trade_date 做截面 Spearman IC。
-    """
-    ics = []
-    dates = []
-    for d, sub in df.groupby("trade_date"):
-        if sub[pred_col].nunique() <= 1:
-            continue
-        ic, _ = spearmanr(sub[pred_col], sub[label_col])
-        ics.append(ic)
-        dates.append(d)
-    return pd.Series(ics, index=dates, name="ic")
+IC / 分组收益可能有变化（我们希望有提升 😂）。
+
+五、预测时要记得也用 3 日特征（提示一下）
+
+虽然你这一步先专注训练，但为了以后不踩坑，我提前提醒一下：
+
+未来你在 daily_predict.py 里做预测时，不能只查单个交易日 t 再直接加 lag 列；
+
+需要一次拉 [t-2, t] 这三天的特征，调用 add_3day_features，再从中筛出 trade_date == t 的那行来预测。
+
+伪代码示例（以后你要做预测时可以照这个改）：
+
+def load_features_for_date_with_lags(engine, trade_date, feature_cols):
+    start = trade_date - dt.timedelta(days=10)  # 用10天覆盖，里面实际只有3个交易日
+    end = trade_date
+
+    # 从 boll+ticks+pool 里把这段日期的样本拉出来（类似训练时的 join，但只做这几天）
+    df = ...  # join 出 [start, end] 区间的样本
+
+    df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
+
+    # 只保留预测日
+    df_today = df[df["trade_date"] == trade_date].copy()
+
+    X = df_today[feature_cols].to_numpy(dtype=float)
+    return df_today, X
 
 
-def quantile_backtest(
-    df: pd.DataFrame,
-    pred_col: str,
-    label_col: str,
-    n_quantiles: int = 5,
-) -> pd.DataFrame:
-    """
-    简单分组回测：每天按预测值分成 n 组，计算每组平均真实收益。
-    """
-    records = []
-    for d, sub in df.groupby("trade_date"):
-        if len(sub) < n_quantiles:
-            continue
-        try:
-            sub = sub.copy()
-            sub["q"] = pd.qcut(sub[pred_col], q=n_quantiles, labels=False) + 1
-        except ValueError:
-            continue
+训练和预测用同一个 add_3day_features 函数 + 同一批 feature_cols，就不会出现特征错位问题。
 
-        for q, sub_q in sub.groupby("q"):
-            records.append(
-                {"trade_date": d, "quantile": int(q), "avg_ret": sub_q[label_col].mean()}
-            )
+六、你接下来可以按这个顺序来
 
-    df_q = pd.DataFrame(records)
-    if df_q.empty:
-        return df_q
+在 pool_data_loader.py 里加：
 
-    pivot = df_q.pivot(index="trade_date", columns="quantile", values="avg_ret").sort_index()
-    pivot.columns = [f"Q{int(c)}" for c in pivot.columns]
-    return pivot
+LAG_BASE_FEATURES 列表；
 
+add_3day_features 函数；
 
-def train_from_pool():
-    # 1. 连接数据库
-    db_cfg = DBConfig()
-    engine = get_engine(db_cfg)
+在拼完 df_all 的地方调用 add_3day_features，然后重新选 feature_cols；
 
-    # 2. 选择样本时间范围（至少覆盖 train_end / valid_end / test）
-    data_range = PoolDataRangeConfig(
-        start_date=dt.date(2024, 11, 15),
-        end_date=dt.date.today(),
-        label_col="y_ret_10d",
-    )
+重新跑一遍 python -m ml.train_xgb_from_pool：
 
-    # 3. 载入样本池数据 + 特征
-    df, feature_cols, label_col = load_pool_merged_dataset(engine, data_range)
-    print(f"Raw merged df shape: {df.shape}, feature num: {len(feature_cols)}")
+看日志里的 features= 是否变多；
 
-    # 4. 特征清洗
-    df = clean_features(df, feature_cols)
-
-    # 5. 时间切分
-    cfg = TrainConfig(
-        model_path="models/xgb_from_pool_ret10d.pkl",
-        # 这里的日期你需要根据当前已有样本的最新日期来设
-        train_end=dt.date(2025, 1, 31),
-        valid_end=dt.date(2025, 2, 28),
-    )
-    (X_train, y_train), (X_valid, y_valid), (X_test, y_test) = time_split(
-        df, label_col, feature_cols, cfg
-    )
-
-    # 6. 训练 XGBoost
-    model = XGBRegressor(
-        n_estimators=cfg.n_estimators,
-        max_depth=cfg.max_depth,
-        learning_rate=cfg.learning_rate,
-        subsample=cfg.subsample,
-        colsample_bytree=cfg.colsample_bytree,
-        reg_lambda=cfg.reg_lambda,
-        reg_alpha=cfg.reg_alpha,
-        objective="reg:squarederror",
-        n_jobs=8,
-    )
-
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_valid, y_valid)],
-        verbose=50,
-    )
-
-    # 7. 评估（主要看 test 段）
-    df_eval = df.copy()
-    X_all = df_eval[feature_cols].to_numpy(dtype=float)
-    df_eval["pred_ret_10d"] = model.predict(X_all)
-
-    df_test = df_eval[df_eval["trade_date"] > cfg.valid_end].copy()
-    if not df_test.empty:
-        ic_series = calc_daily_ic(df_test, "pred_ret_10d", label_col)
-        print("Test IC mean:", ic_series.mean(), "std:", ic_series.std())
-
-        q_ret = quantile_backtest(df_test, "pred_ret_10d", label_col, n_quantiles=5)
-        print("Average return by quantile (test period):")
-        print(q_ret.mean())
-
-    # 8. 保存模型
-    bundle = {
-        "model": model,
-        "feature_cols": feature_cols,
-        "label_col": label_col,
-        "train_end": cfg.train_end,
-        "valid_end": cfg.valid_end,
-    }
-    joblib.dump(bundle, cfg.model_path)
-    print(f"Model saved to {cfg.model_path}")
-
-
-if __name__ == "__main__":
-    train_from_pool()
+看新的 IC & 分组收益有没有变化（可能 IC 会再涨一点，或者 Q5/Q4 更漂亮）；

@@ -12,6 +12,16 @@ import datetime as dt
 
 from db.connection import get_engine
 
+LAG_BASE_FEATURES = [
+    "price_position",
+    "v_price_position",
+    "band_width_zscore",
+    "v_band_width_zscore",
+    "vwap",
+    "amount_sum",
+    "vol_sum",
+]
+
 
 @dataclass
 class PoolDataRangeConfig:
@@ -93,6 +103,7 @@ def load_pool_merged_dataset(dr: PoolDataRangeConfig) -> Tuple[pd.DataFrame, Lis
     print("[load_pool] concat rows=", total_rows, flush=True)
     if df.empty:
         raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
+    df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if dr.label_col not in numeric_cols:
         raise RuntimeError("Label column not found in numeric columns.")
@@ -109,6 +120,19 @@ def clean_features(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
             continue
         q1, q99 = s.quantile([0.01, 0.99])
         df[col] = s.clip(q1, q99).fillna(0.0)
+    return df
+
+
+def add_3day_features(df: pd.DataFrame, lag_base_features: List[str], n_lags: int = 2, use_mean3: bool = True) -> pd.DataFrame:
+    df = df.sort_values(["ts_code", "trade_date"]).copy()
+    g = df.groupby("ts_code")
+    for col in lag_base_features:
+        if col not in df.columns:
+            continue
+        for lag in range(1, n_lags + 1):
+            df[f"{col}_lag{lag}"] = g[col].shift(lag)
+        if use_mean3:
+            df[f"{col}_mean3"] = g[col].rolling(window=3, min_periods=1).mean().reset_index(level=0, drop=True)
     return df
 
 
