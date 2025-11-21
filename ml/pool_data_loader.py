@@ -32,9 +32,16 @@ LAG_BASE_FEATURES = [
     "v_price_position",
     "band_width_zscore",
     "v_band_width_zscore",
-    "vwap",
-    "amount_sum",
-    "vol_sum",
+    "upper_return",
+    "lower_return",
+    "band_width",
+    "upper_band",
+    "middle_band",
+    "lower_band",
+    "v_upper_band",
+    "v_middle_band",
+    "v_lower_band",
+    "v_band_width",
 ]
 
 
@@ -68,12 +75,6 @@ def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30,
         " WHERE trade_date>=:start_date AND trade_date<=:end_date AND " + dr.label_col + " IS NOT NULL) s "
         " ON b.ts_code=s.ts_code AND b.trade_date=s.trade_date"
     )
-    sql_t = (
-        "SELECT t.* FROM stock_tick_daily_features t "
-        "INNER JOIN (SELECT DISTINCT ts_code, trade_date FROM stock_pool_ml_samples "
-        "            WHERE trade_date>=:start_date AND trade_date<=:end_date) s "
-        "ON t.ts_code=s.ts_code AND t.trade_date=s.trade_date"
-    )
     chunks = _date_chunks(dr.start_date, dr.end_date, chunk_days)
     if verbose:
         print("[load_pool] query start", dr.start_date, dr.end_date, "chunks=", len(chunks), flush=True)
@@ -94,15 +95,7 @@ def load_pool_merged_dataset_iter(dr: PoolDataRangeConfig, chunk_days: int = 30,
             t1 = time.perf_counter()
             if verbose:
                 print("[load_pool] chunk", i, "/", len(chunks), "s+b rows=", len(df_sb), "elapsed=", round(t1 - t0, 3), "s", flush=True)
-            t2 = time.perf_counter()
-            if verbose:
-                print("[load_pool] chunk", i, "/", len(chunks), "t query", s, e, flush=True)
-            df_t = pd.read_sql(text(sql_t), conn, params={"start_date": s, "end_date": e}, parse_dates=["trade_date"])
-            df_t = df_t.loc[:, ~df_t.columns.duplicated()]
-            t3 = time.perf_counter()
-            if verbose:
-                print("[load_pool] chunk", i, "/", len(chunks), "t rows=", len(df_t), "elapsed=", round(t3 - t2, 3), "s", flush=True)
-            df = pd.merge(df_sb, df_t, on=["ts_code", "trade_date"], how="left")
+            df = df_sb
             df = df.loc[:, ~df.columns.duplicated()]
             df["trade_date"] = df["trade_date"].dt.date
             if dr.label_col in df.columns:
@@ -126,8 +119,7 @@ def load_pool_merged_dataset(dr: PoolDataRangeConfig, enable_3day_features: bool
     if df.empty:
         raise RuntimeError("No samples found in stock_pool_ml_samples for given range.")
     if enable_3day_features:
-        df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=2, use_mean3=True)
-    df = add_lag1_and_delta_features(df, KEY_TS_FEATURES)
+        df = add_3day_features(df, LAG_BASE_FEATURES, n_lags=4, use_mean3=False)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if dr.label_col not in numeric_cols:
         raise RuntimeError("Label column not found in numeric columns.")

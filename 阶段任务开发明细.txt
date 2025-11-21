@@ -1,118 +1,818 @@
-一、要做的事一共 3 步
+一、整体架构思路（在现有项目上叠一层 “单品种实验室”）
 
-在日频特征里计算 20 日平均成交额列（amount_20d_avg）
+目标：
 
-在训练样本构建阶段加一条过滤条件：amount_20d_avg ≥ 1e8
+只做「一只标的的实验室」：
 
-在每日选股 / 算仓位时，同样先用这个条件过滤
+数据：用 pytdx 按需拉取 K 线，不写入 K 线库。
 
-下面分别说。
+特征：以 ICT（smartmoneyconcepts）为主，谐波（pyharmonics）为辅。
 
-二、Step 1：计算 20 日平均成交额 amount_20d_avg
-方案 A：在数据库里用 SQL 窗口函数计算（推荐）
+回测：一个极简的 bar 级回测引擎，只为验证思路。
 
-假设你日频表里已经有：
+UI：用 Streamlit 做交互，只能一次选一个品种、一个周期，但预留「品种类型」入口。
 
-表：stock_tick_daily_features 或 stock_kline / stock_bollinger_data
+分层：
 
-字段：ts_code, trade_date, amount_sum（或 amount）
+数据层（DataSource）
 
-可以在建表或建视图的时候加一列：
+你项目里已经有 DataSource 抽象 + PytdxDataSource。
 
-ALTER TABLE stock_tick_daily_features
-    ADD COLUMN amount_20d_avg NUMERIC;
+新增一个 data/source_factory.py：根据品种类型（股票 / 期货 / 国债）返回对应数据源。
 
-UPDATE stock_tick_daily_features AS t
-SET amount_20d_avg = sub.amount_20d_avg
-FROM (
-    SELECT
-        ts_code,
-        trade_date,
-        AVG(amount_sum) OVER (
-            PARTITION BY ts_code
-            ORDER BY trade_date
-            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-        ) AS amount_20d_avg
-    FROM stock_tick_daily_features
-) AS sub
-WHERE t.ts_code = sub.ts_code
-  AND t.trade_date = sub.trade_date;
+当前先只实现 stock -> PytdxDataSource，期货/国债先占位，未来扩展。
 
+特征层（Features / Patterns）
 
-说明：
+新增 factors/ict_smc.py：
 
-这就是严格的“过去 20 个交易日（含当日）平均成交额”；
+封装 smartmoneyconcepts：FVG、Swing High/Low、BOS / CHOCH、Order Block、Liquidity。
 
-如果你更谨慎，可以改成用到 t-1 为止（排除当日）：ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING；
+对返回的 DataFrame 做一次整理，统一加上前缀，如 ict_choch_flag、ict_ob_top 等。
 
-用的是窗口函数，不会用到未来数据。
+新增 factors/harmonic_patterns.py：
 
-之后，ETL 定时任务跑完 tick 日聚合后，可以顺带跑这个 UPDATE，或者做成视图。
+封装 pyharmonics，搜索 ABC / ABCD / XABCD 谐波形态。
 
-方案 B：在加载特征的 Python 里滚动计算
+返回一个 HarmonicPattern 列表，里面有 x/y、完成区间等，方便画线。
 
-如果你倾向在 Python 里做（比如已经读了一个大 df），伪代码如下：
+回测层（简易 bar 引擎）
 
-def add_amount_20d_avg(df: pd.DataFrame) -> pd.DataFrame:
-    # df 至少包含: ts_code, trade_date, amount_sum
-    df = df.sort_values(["ts_code", "trade_date"])
-    df["amount_20d_avg"] = (
-        df.groupby("ts_code")["amount_sum"]
-          .transform(lambda s: s.rolling(20, min_periods=10).mean())
-    )
-    return df
+新增 backtest/bar_backtest.py：
 
+输入：bars（K 线） + signal（目标持仓：1 多 / 0 空 / -1 空头）。
 
-然后在你 load 日频特征的地方，加上这一行即可。
+输出：交易列表 + 资金曲线。
 
-三、Step 2：训练样本构建时加流动性过滤
+每次用 1 单位仓位，逻辑简单，但足够用来做实验。
 
-你现在 Stock Pool Ml Samples 是从 stock_bollinger_data + tick 特征合并出来的，对吧。
+UI 层（Streamlit 单品种实验室）
 
-在你构建样本/载入样本时，加一条过滤：
+新增 ui/asset_lab_app.py：
 
-# 假设 df_pool 里已经 merge 进了 amount_20d_avg
-LIQ_THRES = 1e8  # 1 亿
+侧边栏：
 
-before = len(df_pool)
-df_pool = df_pool[df_pool["amount_20d_avg"] >= LIQ_THRES].copy()
-after = len(df_pool)
+品种类型：股票 (A股) / 股指期货(占位) / 国债期货(占位)。
 
-print(f"[build_pool] liquidity filter: {before} -> {after} rows "
-      f"(amount_20d_avg >= {LIQ_THRES:.0f})")
+周期：日线、60/30/15/5 分钟。
+
+K 线数量（最近 N 根）。
+
+是否叠加 ICT / 谐波、是否跑示例回测。
+
+股票下拉：复用你 DB 里的 stock_basic（get_all_stock_basics）。
+
+主区：
+
+用 Pytdx 拉取 K 线。
+
+按勾选计算 ICT 结构 & 谐波形态。
+
+用 Plotly 画 K 线 + ICT（CHOCH 点、Order Block 顶部）+ 谐波结构线。
+
+用一个「基于 CHOCH 的多头示例策略」跑极简回测，展示交易明细 + 资金曲线。
+
+二、开发步骤（具体要做什么）
+
+安装依赖（新项目分支执行）：
+
+pip install smartmoneyconcepts pyharmonics streamlit plotly
 
 
-要注意两点：
+新增数据源工厂：data/source_factory.py
 
-只用历史数据算的 20 日平均（前面已经保证了）；
+from __future__ import annotations
 
-训练阶段和实盘阶段用完全一致的过滤逻辑，避免 train-test mismatch。
+from typing import Literal
 
-如果你是在 SQL 里先筛选股票池再写入 stock_pool_ml_samples，也可以直接写：
+from data.base_source import DataSource
+from data.pytdx_source import PytdxDataSource
 
-WHERE amount_20d_avg >= 100000000
 
-四、Step 3：实盘选股 / 仓位控制时加这个条件
+AssetType = Literal["stock", "index_future", "gov_bond"]
 
-当你每天做“选股 + 算仓位”时，在那一步的 universe 过滤里，加一条简单规则：
 
-def filter_universe_liquidity(df_today, thres=1e8):
+def get_data_source(asset_type: AssetType) -> DataSource:
     """
-    df_today: 当日候选股票的截面数据
-              必须包含 amount_20d_avg（可以是 t 或 t-1）
+    根据品种类型返回对应的数据源实现。
+
+    当前实现：
+    - stock: 使用 PytdxDataSource
+    - 其他类型暂未实现，抛出 NotImplementedError（未来可以接入期货、国债等数据源）。
     """
-    mask = df_today["amount_20d_avg"] >= thres
-    df_filt = df_today[mask].copy()
-    print(
-        f"[universe] liquidity filter: {len(df_today)} -> {len(df_filt)} "
-        f"(amount_20d_avg >= {thres:.0f})"
+    if asset_type == "stock":
+        return PytdxDataSource()
+
+    # 预留扩展点
+    raise NotImplementedError(f"asset_type={asset_type} 暂未实现对应的数据源")
+
+
+新增 ICT 封装：factors/ict_smc.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import pandas as pd
+from smartmoneyconcepts import smc
+
+
+@dataclass
+class ICTConfig:
+    swing_length: int = 20
+    fvg_join_consecutive: bool = True
+    liquidity_range_percent: float = 0.01
+    bos_close_break: bool = True
+    ob_close_mitigation: bool = False
+
+
+def _prepare_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    统一整理为 smartmoneyconcepts 需要的 OHLC 结构：
+    - 必须包含 open/high/low/close 列（小写）
+    - volume 可选，如不存在则补 0
+    """
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺少必要字段: {missing}")
+
+    ohlc = df.copy()
+    # 允许 volume 缺失
+    if "volume" not in ohlc.columns:
+        ohlc["volume"] = 0.0
+
+    # smartmoneyconcepts 默认使用小写字段名
+    ohlc = ohlc[["open", "high", "low", "close", "volume"]].copy()
+    ohlc.columns = [c.lower() for c in ohlc.columns]
+    return ohlc
+
+
+def compute_ict_structures(bars: pd.DataFrame, config: Optional[ICTConfig] = None) -> pd.DataFrame:
+    """
+    基于 smartmoneyconcepts.smc，对传入的 K 线数据计算 ICT 结构信息，并把结果拼回原 DataFrame。
+
+    参数
+    ----
+    bars : DataFrame
+        至少包含 ['datetime','open','high','low','close'] 列，按时间升序。
+    config : ICTConfig
+        算法相关参数。
+
+    返回
+    ----
+    result : DataFrame
+        在原有字段基础上增加一组以 ict_ 开头的列。
+    """
+    if config is None:
+        config = ICTConfig()
+
+    if "datetime" in bars.columns:
+        df = bars.sort_values("datetime").reset_index(drop=True).copy()
+    else:
+        df = bars.sort_index().reset_index(drop=True).copy()
+
+    ohlc = _prepare_ohlc(df)
+
+    # 1) Fair Value Gap
+    fvg = smc.fvg(ohlc, join_consecutive=config.fvg_join_consecutive)
+
+    # 2) Swing High / Low
+    swings = smc.swing_highs_lows(ohlc, swing_length=config.swing_length)
+
+    # 3) BOS / CHOCH
+    bos = smc.bos_choch(ohlc, swings, close_break=config.bos_close_break)
+
+    # 4) Order Blocks
+    ob = smc.ob(ohlc, swings, close_mitigation=config.ob_close_mitigation)
+
+    # 5) Liquidity
+    liq = smc.liquidity(ohlc, swings, range_percent=config.liquidity_range_percent)
+
+    out = df.copy()
+
+    # ---- FVG ----
+    if fvg is not None and not fvg.empty:
+        fvg = fvg.reset_index(drop=True)
+        for src, dst in [
+            ("FVG", "ict_fvg_flag"),
+            ("Top", "ict_fvg_top"),
+            ("Bottom", "ict_fvg_bottom"),
+            ("MitigatedIndex", "ict_fvg_mitigated_index"),
+        ]:
+            if src in fvg.columns:
+                out[dst] = fvg[src]
+
+    # ---- Swing High / Low ----
+    if swings is not None and not swings.empty:
+        swings = swings.reset_index(drop=True)
+        if "HighLow" in swings.columns:
+            out["ict_sw_highlow"] = swings["HighLow"]
+        if "Level" in swings.columns:
+            out["ict_sw_level"] = swings["Level"]
+
+    # ---- BOS / CHOCH ----
+    if bos is not None and not bos.empty:
+        bos = bos.reset_index(drop=True)
+        for src, dst in [
+            ("BOS", "ict_bos_flag"),
+            ("CHOCH", "ict_choch_flag"),
+            ("Level", "ict_bos_level"),
+            ("BrokenIndex", "ict_bos_broken_index"),
+        ]:
+            if src in bos.columns:
+                out[dst] = bos[src]
+
+    # ---- Order Blocks ----
+    if ob is not None and not ob.empty:
+        ob = ob.reset_index(drop=True)
+        for src, dst in [
+            ("OB", "ict_ob_flag"),
+            ("Top", "ict_ob_top"),
+            ("Bottom", "ict_ob_bottom"),
+            ("OBVolume", "ict_ob_volume"),
+            ("Percentage", "ict_ob_strength"),
+        ]:
+            if src in ob.columns:
+                out[dst] = ob[src]
+
+    # ---- Liquidity ----
+    if liq is not None and not liq.empty:
+        liq = liq.reset_index(drop=True)
+        for src, dst in [
+            ("Liquidity", "ict_liq_flag"),
+            ("Level", "ict_liq_level"),
+            ("End", "ict_liq_end_index"),
+            ("Swept", "ict_liq_swept_index"),
+        ]:
+            if src in liq.columns:
+                out[dst] = liq[src]
+
+    return out
+
+
+新增谐波封装：factors/harmonic_patterns.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Literal
+
+import pandas as pd
+
+from pyharmonics.technicals import Technicals
+from pyharmonics.search import HarmonicSearch
+
+
+PatternFamily = Literal["ABC", "ABCD", "XABCD"]
+
+
+@dataclass
+class HarmonicPattern:
+    family: PatternFamily
+    name: str
+    bullish: bool
+    formed: bool
+    x: List[pd.Timestamp]
+    y: List[float]
+    completion_min_price: float
+    completion_max_price: float
+
+
+def detect_harmonic_patterns(
+    bars: pd.DataFrame,
+    ts_code: str,
+    interval: str,
+) -> List[HarmonicPattern]:
+    """
+    使用 pyharmonics 在给定的 K 线数据上搜索谐波形态（ABC / ABCD / XABCD）。
+
+    参数
+    ----
+    bars : DataFrame
+        至少包含 ['datetime','open','high','low','close'] 列，按时间升序。
+    ts_code : str
+        代码，用于 pyharmonics 的 symbol。
+    interval : str
+        周期字符串，用于 pyharmonics 的 interval（例如 '1D','60m' 等）。
+    """
+    if "datetime" in bars.columns:
+        df = bars.sort_values("datetime").copy()
+        df = df.set_index("datetime")
+    else:
+        df = bars.sort_index().copy()
+
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺少必要字段: {missing}")
+
+    # pyharmonics 要求列名为 open/high/low/close/volume
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+
+    ohlc = df[["open", "high", "low", "close", "volume"]].copy()
+
+    tech = Technicals(ohlc, ts_code, interval)
+    searcher = HarmonicSearch(tech)
+    searcher.search()
+
+    patterns_raw = searcher.get_patterns()
+
+    results: List[HarmonicPattern] = []
+
+    # patterns_raw 是一个 dict，key 为 searcher.XABCD / ABCD / ABC，值为列表
+    family_map: Dict[PatternFamily, int] = {
+        "XABCD": searcher.XABCD,
+        "ABCD": searcher.ABCD,
+        "ABC": searcher.ABC,
+    }
+
+    for fam_name, key in family_map.items():
+        pat_list = patterns_raw.get(key, [])
+        for p in pat_list:
+            # docs: p.x, p.y, p.name, p.bullish, p.formed, completion_min_price, completion_max_price
+            results.append(
+                HarmonicPattern(
+                    family=fam_name,
+                    name=str(getattr(p, "name", fam_name)),
+                    bullish=bool(getattr(p, "bullish", True)),
+                    formed=bool(getattr(p, "formed", False)),
+                    x=list(getattr(p, "x", [])),
+                    y=[float(v) for v in getattr(p, "y", [])],
+                    completion_min_price=float(getattr(p, "completion_min_price", 0.0)),
+                    completion_max_price=float(getattr(p, "completion_max_price", 0.0)),
+                )
+            )
+
+    return results
+
+
+新增极简 bar 回测引擎：backtest/bar_backtest.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Literal, Optional
+
+import numpy as np
+import pandas as pd
+
+
+Side = Literal["long", "short"]
+
+
+@dataclass
+class Trade:
+    entry_index: int
+    exit_index: int
+    side: Side
+    entry_price: float
+    exit_price: float
+
+    @property
+    def pnl(self) -> float:
+        delta = self.exit_price - self.entry_price
+        return delta if self.side == "long" else -delta
+
+    @property
+    def return_pct(self) -> float:
+        if self.entry_price == 0:
+            return 0.0
+        return self.pnl / self.entry_price
+
+
+@dataclass
+class BacktestResult:
+    trades: List[Trade]
+    equity_curve: pd.Series  # index 与 bars.index 对齐
+    signal: pd.Series
+
+
+def run_backtest_one_unit(
+    bars: pd.DataFrame,
+    signal: pd.Series,
+    initial_capital: float = 100_000.0,
+) -> BacktestResult:
+    """
+    一个极简的单品种回测：
+    - signal: 1 = 做多，0 = 空仓，-1 = 做空
+    - 每次满仓 1 手（1 单位），不考虑手续费和滑点
+    - 在当前 bar 的收盘价换仓（仅用于实验，不用于真实回测）
+
+    返回
+    ----
+    BacktestResult:
+        - trades: 所有交易记录
+        - equity_curve: 资金曲线
+        - signal: 规范化后的信号（索引对齐到 bars）
+    """
+    if "close" not in bars.columns:
+        raise ValueError("bars 必须包含 'close' 列")
+
+    close = bars["close"].astype(float).values
+    signal = signal.reindex(bars.index).fillna(0.0).astype(float).values
+
+    n = len(close)
+    pos = 0  # 当前持仓：1=多，-1=空，0=空仓
+    trades: List[Trade] = []
+    equity = np.zeros(n, dtype=float)
+    capital = initial_capital
+    entry_price: Optional[float] = None
+    entry_idx: Optional[int] = None
+    entry_side: Optional[Side] = None
+
+    for i in range(n):
+        target = int(np.sign(signal[i]))
+        price = close[i]
+
+        # 换仓逻辑：任何 pos != target 都在当前 bar 收盘价调仓
+        if target != pos:
+            # 先平旧仓
+            if pos != 0 and entry_price is not None and entry_idx is not None and entry_side is not None:
+                t = Trade(
+                    entry_index=entry_idx,
+                    exit_index=i,
+                    side=entry_side,
+                    entry_price=float(entry_price),
+                    exit_price=float(price),
+                )
+                capital += t.pnl  # 单位持仓，直接累加 PnL
+                trades.append(t)
+
+            # 开新仓
+            if target != 0:
+                pos = target
+                entry_price = float(price)
+                entry_idx = i
+                entry_side = "long" if target > 0 else "short"
+            else:
+                pos = 0
+                entry_price = None
+                entry_idx = None
+                entry_side = None
+
+        # 更新资金曲线：按当前浮动盈亏更新
+        if pos == 0 or entry_price is None:
+            equity[i] = capital
+        else:
+            floating = (price - entry_price) if pos > 0 else (entry_price - price)
+            equity[i] = capital + floating
+
+    # 收盘仍有仓位，强制平仓
+    if pos != 0 and entry_price is not None and entry_idx is not None and entry_side is not None:
+        t = Trade(
+            entry_index=entry_idx,
+            exit_index=n - 1,
+            side=entry_side,
+            entry_price=float(entry_price),
+            exit_price=float(close[-1]),
+        )
+        capital += t.pnl
+        trades.append(t)
+        equity[-1] = capital
+
+    equity_curve = pd.Series(equity, index=bars.index, name="equity")
+
+    return BacktestResult(
+        trades=trades,
+        equity_curve=equity_curve,
+        signal=pd.Series(signal, index=bars.index, name="signal"),
     )
-    return df_filt
 
 
-然后在你的选股逻辑里：
+新增 Streamlit 单品种实验室：ui/asset_lab_app.py
 
-df_today = load_today_features(...)
-df_today = filter_universe_liquidity(df_today, thres=1e8)
+from __future__ import annotations
 
-# 再按 pred_ret_10d 排序，选择 top N，算权重等
+import os
+import sys
+from typing import List, Dict, Tuple
+
+# 把项目根目录加入 sys.path，方便在 ui/ 下直接运行
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from data.repository import get_all_stock_basics
+from data.source_factory import get_data_source, AssetType
+from factors.ict_smc import compute_ict_structures, ICTConfig
+from factors.harmonic_patterns import detect_harmonic_patterns
+from backtest.bar_backtest import run_backtest_one_unit
+
+
+ASSET_LABEL_TO_CODE: Dict[str, AssetType] = {
+    "股票 (A股)": "stock",
+    "股指期货 (占位)": "index_future",
+    "国债期货 (占位)": "gov_bond",
+}
+
+
+def _load_stock_universe() -> Tuple[List[str], Dict[str, str]]:
+    """
+    从 stock_basic 表加载股票列表。
+    返回 (ts_codes, code_to_name)。
+    """
+    basics = get_all_stock_basics()
+    if not basics:
+        return [], {}
+    ts_codes: List[str] = [b.ts_code for b in basics]
+    names: List[str] = [getattr(b, "name", b.ts_code) for b in basics]
+    code_to_name = dict(zip(ts_codes, names))
+    return ts_codes, code_to_name
+
+
+def _load_bars(
+    asset_type: AssetType,
+    ts_code: str,
+    freq_label: str,
+    bar_count: int,
+) -> pd.DataFrame:
+    """
+    使用统一的数据源接口按需拉取 K 线。
+    当前仅实现股票通过 Pytdx 获取。
+    """
+    ds = get_data_source(asset_type)
+
+    if freq_label == "日线":
+        bars = ds.get_daily_bars(ts_code, count=bar_count)
+    else:
+        freq_map = {
+            "60分钟": "60m",
+            "30分钟": "30m",
+            "15分钟": "15m",
+            "5分钟": "5m",
+        }
+        freq = freq_map.get(freq_label)
+        if freq is None:
+            raise ValueError(f"不支持的周期: {freq_label}")
+        bars = ds.get_minute_bars(ts_code, freq=freq, count=bar_count)
+
+    if bars is None or bars.empty:
+        raise RuntimeError(f"{ts_code} 在 {freq_label} 周期没有拉到数据")
+
+    # 只保留常用字段
+    keep_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in bars.columns]
+    bars = bars[keep_cols].copy()
+    # 保证时间升序
+    if "datetime" in bars.columns:
+        bars = bars.sort_values("datetime")
+    return bars.reset_index(drop=True)
+
+
+def _build_demo_signal(df: pd.DataFrame) -> pd.Series:
+    """
+    一个非常简单的示例信号：
+    - ict_choch_flag > 0 后开始持有多头
+    - ict_choch_flag < 0 时平仓
+    仅用于演示，不建议直接用于真实策略。
+    """
+    if "ict_choch_flag" not in df.columns:
+        return pd.Series(0, index=df.index, name="signal")
+
+    raw = df["ict_choch_flag"].fillna(0)
+    pos_list: List[int] = []
+    pos = 0
+    for v in raw:
+        if v > 0:
+            pos = 1
+        elif v < 0:
+            pos = 0
+        pos_list.append(pos)
+
+    return pd.Series(pos_list, index=df.index, name="signal")
+
+
+def _plot_main_chart(
+    df: pd.DataFrame,
+    ts_code: str,
+    show_ict: bool,
+    show_harmonics: bool,
+):
+    if "datetime" not in df.columns:
+        x = df.index
+    else:
+        x = df["datetime"]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Candlestick(
+            x=x,
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="K线",
+        )
+    )
+
+    # 叠加 ICT 结构（示例：CHOCH + Order Block 顶）
+    if show_ict:
+        if "ict_choch_flag" in df.columns:
+            bull_idx = df.index[df["ict_choch_flag"] > 0]
+            bear_idx = df.index[df["ict_choch_flag"] < 0]
+            if len(bull_idx) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x.iloc[bull_idx] if hasattr(x, "iloc") else [x[i] for i in bull_idx],
+                        y=df.loc[bull_idx, "close"],
+                        mode="markers",
+                        marker=dict(size=8, symbol="triangle-up"),
+                        name="Bull CHOCH",
+                    )
+                )
+            if len(bear_idx) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x.iloc[bear_idx] if hasattr(x, "iloc") else [x[i] for i in bear_idx],
+                        y=df.loc[bear_idx, "close"],
+                        mode="markers",
+                        marker=dict(size=8, symbol="triangle-down"),
+                        name="Bear CHOCH",
+                    )
+                )
+
+        # 简单展示最近若干个 Order Block 顶部水平线
+        if "ict_ob_top" in df.columns and "ict_ob_flag" in df.columns:
+            ob_idx = df.index[df["ict_ob_flag"].fillna(0) != 0]
+            ob_idx = list(ob_idx)[-5:]  # 只画最近 5 个
+            for i in ob_idx:
+                y = df.at[i, "ict_ob_top"]
+                fig.add_hline(y=y, line_width=1, annotation_text="OB", annotation_position="top left")
+
+    # 叠加谐波形态：将每个 pattern 的 X/A/B/C/D 连成线
+    if show_harmonics and "harmonic_patterns" in df.attrs:
+        patterns = df.attrs["harmonic_patterns"]
+        for p in patterns:
+            if not p.formed:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=p.x,
+                    y=p.y,
+                    mode="lines+markers",
+                    name=f"{p.family}-{p.name}",
+                )
+            )
+
+    fig.update_layout(
+        xaxis_title="时间",
+        yaxis_title="价格",
+        xaxis_rangeslider_visible=False,
+        height=600,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _plot_equity_curve(equity: pd.Series):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity"))
+    fig.update_layout(
+        xaxis_title="时间",
+        yaxis_title="资金",
+        height=300,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def main():
+    st.set_page_config(page_title="单品种 ICT + 谐波 实验室", layout="wide")
+
+    st.title("单品种 ICT + 谐波 实验室")
+    st.markdown(
+        "以 **ICT 结构为主，谐波形态为辅** 的单品种实验环境。\n\n"
+        "当前版本：仅支持 A 股股票，通过 Pytdx 按需拉取 K 线，不落地数据库。"
+    )
+
+    # =============== 侧边栏：基础参数 ===============
+    asset_label = st.sidebar.selectbox("选择品种", list(ASSET_LABEL_TO_CODE.keys()))
+    asset_type = ASSET_LABEL_TO_CODE[asset_label]
+
+    if asset_type != "stock":
+        st.sidebar.warning("当前数据源仅实现了股票，其它品种先作为占位，未来接入期货 / 国债数据源。")
+
+    freq_label = st.sidebar.selectbox("周期", ["日线", "60分钟", "30分钟", "15分钟", "5分钟"])
+    bar_count = st.sidebar.slider("K 线数量（最近 N 根）", min_value=100, max_value=1000, value=300, step=50)
+
+    show_ict = st.sidebar.checkbox("叠加 ICT 结构", value=True)
+    show_harmonics = st.sidebar.checkbox("叠加谐波形态", value=False)
+    run_bt = st.sidebar.checkbox("运行示例回测（基于 CHOCH）", value=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**提示：**\n- 后续可以在本项目中增加自定义策略模块，直接复用这里的 ICT / 谐波信号。")
+
+    # =============== 股票选择 ===============
+    if asset_type == "stock":
+        ts_codes, code_to_name = _load_stock_universe()
+        if not ts_codes:
+            st.error("stock_basic 为空或数据库未配置，请先跑基础数据更新任务。")
+            return
+        ts_code = st.sidebar.selectbox(
+            "选择股票",
+            options=ts_codes,
+            format_func=lambda x: f"{x} {code_to_name.get(x, '')}",
+        )
+    else:
+        ts_code = st.sidebar.text_input("手工输入代码（当前仅支持股票数据）", value="SZ.000001")
+
+    if st.sidebar.button("加载数据并计算", type="primary"):
+        try:
+            # 1) 拉取 K 线
+            bars = _load_bars(asset_type, ts_code, freq_label, bar_count)
+        except Exception as e:
+            st.error(f"拉取行情失败：{e}")
+            return
+
+        st.subheader(f"{ts_code} - 原始 K 线")
+        st.dataframe(bars.tail(10))
+
+        df = bars.copy()
+
+        # 2) 计算 ICT 结构
+        if show_ict:
+            ict_cfg = ICTConfig(swing_length=20)
+            df = compute_ict_structures(df, config=ict_cfg)
+
+        # 3) 识别谐波形态（仅在勾选时执行，避免无谓开销）
+        if show_harmonics:
+            # 将 freq_label 转为类似 '1D' / '60m' 的字符串
+            interval_map = {
+                "日线": "1D",
+                "60分钟": "60m",
+                "30分钟": "30m",
+                "15分钟": "15m",
+                "5分钟": "5m",
+            }
+            interval = interval_map.get(freq_label, "1D")
+            patterns = detect_harmonic_patterns(df, ts_code=ts_code, interval=interval)
+            # 把 patterns 存在 DataFrame 的 attrs 中，方便绘图函数使用
+            df.attrs["harmonic_patterns"] = patterns
+
+        # 4) 画主图
+        st.subheader("价格 + ICT / 谐波结构")
+        _plot_main_chart(df, ts_code, show_ict=show_ict, show_harmonics=show_harmonics)
+
+        # 5) 示例回测
+        if run_bt and show_ict:
+            st.subheader("示例回测（基于 CHOCH 的多头策略）")
+            signal = _build_demo_signal(df)
+            bt_res = run_backtest_one_unit(df, signal)
+
+            st.markdown("**交易统计**")
+            trades = bt_res.trades
+            if not trades:
+                st.info("示例策略没有产生任何交易。")
+            else:
+                trades_df = pd.DataFrame(
+                    [
+                        {
+                            "entry_index": t.entry_index,
+                            "exit_index": t.exit_index,
+                            "side": t.side,
+                            "entry_price": t.entry_price,
+                            "exit_price": t.exit_price,
+                            "pnl": t.pnl,
+                            "return_pct": t.return_pct,
+                        }
+                        for t in trades
+                    ]
+                )
+                st.dataframe(trades_df)
+
+                equity = bt_res.equity_curve
+                total_ret = equity.iloc[-1] / equity.iloc[0] - 1.0 if len(equity) > 1 else 0.0
+                dd = (equity.cummax() - equity) / equity.cummax()
+                max_dd = dd.max() if not dd.empty else 0.0
+
+                st.markdown(
+                    f"- 总收益率：{total_ret:.2%}\n"
+                    f"- 最大回撤：{max_dd:.2%}\n"
+                    f"- 交易笔数：{len(trades)}"
+                )
+
+                st.markdown("**资金曲线**")
+                _plot_equity_curve(equity)
+
+        # 6) 底部信息
+        st.markdown("---")
+        st.markdown(
+            "当前页面只是一个 **研究环境（lab）**：\n"
+            "- 上游使用 Pytdx 即时拉取数据，不写入数据库；\n"
+            "- 中间层抽象出 ICT / 谐波特征；\n"
+            "- 下游用一个极简回测引擎做验证。\n\n"
+            "未来如果要做成正式量化策略，可以：\n"
+            "1. 把本页面中的数据获取和特征计算封装成独立模块；\n"
+            "2. 在 `strategy/` 下实现基于 ICT + 谐波的策略类；\n"
+            "3. 在 `backtest/engine.py` 或新的 bar 级引擎中接入这些策略。"
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -21,7 +21,6 @@ def create_stock_pool_ml_samples_table() -> None:
                 "CREATE TABLE IF NOT EXISTS stock_pool_ml_samples ("
                 "ts_code text NOT NULL,"
                 "trade_date date NOT NULL,"
-                "amount_20d_avg double precision,"
                 "y_ret_10d double precision,"
                 "created_at timestamp without time zone DEFAULT now(),"
                 "PRIMARY KEY (ts_code, trade_date)"
@@ -30,7 +29,6 @@ def create_stock_pool_ml_samples_table() -> None:
             conn.execute(text(ddl))
         else:
             conn.execute(text("ALTER TABLE stock_pool_ml_samples ADD COLUMN IF NOT EXISTS trade_date date"))
-            conn.execute(text("ALTER TABLE stock_pool_ml_samples ADD COLUMN IF NOT EXISTS amount_20d_avg double precision"))
             conn.execute(text("ALTER TABLE stock_pool_ml_samples ADD COLUMN IF NOT EXISTS y_ret_10d double precision"))
             conn.execute(text("ALTER TABLE stock_pool_ml_samples ADD COLUMN IF NOT EXISTS created_at timestamp without time zone DEFAULT now()"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_spms_ts_trade ON stock_pool_ml_samples(ts_code, trade_date)"))
@@ -57,21 +55,15 @@ def insert_samples_for_window(window_start: dt.date, window_end: dt.date) -> Non
         "DELETE FROM stock_pool_ml_samples WHERE trade_date >= :start_date AND trade_date <= :end_date"
     )
     insert_sql = (
-        "INSERT INTO stock_pool_ml_samples (ts_code, trade_date, y_ret_10d, amount_20d_avg) "
-        "SELECT s.ts_code, s.trade_date, s.y_ret_10d, d.amount_20d_avg FROM ("
+        "INSERT INTO stock_pool_ml_samples (ts_code, trade_date, y_ret_10d) "
+        "SELECT ts_code, trade_date, y_ret_10d FROM ("
         "SELECT ts_code, trade_date::date AS trade_date, y_ret_10d, band_width_zscore, v_band_width_zscore, "
         "price_position, v_price_position, LAG(price_position, 1) OVER (PARTITION BY ts_code ORDER BY trade_date) AS price_position_lag1 "
         "FROM stock_bollinger_data WHERE trade_date >= :start_date AND trade_date <= :end_date AND y_ret_10d IS NOT NULL"
-        ") s INNER JOIN ("
-        "SELECT ts_code, trade_date::date AS trade_date, "
-        "AVG(amount) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS amount_20d_avg "
-        "FROM stock_daily WHERE trade_date >= :start_date AND trade_date <= :end_date"
-        ") d ON s.ts_code = d.ts_code AND s.trade_date = d.trade_date "
-        "WHERE s.band_width_zscore < 0.5 AND s.v_band_width_zscore < 0.5 "
-        "AND s.price_position_lag1 IS NOT NULL AND s.price_position > s.price_position_lag1 "
-        "AND s.price_position <= 60 AND s.v_price_position <= 40 "
-        "AND d.amount_20d_avg >= 100000000 "
-        "ON CONFLICT (ts_code, trade_date) DO UPDATE SET y_ret_10d=EXCLUDED.y_ret_10d, amount_20d_avg=EXCLUDED.amount_20d_avg"
+        ") s WHERE band_width_zscore < 0.5 AND v_band_width_zscore < 0.5 "
+        "AND price_position_lag1 IS NOT NULL AND price_position > price_position_lag1 "
+        "AND price_position <= 60 AND v_price_position <= 40 "
+        "ON CONFLICT (ts_code, trade_date) DO NOTHING"
     )
     with eng.begin() as conn:
         conn.execute(text(delete_sql), {"start_date": window_start, "end_date": window_end})

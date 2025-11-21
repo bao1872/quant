@@ -101,7 +101,7 @@ def train_from_pool(drop_tail: bool | None = None):
     print("[train] load start", flush=True)
     t0 = time.perf_counter()
     use_drop = USE_DROP_TAIL_FEATURES if drop_tail is None else drop_tail
-    df, feature_cols, label_col = load_pool_merged_dataset(dr, enable_3day_features=False, verbose=False, drop_tail=use_drop)
+    df, feature_cols, label_col = load_pool_merged_dataset(dr, enable_3day_features=True, verbose=False, drop_tail=use_drop)
     t1 = time.perf_counter()
     print("[train] load done shape=", df.shape, "features=", len(feature_cols), "elapsed=", round(t1 - t0, 3), "s", flush=True)
     t2 = time.perf_counter()

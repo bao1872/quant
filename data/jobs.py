@@ -36,6 +36,33 @@ import pyarrow.parquet as pq
 def job_update_ohlc(trade_date: _date) -> None:
     print(f"[job_update_ohlc] trade_date={trade_date}")
     update_daily_bars(trade_date=trade_date, count=600)
+    job_update_minute_60m(trade_date)
+    job_update_minute_15m(trade_date)
+
+
+def _validate_minute_for_date(d: _date) -> int:
+    eng = get_engine()
+    with eng.connect() as conn:
+        dfc = pd.read_sql(text("select count(1) as c from stock_minute where trade_date=:d"), conn, params={"d": d})
+    cnt = int(pd.to_numeric(dfc.get("c", pd.Series([0])), errors="coerce").fillna(0).iloc[0]) if not dfc.empty else 0
+    print(f"[validate_minute] rows@{d}={cnt}")
+    return cnt
+
+
+def job_update_minute_60m(trade_date: _date) -> None:
+    print(f"[job_update_minute_60m] trade_date={trade_date}")
+    update_minute_bars(trade_date=trade_date, freq="60m", count=240)
+    n = _validate_minute_for_date(trade_date)
+    if n == 0:
+        print("[job_update_minute_60m] empty result")
+
+
+def job_update_minute_15m(trade_date: _date) -> None:
+    print(f"[job_update_minute_15m] trade_date={trade_date}")
+    update_minute_bars(trade_date=trade_date, freq="15m", count=240)
+    n = _validate_minute_for_date(trade_date)
+    if n == 0:
+        print("[job_update_minute_15m] empty result")
 
 
 def job_collect_full_day_ticks(trade_date: _date) -> None:
