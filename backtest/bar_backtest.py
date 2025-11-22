@@ -14,17 +14,21 @@ class Trade:
     side: str
     entry_price: float
     exit_price: float
+    qty: int
+    stop_price: Optional[float] = None
+    target_price: Optional[float] = None
 
     @property
     def pnl(self) -> float:
-        d = self.exit_price - self.entry_price
-        return d if self.side == "long" else -d
+        d = (self.exit_price - self.entry_price) if self.side == "long" else (self.entry_price - self.exit_price)
+        return d * float(self.qty)
 
     @property
     def return_pct(self) -> float:
-        if self.entry_price == 0:
+        if self.entry_price == 0 or self.qty <= 0:
             return 0.0
-        return self.pnl / self.entry_price
+        cost = self.entry_price * float(self.qty)
+        return self.pnl / cost
 
 
 @dataclass
@@ -54,17 +58,19 @@ def run_backtest_one_unit(
     entry_price: Optional[float] = None
     entry_idx: Optional[int] = None
     entry_side: Optional[str] = None
+    qty: int = 0
     for i in range(n):
         target = int(np.sign(sig[i]))
         price = float(close[i])
         if target != pos:
-            if pos != 0 and entry_price is not None and entry_idx is not None and entry_side is not None:
+            if pos != 0 and entry_price is not None and entry_idx is not None and entry_side is not None and qty > 0:
                 exit_px_raw = price
                 exit_px = exit_px_raw * (1.0 - slippage) if entry_side == "long" else exit_px_raw * (1.0 + slippage)
-                t = Trade(entry_index=entry_idx, exit_index=i, side=entry_side, entry_price=float(entry_price), exit_price=float(exit_px))
-                fee = fee_rate * (abs(entry_price) + abs(exit_px))
+                t = Trade(entry_index=entry_idx, exit_index=i, side=entry_side, entry_price=float(entry_price), exit_price=float(exit_px), qty=int(qty))
+                fee = fee_rate * ((abs(entry_price) * qty) + (abs(exit_px) * qty))
                 capital += t.pnl - fee
                 trades.append(t)
+                qty = 0
             if target != 0:
                 pos = target
                 if target > 0:
@@ -75,21 +81,25 @@ def run_backtest_one_unit(
                     entry_side = "short"
                 entry_price = float(entry_px)
                 entry_idx = i
+                qty = int(capital // entry_price // 100 * 100)
+                if qty <= 0:
+                    qty = 0
             else:
                 pos = 0
                 entry_price = None
                 entry_idx = None
                 entry_side = None
-        if pos == 0 or entry_price is None:
+                qty = 0
+        if pos == 0 or entry_price is None or qty <= 0:
             equity[i] = capital
         else:
-            floating = (price - entry_price) if pos > 0 else (entry_price - price)
+            floating = ((price - entry_price) * qty) if pos > 0 else ((entry_price - price) * qty)
             equity[i] = capital + floating
-    if pos != 0 and entry_price is not None and entry_idx is not None and entry_side is not None:
+    if pos != 0 and entry_price is not None and entry_idx is not None and entry_side is not None and qty > 0:
         exit_px_raw = close[-1]
         exit_px = exit_px_raw * (1.0 - slippage) if entry_side == "long" else exit_px_raw * (1.0 + slippage)
-        t = Trade(entry_index=entry_idx, exit_index=n - 1, side=entry_side, entry_price=float(entry_price), exit_price=float(exit_px))
-        fee = fee_rate * (abs(entry_price) + abs(exit_px))
+        t = Trade(entry_index=entry_idx, exit_index=n - 1, side=entry_side, entry_price=float(entry_price), exit_price=float(exit_px), qty=int(qty))
+        fee = fee_rate * ((abs(entry_price) * qty) + (abs(exit_px) * qty))
         capital += t.pnl - fee
         trades.append(t)
         equity[-1] = capital

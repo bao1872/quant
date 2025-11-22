@@ -9,7 +9,7 @@ from smartmoneyconcepts import smc
 
 @dataclass
 class ICTConfig:
-    swing_length: int = 20
+    swing_length: int = 5
     fvg_join_consecutive: bool = True
     liquidity_range_percent: float = 0.01
     bos_close_break: bool = True

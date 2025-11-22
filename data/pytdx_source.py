@@ -154,13 +154,14 @@ class PytdxDataSource(DataSource):
         market, code = self.ts_code_to_tdx(ts_code)
 
         freq_map = {
-            "1m": 0,
-            "5m": 1,
-            "15m": 2,
-            "30m": 3,
-            "60m": 4,
+            "5m": 0,
+            "15m": 1,
+            "30m": 2,
+            "60m": 3,
         }
-        category = freq_map.get(freq, 0)
+        if freq not in freq_map:
+            raise ValueError(f"不支持的分钟频率: {freq}")
+        category = freq_map[freq]
 
         raw = self.api.get_security_bars(
             category=category,
