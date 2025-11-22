@@ -20,6 +20,7 @@ from factors.harmonic_patterns import detect_harmonic_patterns
 from backtest.bar_backtest import run_backtest_one_unit
 from strategy.ict_rr3_simple import generate_rr3_long_signals, backtest_fullsize_rr3
 import analysis.ob_swing_tuner as ob_swing_tuner
+from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest
 
 
 ASSET_LABEL_TO_CODE: Dict[str, str] = {
@@ -293,7 +294,11 @@ def main():
         df = _load_bars(asset_type, ts, freq_label, bar_count)
     L_list = [3, 4, 5, 6, 8, 10, 12]
     stats_map = ob_swing_tuner.evaluate_swing_lengths(df, L_list)
-    best_L = _auto_choose_swing_min(stats_map, target_width=0.01, default_L=5)
+    best_L = (
+        ob_swing_tuner.auto_choose_swing_length_min_based(stats_map, target_width=0.01, default_L=5)
+        if hasattr(ob_swing_tuner, "auto_choose_swing_length_min_based")
+        else _auto_choose_swing_min(stats_map, target_width=0.01, default_L=5)
+    )
     swing_default = int(best_L)
     swing_length = st.sidebar.slider("ICT 摆动长度 (swing_length)", min_value=1, max_value=50, value=swing_default, step=1)
     cfg_strategy = ICTConfig(swing_length=int(best_L) if best_L is not None else swing_length)
@@ -315,86 +320,58 @@ def main():
     _plot_main_chart(df, ts, show_ict, show_harm)
     
 
-    if run_rr3_bt and freq_label == "15分钟":
-        df_daily = _load_bars(asset_type, ts, "日线", max(240, bar_count))
-        df_daily_ict = compute_ict_structures(df_daily, cfg_strategy)
-        allow_long = _daily_trend_allow_long(df_daily_ict)
-        target_price = _daily_recent_high(df_daily_ict)
-        st.subheader("当前日线趋势")
-        st.write("多头" if allow_long else "空仓观望")
-        if allow_long and pd.notna(target_price) and float(target_price) > 0.0:
-            df_15m_ict = compute_ict_structures(df, cfg_strategy)
-            signals = generate_rr3_long_signals(df_15m_ict, float(target_price))
-            bt_res = backtest_fullsize_rr3(df_15m_ict, signals)
-            st.subheader("ICT R:R≥3 策略回测资金曲线")
-            if "datetime" in df_15m_ict.columns:
-                x = df_15m_ict["datetime"]
-            else:
-                x = df_15m_ict.index
-            fig_eq = go.Figure()
-            fig_eq.add_trace(go.Scatter(x=x, y=bt_res.equity_curve.values, mode="lines", name="Equity"))
-            fig_eq.update_layout(xaxis_title="时间", yaxis_title="资金", height=300)
-            st.plotly_chart(fig_eq, use_container_width=True)
-            if "datetime" in df_15m_ict.columns:
-                td_x = df_15m_ict["datetime"]
-            else:
-                td_x = df_15m_ict.index
-            if bt_res.trades:
-                rows = []
-                for t in bt_res.trades:
-                    ed = td_x.iloc[t.entry_index] if hasattr(td_x, "iloc") else td_x[t.entry_index]
-                    xd = td_x.iloc[t.exit_index] if hasattr(td_x, "iloc") else td_x[t.exit_index]
-                    rows.append({
-                        "entry_dt": ed,
-                        "exit_dt": xd,
-                        "entry_idx": int(t.entry_index),
-                        "exit_idx": int(t.exit_index),
-                        "entry_price": float(t.entry_price),
-                        "exit_price": float(t.exit_price),
-                        "stop_price": float(t.stop_price),
-                        "target_price": float(t.target_price),
-                        "rr": float(t.rr),
-                        "pnl": float(t.pnl),
-                        "side": "long",
-                    })
-                st.subheader("回测交易历史")
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                df.attrs["bt_trades"] = rows
-            st.write({"signals_count": len(signals), "target_price": float(target_price)})
-        else:
-            st.info("当前日线不允许做多或目标价无效")
-    elif run_rr3_bt:
-        if "ict_choch_flag" not in df.columns:
-            df = compute_ict_structures(df, cfg_strategy)
-        sig = _build_demo_signal(df)
-        res = run_backtest_one_unit(df, sig)
-        st.subheader("策略回测资金曲线")
-        if "datetime" in df.columns:
-            x = df["datetime"]
-        else:
-            x = df.index
+    if run_rr3_bt:
+        ds = get_data_source(asset_type)
+        daily_bars = ds.get_daily_bars(ts, count=max(240, bar_count))
+        keep = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in daily_bars.columns]
+        daily_bars = daily_bars[keep].copy().reset_index(drop=True)
+        cfg_mtf = IctMtfConfig(
+            swing_length_daily=20,
+            swing_length_exec=int(best_L) if best_L is not None else int(swing_length),
+            risk_per_trade_pct=0.01,
+        )
+        with st.spinner("运行 ICT 多周期回测..."):
+            res = run_ict_mtf_backtest(daily_bars, df, cfg_mtf)
+        st.subheader("ICT 多周期回测资金曲线")
+        x = res.equity.index
         fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(x=x, y=res.equity_curve.values, mode="lines", name="Equity"))
+        fig_eq.add_trace(go.Scatter(x=x, y=res.equity.values, mode="lines", name="Equity"))
         fig_eq.update_layout(xaxis_title="时间", yaxis_title="资金", height=300)
         st.plotly_chart(fig_eq, use_container_width=True)
+        show_debug = st.checkbox("显示调试明细（当前周期）", value=False)
+        if show_debug:
+            debug_df = res.debug.copy()
+            view_mode = st.selectbox(
+                "查看模式",
+                ["全部bar", "只看有入场机会的bar", "只看实际开仓的bar", "只看平仓bar"],
+                index=0,
+            )
+            if view_mode == "只看有入场机会的bar":
+                debug_df = debug_df[(debug_df["can_open_long"]) | (debug_df["can_open_short"])]
+            elif view_mode == "只看实际开仓的bar":
+                debug_df = debug_df[(debug_df["opened_long"]) | (debug_df["opened_short"])]
+            elif view_mode == "只看平仓bar":
+                debug_df = debug_df[debug_df["closed_pos"]]
+            st.write(f"共 {len(debug_df)} 行")
+            st.dataframe(debug_df.tail(300))
         if res.trades:
-            td_x = df["datetime"] if "datetime" in df.columns else df.index
-            rows = []
-            for t in res.trades:
-                ed = td_x.iloc[t.entry_index] if hasattr(td_x, "iloc") else td_x[t.entry_index]
-                xd = td_x.iloc[t.exit_index] if hasattr(td_x, "iloc") else td_x[t.exit_index]
-                rows.append({
-                    "entry_dt": ed,
-                    "exit_dt": xd,
-                    "entry_idx": int(t.entry_index),
-                    "exit_idx": int(t.exit_index),
-                    "side": t.side,
+            rows = [
+                {
+                    "entry_dt": t.entry_time,
+                    "exit_dt": t.exit_time,
+                    "entry_idx": None,
+                    "exit_idx": None,
                     "entry_price": float(t.entry_price),
                     "exit_price": float(t.exit_price),
-                    "pnl": float(t.pnl),
-                    "stop_price": None,
-                    "target_price": None,
-                })
+                    "stop_price": float(t.stop_price),
+                    "target_price": float(t.target_price),
+                    "qty": int(t.qty),
+                    "rr": float(t.rr),
+                    "pnl": float(t.pnl_after_fee),
+                    "side": t.side,
+                }
+                for t in res.trades
+            ]
             st.subheader("回测交易历史")
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
             df.attrs["bt_trades"] = rows
