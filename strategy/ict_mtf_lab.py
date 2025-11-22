@@ -10,10 +10,12 @@ import pandas as pd
 from factors.ict_smc import ICTConfig, compute_ict_structures
 
 
-class TrendState(str, Enum):
-    LONG = "long"
-    SHORT = "short"
-    FLAT = "flat"
+class TrendState(int, Enum):
+    STRONG_SHORT = -2
+    WEAK_SHORT = -1
+    FLAT = 0
+    WEAK_LONG = 1
+    STRONG_LONG = 2
 
 
 @dataclass
@@ -83,13 +85,96 @@ def _is_bearish_reversal(
     mid_prev = 0.5 * (prev_open + prev_close)
     return cur_close <= mid_prev
 
+def mark_bullish_reversal(df: pd.DataFrame) -> pd.Series:
+    o = pd.to_numeric(df["open"], errors="coerce").values
+    c = pd.to_numeric(df["close"], errors="coerce").values
+    prev_o = np.roll(o, 1)
+    prev_c = np.roll(c, 1)
+    is_prev_bear = prev_c < prev_o
+    is_cur_bull = c > o
+    mid_prev = 0.5 * (prev_o + prev_c)
+    recapture = c >= mid_prev
+    flag = (is_prev_bear & is_cur_bull & recapture)
+    if len(flag) > 0:
+        flag[0] = False
+    return pd.Series(flag.astype(int), index=df.index, name="bull_reversal_flag")
 
-def _compute_daily_trend(df_daily: pd.DataFrame, ict_cfg: Optional[ICTConfig] = None) -> pd.DataFrame:
-    if ict_cfg is None:
-        ict_cfg = ICTConfig()
-    df = compute_ict_structures(df_daily, ict_cfg)
-    trend_state: List[TrendState] = []
-    last_state: TrendState = TrendState.FLAT
+def mark_bearish_reversal(df: pd.DataFrame) -> pd.Series:
+    o = pd.to_numeric(df["open"], errors="coerce").values
+    c = pd.to_numeric(df["close"], errors="coerce").values
+    prev_o = np.roll(o, 1)
+    prev_c = np.roll(c, 1)
+    is_prev_bull = prev_c > prev_o
+    is_cur_bear = c < o
+    mid_prev = 0.5 * (prev_o + prev_c)
+    dump_back = c <= mid_prev
+    flag = (is_prev_bull & is_cur_bear & dump_back)
+    if len(flag) > 0:
+        flag[0] = False
+    return pd.Series(flag.astype(int), index=df.index, name="bear_reversal_flag")
+
+def mark_bullish_pinbar(df: pd.DataFrame, min_tail_ratio: float = 0.6, max_body_ratio: float = 0.3) -> pd.Series:
+    o = pd.to_numeric(df["open"], errors="coerce").values
+    h = pd.to_numeric(df["high"], errors="coerce").values
+    l = pd.to_numeric(df["low"], errors="coerce").values
+    c = pd.to_numeric(df["close"], errors="coerce").values
+    body = np.abs(c - o)
+    rng = (h - l)
+    rng[rng == 0] = np.nan
+    body_ratio = body / rng
+    lower = np.minimum(o, c)
+    upper = np.maximum(o, c)
+    lower_shadow = lower - l
+    upper_shadow = h - upper
+    tail_ratio = lower_shadow / rng
+    cond_body = body_ratio <= max_body_ratio
+    cond_tail = tail_ratio >= min_tail_ratio
+    cond_upper_short = upper_shadow <= (0.3 * rng)
+    flag = cond_body & cond_tail & cond_upper_short
+    return pd.Series(flag.astype(int), index=df.index, name="bull_pinbar_flag")
+
+def mark_bearish_pinbar(df: pd.DataFrame, min_tail_ratio: float = 0.6, max_body_ratio: float = 0.3) -> pd.Series:
+    o = pd.to_numeric(df["open"], errors="coerce").values
+    h = pd.to_numeric(df["high"], errors="coerce").values
+    l = pd.to_numeric(df["low"], errors="coerce").values
+    c = pd.to_numeric(df["close"], errors="coerce").values
+    body = np.abs(c - o)
+    rng = (h - l)
+    rng[rng == 0] = np.nan
+    body_ratio = body / rng
+    lower = np.minimum(o, c)
+    upper = np.maximum(o, c)
+    lower_shadow = lower - l
+    upper_shadow = h - upper
+    tail_ratio = upper_shadow / rng
+    cond_body = body_ratio <= max_body_ratio
+    cond_tail = tail_ratio >= min_tail_ratio
+    cond_lower_short = lower_shadow <= (0.3 * rng)
+    flag = cond_body & cond_tail & cond_lower_short
+    return pd.Series(flag.astype(int), index=df.index, name="bear_pinbar_flag")
+
+def attach_entry_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["bull_reversal_flag"] = mark_bullish_reversal(df)
+    df["bear_reversal_flag"] = mark_bearish_reversal(df)
+    df["bull_pinbar_flag"] = mark_bullish_pinbar(df)
+    df["bear_pinbar_flag"] = mark_bearish_pinbar(df)
+    df["bull_entry_signal"] = ((df["bull_reversal_flag"] == 1) | (df["bull_pinbar_flag"] == 1)).astype(int)
+    df["bear_entry_signal"] = ((df["bear_reversal_flag"] == 1) | (df["bear_pinbar_flag"] == 1)).astype(int)
+    return df
+
+
+def compute_daily_trend_with_fallback(df_daily: pd.DataFrame, swing_len: int = 20) -> pd.DataFrame:
+    ict_cfg = ICTConfig(swing_length=swing_len)
+    df = compute_ict_structures(df_daily, ict_cfg).copy()
+    close = pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").ffill().bfill()
+    bos = pd.to_numeric(df.get("ict_bos_flag", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0)
+    choch = pd.to_numeric(df.get("ict_choch_flag", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0)
+    sw = pd.to_numeric(df.get("ict_sw_highlow", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0)
+    lv = pd.to_numeric(df.get("ict_sw_level", pd.Series(np.nan, index=df.index)), errors="coerce")
+    ma_fast = close.rolling(10, min_periods=3).mean()
+    ma_slow = close.rolling(20, min_periods=5).mean()
+    trend_states: List[TrendState] = []
     long_ob_top: List[float] = []
     long_ob_bottom: List[float] = []
     short_ob_top: List[float] = []
@@ -98,24 +183,52 @@ def _compute_daily_trend(df_daily: pd.DataFrame, ict_cfg: Optional[ICTConfig] = 
     cur_long_bottom = np.nan
     cur_short_top = np.nan
     cur_short_bottom = np.nan
+    last_state = TrendState.FLAT
     for i in range(len(df)):
-        bos = float(df.get("ict_bos_flag", pd.Series(index=df.index)).iloc[i]) if "ict_bos_flag" in df.columns else 0.0
-        choch = float(df.get("ict_choch_flag", pd.Series(index=df.index)).iloc[i]) if "ict_choch_flag" in df.columns else 0.0
-        ob_flag = float(df.get("ict_ob_flag", pd.Series(index=df.index)).iloc[i]) if "ict_ob_flag" in df.columns else 0.0
         state = last_state
-        if bos > 0 or choch > 0:
-            state = TrendState.LONG
-        elif bos < 0 or choch < 0:
-            state = TrendState.SHORT
-        if last_state == TrendState.FLAT and state not in (TrendState.LONG, TrendState.SHORT):
-            state = TrendState.FLAT
-        if ob_flag > 0:
+        b = float(bos.iloc[i])
+        ch = float(choch.iloc[i])
+        ob_flag = float(df.get("ict_ob_flag", pd.Series(0, index=df.index)).iloc[i]) if "ict_ob_flag" in df.columns else 0.0
+        if b > 0 or ch > 0:
+            state = TrendState.STRONG_LONG
+        elif b < 0 or ch < 0:
+            state = TrendState.STRONG_SHORT
+        else:
+            lookback = 10
+            if i >= lookback:
+                sub_sw = sw.iloc[i - lookback + 1 : i + 1]
+                sub_lv = lv.iloc[i - lookback + 1 : i + 1]
+                highs = sub_lv[sub_sw > 0].dropna()
+                lows = sub_lv[sub_sw < 0].dropna()
+                weak_long = False
+                weak_short = False
+                if len(highs) >= 2 and len(lows) >= 2:
+                    hh = float(highs.iloc[-1]) > float(highs.iloc[-2])
+                    hl = float(lows.iloc[-1]) > float(lows.iloc[-2])
+                    if hh and hl:
+                        weak_long = True
+                    ll = float(lows.iloc[-1]) < float(lows.iloc[-2])
+                    lh = float(highs.iloc[-1]) < float(highs.iloc[-2])
+                    if ll and lh:
+                        weak_short = True
+                if not weak_long and not weak_short:
+                    if float(ma_fast.iloc[i]) > float(ma_slow.iloc[i]):
+                        weak_long = True
+                    elif float(ma_fast.iloc[i]) < float(ma_slow.iloc[i]):
+                        weak_short = True
+                if weak_long and not weak_short:
+                    state = TrendState.WEAK_LONG
+                elif weak_short and not weak_long:
+                    state = TrendState.WEAK_SHORT
+                else:
+                    state = TrendState.FLAT
+        if ob_flag > 0 and "ict_ob_top" in df.columns and "ict_ob_bottom" in df.columns:
             cur_long_top = float(df.get("ict_ob_top").iloc[i])
             cur_long_bottom = float(df.get("ict_ob_bottom").iloc[i])
-        elif ob_flag < 0:
+        elif ob_flag < 0 and "ict_ob_top" in df.columns and "ict_ob_bottom" in df.columns:
             cur_short_top = float(df.get("ict_ob_top").iloc[i])
             cur_short_bottom = float(df.get("ict_ob_bottom").iloc[i])
-        trend_state.append(state)
+        trend_states.append(state)
         long_ob_top.append(cur_long_top)
         long_ob_bottom.append(cur_long_bottom)
         short_ob_top.append(cur_short_top)
@@ -124,20 +237,25 @@ def _compute_daily_trend(df_daily: pd.DataFrame, ict_cfg: Optional[ICTConfig] = 
     out = df[[c for c in ["datetime", "close"] if c in df.columns]].copy()
     if "datetime" not in out.columns:
         out["datetime"] = df.index
-    out["trend_state"] = trend_state
+    out["trend_state"] = trend_states
     out["ob_long_top"] = long_ob_top
     out["ob_long_bottom"] = long_ob_bottom
     out["ob_short_top"] = short_ob_top
     out["ob_short_bottom"] = short_ob_bottom
+    out["trade_date"] = pd.to_datetime(out["datetime"]).dt.date
     return out
 
 
-def _price_in_range(price: float, bottom: float, top: float, tol_pct: float) -> bool:
-    if np.isnan(bottom) or np.isnan(top):
+def _price_near_ob(price: float, bottom: float, top: float, tol_pct: float, abs_tick: float = 0.01) -> bool:
+    if np.isnan(bottom) or np.isnan(top) or bottom <= 0 or top <= 0:
         return False
     lo = bottom * (1.0 - tol_pct)
     hi = top * (1.0 + tol_pct)
-    return lo <= price <= hi
+    if lo <= price <= hi:
+        return True
+    dist = min(abs(price - bottom), abs(price - top))
+    tol_abs = max(abs_tick, price * tol_pct)
+    return dist <= tol_abs
 
 
 def run_ict_mtf_backtest(
@@ -155,12 +273,11 @@ def run_ict_mtf_backtest(
         else:
             df.sort_index(inplace=True)
             df["datetime"] = df.index
-    daily_cfg = ICTConfig(swing_length=config.swing_length_daily)
-    daily_state = _compute_daily_trend(df_daily, daily_cfg)
-    daily_state["trade_date"] = pd.to_datetime(daily_state["datetime"]).dt.date
+    daily_state = compute_daily_trend_with_fallback(df_daily, swing_len=int(config.swing_length_daily))
     daily_state = daily_state.set_index("trade_date")
     exec_cfg = ICTConfig(swing_length=config.swing_length_exec)
     exec_df = compute_ict_structures(df_exec, exec_cfg).copy()
+    exec_df = attach_entry_signals(exec_df)
     exec_df["datetime"] = pd.to_datetime(exec_df["datetime"]) if "datetime" in exec_df.columns else pd.to_datetime(exec_df.index)
     exec_df["trade_date"] = exec_df["datetime"].dt.date
     merged = exec_df.merge(
@@ -173,12 +290,15 @@ def run_ict_mtf_backtest(
     def _normalize_trend_state(val) -> TrendState:
         if isinstance(val, TrendState):
             return val
+        if isinstance(val, (int, np.integer)):
+            v = int(val)
+            if v in (-2, -1, 0, 1, 2):
+                return TrendState(v)
+            return TrendState.FLAT
         if isinstance(val, str):
-            s = val.strip().lower()
-            if "long" in s:
-                return TrendState.LONG
-            if "short" in s:
-                return TrendState.SHORT
+            s = val.strip()
+            if s in {"-2", "-1", "0", "1", "2"}:
+                return TrendState(int(s))
             return TrendState.FLAT
         return TrendState.FLAT
     merged["trend_state"] = merged["trend_state"].apply(_normalize_trend_state)
@@ -224,7 +344,7 @@ def run_ict_mtf_backtest(
                 elif high >= target_price:
                     exit_px = target_price * (1.0 - config.slippage_pct)
                     exit_reason = "target"
-                elif trend == TrendState.SHORT:
+                elif trend in (TrendState.WEAK_SHORT, TrendState.STRONG_SHORT):
                     exit_px = price * (1.0 - config.slippage_pct)
                     exit_reason = "daily_flip"
             elif position_side == "short":
@@ -234,7 +354,7 @@ def run_ict_mtf_backtest(
                 elif low <= target_price:
                     exit_px = target_price * (1.0 + config.slippage_pct)
                     exit_reason = "target"
-                elif trend == TrendState.LONG:
+                elif trend in (TrendState.WEAK_LONG, TrendState.STRONG_LONG):
                     exit_px = price * (1.0 + config.slippage_pct)
                     exit_reason = "daily_flip"
             if exit_px is not None:
@@ -276,17 +396,18 @@ def run_ict_mtf_backtest(
         if position_side is None:
             can_open_long = False
             can_open_short = False
-            if trend == TrendState.LONG:
+            if trend in (TrendState.STRONG_LONG, TrendState.WEAK_LONG):
                 in_ob_long = False
                 if ob_flag > 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
                     ob_bottom = float(row["ict_ob_bottom"])
                     ob_top = float(row["ict_ob_top"])
-                    in_ob_long = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                    in_ob_long = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
                 else:
                     ob_bottom = float(row.get("ob_long_bottom", np.nan))
                     ob_top = float(row.get("ob_long_top", np.nan))
-                    in_ob_long = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
-                if in_ob_long and bull_rev:
+                    in_ob_long = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                bull_signal = int(row.get("bull_entry_signal", 0)) == 1
+                if in_ob_long and bull_signal:
                     can_open_long = True
                     if np.isnan(ob_bottom) or ob_bottom <= 0 or ob_bottom >= price:
                         stop = price * (1.0 - 0.005)
@@ -294,7 +415,8 @@ def run_ict_mtf_backtest(
                         stop = ob_bottom
                     risk_per_share = price - stop
                     if risk_per_share > 0:
-                        risk_budget = equity * config.risk_per_trade_pct
+                        risk_budget_pct = config.risk_per_trade_pct if trend == TrendState.STRONG_LONG else (config.risk_per_trade_pct * 0.5)
+                        risk_budget = equity * risk_budget_pct
                         max_position_value = equity * config.max_position_pct
                         qty = int(risk_budget / risk_per_share)
                         qty = (qty // config.lot_size) * config.lot_size
@@ -314,17 +436,18 @@ def run_ict_mtf_backtest(
                                 target_price = float(target)
                                 cash -= entry_price * position_qty
                                 opened_long = True
-            elif trend == TrendState.SHORT:
+            elif trend in (TrendState.STRONG_SHORT, TrendState.WEAK_SHORT):
                 in_ob_short = False
                 if ob_flag < 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
                     ob_top = float(row["ict_ob_top"])
                     ob_bottom = float(row["ict_ob_bottom"])
-                    in_ob_short = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                    in_ob_short = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
                 else:
                     ob_top = float(row.get("ob_short_top", np.nan))
                     ob_bottom = float(row.get("ob_short_bottom", np.nan))
-                    in_ob_short = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
-                if in_ob_short and bear_rev:
+                    in_ob_short = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                bear_signal = int(row.get("bear_entry_signal", 0)) == 1
+                if in_ob_short and bear_signal:
                     can_open_short = True
                     if np.isnan(ob_top) or ob_top <= 0 or ob_top <= price:
                         stop = price * (1.0 + 0.005)
@@ -332,7 +455,8 @@ def run_ict_mtf_backtest(
                         stop = ob_top
                     risk_per_share = stop - price
                     if risk_per_share > 0:
-                        risk_budget = equity * config.risk_per_trade_pct
+                        risk_budget_pct = config.risk_per_trade_pct if trend == TrendState.STRONG_SHORT else (config.risk_per_trade_pct * 0.5)
+                        risk_budget = equity * risk_budget_pct
                         max_position_value = equity * config.max_position_pct
                         qty = int(risk_budget / risk_per_share)
                         qty = (qty // config.lot_size) * config.lot_size
@@ -409,6 +533,11 @@ if __name__ == "__main__":
         "close": base_exec + np.sin(np.linspace(0, 20, n_exec)) * 0.1,
         "volume": np.ones(n_exec) * 10000,
     })
+    test_exec = attach_entry_signals(df_exec.copy())
+    print(int(test_exec["bull_entry_signal"].sum()))
+    print(int(test_exec["bear_entry_signal"].sum()))
+    mid_i = int(len(test_exec) // 2)
+    print(bool(_price_near_ob(price=float(test_exec["close"].iloc[mid_i]), bottom=float(test_exec["low"].iloc[mid_i]), top=float(test_exec["high"].iloc[mid_i]), tol_pct=0.005)))
     cfg = IctMtfConfig(swing_length_daily=20, swing_length_exec=5, risk_per_trade_pct=0.01)
     res = run_ict_mtf_backtest(df_daily, df_exec, cfg)
     print({"trades": len(res.trades), "equity_last": float(res.equity.iloc[-1])})

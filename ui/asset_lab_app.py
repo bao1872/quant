@@ -20,7 +20,7 @@ from factors.harmonic_patterns import detect_harmonic_patterns
 from backtest.bar_backtest import run_backtest_one_unit
 from strategy.ict_rr3_simple import generate_rr3_long_signals, backtest_fullsize_rr3
 import analysis.ob_swing_tuner as ob_swing_tuner
-from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest
+from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest, attach_entry_signals, compute_daily_trend_with_fallback, TrendState
 
 
 ASSET_LABEL_TO_CODE: Dict[str, str] = {
@@ -129,6 +129,26 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
         row=1,
         col=1,
     )
+    if "trend_state" in df.columns:
+        ts = df["trend_state"].tolist()
+        idxs = df.index.tolist()
+        start = 0
+        for i in range(1, len(ts) + 1):
+            if i == len(ts) or ts[i] != ts[start]:
+                state = ts[start]
+                x0 = x[start]
+                x1 = x[i - 1]
+                color_map = {
+                    int(TrendState.STRONG_LONG): "rgba(255,0,0,0.08)",
+                    int(TrendState.WEAK_LONG): "rgba(255,165,0,0.08)",
+                    int(TrendState.WEAK_SHORT): "rgba(135,206,250,0.08)",
+                    int(TrendState.STRONG_SHORT): "rgba(0,128,0,0.08)",
+                    int(TrendState.FLAT): None,
+                }
+                color = color_map.get(int(state), None)
+                if color is not None:
+                    fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.25, layer="below", line_width=0, row=1, col=1)
+                start = i
     if show_ict:
         if "ict_choch_flag" in df.columns:
             bull_idx = df.index[df["ict_choch_flag"] > 0]
@@ -154,6 +174,34 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
             for i in ob_idx:
                 y_val = df.at[i, "ict_ob_top"]
                 fig.add_hline(y=y_val, line_width=2, line_color="blue", annotation_text="OB", annotation_position="top left", row=1, col=1)
+        if "bull_entry_signal" in df.columns:
+            bull_sig_idx = df.index[df["bull_entry_signal"] == 1]
+            if len(bull_sig_idx) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x[i] for i in bull_sig_idx],
+                        y=(df.loc[bull_sig_idx, "low"] * 0.995),
+                        mode="markers",
+                        marker=dict(symbol="triangle-up", size=8),
+                        name="多头信号",
+                    ),
+                    row=1,
+                    col=1,
+                )
+        if "bear_entry_signal" in df.columns:
+            bear_sig_idx = df.index[df["bear_entry_signal"] == 1]
+            if len(bear_sig_idx) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x[i] for i in bear_sig_idx],
+                        y=(df.loc[bear_sig_idx, "high"] * 1.005),
+                        mode="markers",
+                        marker=dict(symbol="triangle-down", size=8),
+                        name="空头信号",
+                    ),
+                    row=1,
+                    col=1,
+                )
     if show_harmonics and "harmonic_patterns" in df.attrs:
         patterns = df.attrs["harmonic_patterns"]
         for p in patterns:
@@ -305,6 +353,10 @@ def main():
     if show_ict:
         with st.spinner("计算ICT结构..."):
             df = compute_ict_structures(df, cfg_strategy)
+            df = attach_entry_signals(df)
+            if freq_label == "日线":
+                dt_df = compute_daily_trend_with_fallback(df, swing_len=20)
+                df = df.merge(dt_df[["datetime", "trend_state"]], on="datetime", how="left")
     if show_harm:
         interval_map = {
             "日线": "1D",

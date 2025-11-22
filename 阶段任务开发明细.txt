@@ -1,283 +1,552 @@
-一、策略层：在 run_ict_mtf_backtest 里记录调试明细
+一、整体修改计划（按层次来）
+第 0 步：不动大框架，只改“感知世界的方式”
 
-目标：每根 K 线一行，记录：
+我们先不推翻现有的 MTF / RR3 框架，只做这几类改动：
 
-日线趋势：trend_state
+信号层（execution 15m）：
 
-位置判断：在不在 OB？（执行周期 / 日线）
+新增：
 
-K 线信号：bull_rev / bear_rev
+bull_reversal_flag（反转阳线）
 
-是否满足入场前提：can_open_long / can_open_short
+bear_reversal_flag（反转阴线）
 
-是否实际开仓/平仓：opened_long / opened_short / closed_pos
+bull_pinbar_flag（看涨 pinbar）
 
-当前持仓：position_side / position_qty
+bear_pinbar_flag（看跌 pinbar）
 
-当前止损/止盈：stop_price / target_price
+再合成：
 
-当前资金：equity
+bull_entry_signal = (bull_reversal_flag | bull_pinbar_flag)
 
-1.1 扩展回测结果 dataclass
+bear_entry_signal = (bear_reversal_flag | bear_pinbar_flag)
 
-在 strategy/ict_mtf_lab.py 里，把 IctBacktestResult 改一下，多一个 debug：
+位置层（OB 命中）：
 
-@dataclass
-class IctBacktestResult:
-    trades: List[IctTrade]
-    equity: pd.Series         # 执行周期上的资金曲线
-    config: IctMtfConfig
-    debug: pd.DataFrame       # 每根bar的调试信息
+把原来的 _price_in_range 改成 _price_near_ob：
 
-1.2 在回测函数里准备 debug_rows 容器
+允许“在 OB 区间内”或“贴着 OB 边界、距离不超过 max(绝对tick, 百分比)”。
 
-在 run_ict_mtf_backtest 内，主循环前加：
+趋势层（日线）：
 
-    trades: List[IctTrade] = []
-    equity_values: List[float] = []
-    debug_rows: List[dict] = []   # 新增：存调试明细
+保留 ICT 的 BOS/CHOCH 作为“强趋势”；
 
-1.3 循环里增加调试变量 + 记录
+加一个 fallback：
 
-在 for i in range(len(merged)): 这个循环里，建议做如下改动：
+用“高点更高 & 低点更高” / MA10 vs MA20 来判定“弱多 / 弱空”；
 
-(1) 每次迭代先初始化“事件标志”
+输出：
 
-放在循环最开头、处理平仓逻辑之前：
+trend_state ∈ {STRONG_LONG, WEAK_LONG, FLAT, WEAK_SHORT, STRONG_SHORT}
+（实现上可以用 int 或 Enum）。
 
-        opened_long = False
-        opened_short = False
-        closed_pos = False
+入场层（策略）：
 
-        # 取当前 OHLC
-        o = float(row["open"])
-        c = float(row["close"])
+多头入场条件：
 
-        # 取上一根 K 线用于反转判断
-        if i > 0:
-            prev_row = merged.iloc[i - 1]
-            prev_o = float(prev_row["open"])
-            prev_c = float(prev_row["close"])
-            bull_rev = _is_bullish_reversal(prev_o, prev_c, o, c)
-            bear_rev = _is_bearish_reversal(prev_o, prev_c, o, c)
+trend_state 允许做多（强多 / 弱多）；
+
+价格在（或贴近）多头 OB（优先 15m OB，退回日线 OB）；
+
+bull_entry_signal == True（反转阳线或看涨 pinbar）；
+
+按 OB 边界设置止损，算 R:R ≥ min_rr；
+
+以损定仓：每笔亏损 ≤ 1% 账户权益（弱多可打折，比如 0.5%）。
+
+空头入场镜像。
+
+UI / 调试：
+
+日线图：
+
+按趋势分区上色：强多/弱多/弱空/强空背景色不同，方便肉眼 check；
+
+15 分钟图：
+
+用 marker 标出 bull_entry_signal / bear_entry_signal；
+
+以后可以再叠加“在 OB 内的 bar”高亮。
+
+二、核心代码：信号层（反转K线 + pinbar）
+
+可以新建一个工具模块，比如 strategy/candle_signals.py，也可以直接放进 ict_mtf_lab.py 顶部。
+
+2.1 反转阳线 / 反转阴线
+import numpy as np
+import pandas as pd
+
+def mark_bullish_reversal(df: pd.DataFrame) -> pd.Series:
+    """
+    简单版“反转阳线”：
+    - 前一根是阴线
+    - 当前是阳线
+    - 当前收盘至少收回前一根实体的一半
+    """
+    o = df["open"].astype(float).values
+    c = df["close"].astype(float).values
+
+    prev_o = np.roll(o, 1)
+    prev_c = np.roll(c, 1)
+
+    is_prev_bear = prev_c < prev_o
+    is_cur_bull = c > o
+
+    mid_prev = 0.5 * (prev_o + prev_c)
+    recapture = c >= mid_prev
+
+    flag = (is_prev_bear & is_cur_bull & recapture)
+    flag[0] = False  # 第一根没有前一根，强制 False
+    return pd.Series(flag.astype(int), index=df.index, name="bull_reversal_flag")
+
+
+def mark_bearish_reversal(df: pd.DataFrame) -> pd.Series:
+    """
+    简单版“反转阴线”：
+    - 前一根是阳线
+    - 当前是阴线
+    - 当前收盘至少打回前一根实体的一半
+    """
+    o = df["open"].astype(float).values
+    c = df["close"].astype(float).values
+
+    prev_o = np.roll(o, 1)
+    prev_c = np.roll(c, 1)
+
+    is_prev_bull = prev_c > prev_o
+    is_cur_bear = c < o
+
+    mid_prev = 0.5 * (prev_o + prev_c)
+    dump_back = c <= mid_prev
+
+    flag = (is_prev_bull & is_cur_bear & dump_back)
+    flag[0] = False
+    return pd.Series(flag.astype(int), index=df.index, name="bear_reversal_flag")
+
+2.2 看涨 / 看跌 pinbar
+
+这里给你一个相对宽松的定义（你可以以后再调参数）：
+
+Pinbar 特征：
+
+总振幅 = high - low
+
+实体 = |close - open|
+
+影线比：某一侧影线很长，另一侧+实体都比较短
+
+def mark_bullish_pinbar(
+    df: pd.DataFrame,
+    min_tail_ratio: float = 0.6,
+    max_body_ratio: float = 0.3,
+) -> pd.Series:
+    """
+    看涨 pinbar（下影长上影短）：
+    - 总振幅 > 0
+    - 实体/振幅 <= max_body_ratio
+    - 下影线/振幅 >= min_tail_ratio
+    """
+    o = df["open"].astype(float).values
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    c = df["close"].astype(float).values
+
+    body = np.abs(c - o)
+    rng = (h - l)
+    rng[rng == 0] = np.nan  # 避免除零
+
+    body_ratio = body / rng
+
+    lower = np.minimum(o, c)
+    upper = np.maximum(o, c)
+
+    lower_shadow = lower - l
+    upper_shadow = h - upper
+
+    tail_ratio = lower_shadow / rng
+
+    cond_body = body_ratio <= max_body_ratio
+    cond_tail = tail_ratio >= min_tail_ratio
+    cond_upper_short = upper_shadow <= (0.3 * rng)  # 上影不太长
+
+    flag = cond_body & cond_tail & cond_upper_short
+    return pd.Series(flag.astype(int), index=df.index, name="bull_pinbar_flag")
+
+
+def mark_bearish_pinbar(
+    df: pd.DataFrame,
+    min_tail_ratio: float = 0.6,
+    max_body_ratio: float = 0.3,
+) -> pd.Series:
+    """
+    看跌 pinbar（上影长下影短）：
+    - 总振幅 > 0
+    - 实体/振幅 <= max_body_ratio
+    - 上影线/振幅 >= min_tail_ratio
+    """
+    o = df["open"].astype(float).values
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    c = df["close"].astype(float).values
+
+    body = np.abs(c - o)
+    rng = (h - l)
+    rng[rng == 0] = np.nan
+
+    body_ratio = body / rng
+
+    lower = np.minimum(o, c)
+    upper = np.maximum(o, c)
+
+    lower_shadow = lower - l
+    upper_shadow = h - upper
+
+    tail_ratio = upper_shadow / rng
+
+    cond_body = body_ratio <= max_body_ratio
+    cond_tail = tail_ratio >= min_tail_ratio
+    cond_lower_short = lower_shadow <= (0.3 * rng)
+
+    flag = cond_body & cond_tail & cond_lower_short
+    return pd.Series(flag.astype(int), index=df.index, name="bear_pinbar_flag")
+
+2.3 合成“交易信号旗标”
+
+在你执行周期（15m）的 df 上，算完上述 4 个 flag 后：
+
+def attach_entry_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    在 df 上新增：
+    - bull_reversal_flag, bear_reversal_flag
+    - bull_pinbar_flag, bear_pinbar_flag
+    - bull_entry_signal, bear_entry_signal
+    """
+    df = df.copy()
+    df["bull_reversal_flag"] = mark_bullish_reversal(df)
+    df["bear_reversal_flag"] = mark_bearish_reversal(df)
+    df["bull_pinbar_flag"] = mark_bullish_pinbar(df)
+    df["bear_pinbar_flag"] = mark_bearish_pinbar(df)
+
+    df["bull_entry_signal"] = (
+        (df["bull_reversal_flag"] == 1) | (df["bull_pinbar_flag"] == 1)
+    ).astype(int)
+
+    df["bear_entry_signal"] = (
+        (df["bear_reversal_flag"] == 1) | (df["bear_pinbar_flag"] == 1)
+    ).astype(int)
+
+    return df
+
+
+集成到现有代码里：在执行周期 ICT 计算完之后，立刻 exec_df = attach_entry_signals(exec_df)。
+
+三、核心代码：OB 命中 _price_near_ob
+
+替换你现在的 _price_in_range：
+
+def _price_near_ob(
+    price: float,
+    bottom: float,
+    top: float,
+    tol_pct: float,
+    abs_tick: float = 0.01,
+) -> bool:
+    """
+    价格是否在 / 接近 OB：
+    - 若 price 在 [bottom*(1-tol_pct), top*(1+tol_pct)] 内，直接命中；
+    - 否则，若 price 距离 [bottom, top] 中任一边界的距离 <= max(abs_tick, price*tol_pct)，也算命中。
+    """
+    if np.isnan(bottom) or np.isnan(top) or bottom <= 0 or top <= 0:
+        return False
+
+    lo = bottom * (1.0 - tol_pct)
+    hi = top * (1.0 + tol_pct)
+
+    # 区间内部
+    if lo <= price <= hi:
+        return True
+
+    # 靠边判定
+    dist = min(abs(price - bottom), abs(price - top))
+    tol_abs = max(abs_tick, price * tol_pct)
+    return dist <= tol_abs
+
+
+在策略里，原来是：
+
+in_ob = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+
+
+改成：
+
+in_ob = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+
+四、核心代码：日线趋势（强/弱 + fallback）
+
+在你之前的 _compute_daily_trend 基础上加 fallback，这里给一个相对简单且贴合你思路的版本：
+
+from enum import Enum
+
+class TrendState(int, Enum):
+    STRONG_SHORT = -2
+    WEAK_SHORT   = -1
+    FLAT         = 0
+    WEAK_LONG    = 1
+    STRONG_LONG  = 2
+
+
+def compute_daily_trend_with_fallback(df_daily: pd.DataFrame, swing_len: int = 20) -> pd.DataFrame:
+    """
+    日线趋势：
+    - 首先看 BOS/CHOCH：有向上 BOS/CHOCH → STRONG_LONG；向下 → STRONG_SHORT；
+    - 若近期没有 BOS/CHOCH，则用 HHHL / LHLL 或 MA10/MA20 判定 WEAK_LONG/WEAK_SHORT；
+    - 否则 FLAT。
+    """
+
+    from factors.ict_smc import ICTConfig, compute_ict_structures
+
+    ict_cfg = ICTConfig(swing_length=swing_len)
+    df = compute_ict_structures(df_daily, ict_cfg).copy()
+
+    close = df["close"].astype(float)
+    bos = df.get("ict_bos_flag", pd.Series(0, index=df.index)).fillna(0).astype(float)
+    choch = df.get("ict_choch_flag", pd.Series(0, index=df.index)).fillna(0).astype(float)
+    sw = df.get("ict_sw_highlow", pd.Series(0, index=df.index)).fillna(0).astype(float)
+    lv = pd.to_numeric(df.get("ict_sw_level", pd.Series(np.nan, index=df.index)), errors="coerce")
+
+    # 计算简单均线作为辅助
+    ma_fast = close.rolling(10, min_periods=3).mean()
+    ma_slow = close.rolling(20, min_periods=5).mean()
+
+    trend_states: list[TrendState] = []
+    last_state = TrendState.FLAT
+
+    for i in range(len(df)):
+        state = last_state
+
+        b = bos.iloc[i]
+        ch = choch.iloc[i]
+
+        # 先看强趋势（BOS/CHOCH）
+        if b > 0 or ch > 0:
+            state = TrendState.STRONG_LONG
+        elif b < 0 or ch < 0:
+            state = TrendState.STRONG_SHORT
         else:
-            bull_rev = False
-            bear_rev = False
+            # 最近 N 根没有 BOS/CHOCH，就用 HHHL/LHLL 或 MA10/MA20
+            lookback = 10
+            if i >= lookback:
+                sub_sw = sw.iloc[i - lookback + 1 : i + 1]
+                sub_lv = lv.iloc[i - lookback + 1 : i + 1]
 
+                highs = sub_lv[sub_sw > 0].dropna()
+                lows = sub_lv[sub_sw < 0].dropna()
 
-这里用的是我们之前约好的“反转阳线/反转阴线”，不再用 CHOCH。
+                weak_long = False
+                weak_short = False
 
-(2) 平仓时，把 closed_pos 标成 True
+                if len(highs) >= 2 and len(lows) >= 2:
+                    hh = float(highs.iloc[-1]) > float(highs.iloc[-2])
+                    hl = float(lows.iloc[-1]) > float(lows.iloc[-2])
+                    if hh and hl:
+                        weak_long = True
 
-在你平仓那一段的逻辑里（有 exit_px is not None: 的地方），平仓成功后加一行：
+                    ll = float(lows.iloc[-1]) < float(lows.iloc[-2])
+                    lh = float(highs.iloc[-1]) < float(highs.iloc[-2])
+                    if ll and lh:
+                        weak_short = True
 
-                if exit_px is not None:
-                    closed_pos = True   # 这根bar发生了平仓事件
-                    ...
+                # 若 HHHL/LHLL 不够清晰，用均线辅助
+                if not weak_long and not weak_short:
+                    if ma_fast.iloc[i] > ma_slow.iloc[i]:
+                        weak_long = True
+                    elif ma_fast.iloc[i] < ma_slow.iloc[i]:
+                        weak_short = True
 
-
-其他 cash / pnl 逻辑保持你现在修好的版本即可。
-
-(3) 入场逻辑里打 can_open_* & opened_*
-
-在“无持仓 → 尝试开新仓”那段，
-原来大概是：
-
-        if position_side is None:
-            if trend == TrendState.LONG:
-                # 计算 in_ob ...
-                if in_ob and bull_rev:
-                    # 算止损、仓位、R:R...
-                    if 通过RR过滤:
-                        position_side = "long"
-                        position_qty = ...
-                        ...
-
-
-我们加两个变量：
-
-        can_open_long = False
-        can_open_short = False
-
-
-然后在多头分支里这样写（示意核心改动）：
-
-        if position_side is None:
-            if trend == TrendState.LONG:
-                in_ob_long = False
-
-                # 执行周期 OB 优先
-                if ob_flag > 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
-                    ob_bottom = float(row["ict_ob_bottom"])
-                    ob_top = float(row["ict_ob_top"])
-                    in_ob_long = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                if weak_long and not weak_short:
+                    state = TrendState.WEAK_LONG
+                elif weak_short and not weak_long:
+                    state = TrendState.WEAK_SHORT
                 else:
-                    ob_bottom = float(row.get("ob_long_bottom", np.nan))
-                    ob_top = float(row.get("ob_long_top", np.nan))
-                    in_ob_long = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                    state = TrendState.FLAT
 
-                # 先只判断“前提是否满足”
-                if in_ob_long and bull_rev:
-                    can_open_long = True
+        trend_states.append(state)
+        last_state = state
 
-                    # === 下面才是原来的“真正开仓”逻辑 ===
-                    # 止损
-                    if np.isnan(ob_bottom) or ob_bottom <= 0 or ob_bottom >= price:
-                        stop = price * (1.0 - 0.005)
-                    else:
-                        stop = ob_bottom
-
-                    risk_per_share = price - stop
-                    if risk_per_share > 0:
-                        risk_budget = equity * config.risk_per_trade_pct
-                        max_position_value = equity * config.max_position_pct
-                        qty = int(risk_budget / risk_per_share)
-                        qty = (qty // config.lot_size) * config.lot_size
-                        if qty > 0:
-                            position_value = qty * price
-                            if position_value > max_position_value:
-                                qty = int(max_position_value // price)
-                                qty = (qty // config.lot_size) * config.lot_size
-
-                        if qty > 0:
-                            target = price + config.min_rr * risk_per_share
-                            entry_px = price * (1.0 + config.slippage_pct)
-                            # 最小 R:R 过滤
-                            if (target - entry_px) / (entry_px - stop) >= config.min_rr:
-                                position_side = "long"
-                                position_qty = int(qty)
-                                entry_price = float(entry_px)
-                                stop_price = float(stop)
-                                target_price = float(target)
-                                cash -= entry_price * position_qty
-                                opened_long = True   # 真正开多仓
+    out = df[["datetime", "close"]].copy()
+    out["trend_state"] = trend_states
+    out["trade_date"] = pd.to_datetime(out["datetime"]).dt.date
+    return out
 
 
-空头分支同样模式（这里写核心差异）：
+在 run_ict_mtf_backtest 中替换原来的 _compute_daily_trend 调用即可。
 
-            elif trend == TrendState.SHORT:
-                in_ob_short = False
-                if ob_flag < 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
-                    ob_top = float(row["ict_ob_top"])
-                    ob_bottom = float(row["ict_ob_bottom"])
-                    in_ob_short = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+入场时可以区分：
+
+if trend in (TrendState.STRONG_LONG, TrendState.WEAK_LONG):
+    # 多头方向允许
+
+
+后面如果你愿意，可以让 WEAK_LONG 的每笔风险用 0.5%，STRONG_LONG 用 1%。
+
+五、核心代码：入场逻辑片段（多头为例）
+
+在 run_ict_mtf_backtest 的主循环里，完成以下替换：
+
+5.1 执行周期 DF 加信号 + 合并趋势
+
+你原来已经 merge 了日线状态，这里简化说明：
+
+# exec_df = compute_ict_structures(df_exec, exec_cfg)
+exec_df = compute_ict_structures(df_exec, exec_cfg)
+exec_df = attach_entry_signals(exec_df)   # <== 新加这一行
+
+exec_df["datetime"] = pd.to_datetime(exec_df["datetime"])
+exec_df["trade_date"] = exec_df["datetime"].dt.date
+
+daily_state = compute_daily_trend_with_fallback(df_daily, swing_len=config.swing_length_daily)
+daily_state = daily_state.set_index("trade_date")
+
+merged = exec_df.merge(
+    daily_state[["trend_state", "ob_long_top", "ob_long_bottom", "ob_short_top", "ob_short_bottom"]],
+    left_on="trade_date",
+    right_index=True,
+    how="left",
+)
+
+5.2 多头入场条件：near OB + bull_entry_signal
+
+在循环内部（伪代码精简版）：
+
+for i in range(len(merged)):
+    row = merged.iloc[i]
+    dt = row["datetime"]
+    price = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+
+    trend: TrendState = row.get("trend_state", TrendState.FLAT)
+    ob_flag = float(row.get("ict_ob_flag", 0.0))
+
+    bull_signal = int(row.get("bull_entry_signal", 0)) == 1
+    bear_signal = int(row.get("bear_entry_signal", 0)) == 1
+
+    # 先处理持仓的止损/止盈 ...（略，沿用你现有逻辑）
+
+    # 无仓 → 尝试开新仓
+    if position_side is None or position_qty == 0:
+
+        # ====== 多头方向 ======
+        if trend in (TrendState.STRONG_LONG, TrendState.WEAK_LONG):
+
+            # 优先使用执行周期多头 OB
+            in_ob_long = False
+            ob_bottom = np.nan
+            ob_top = np.nan
+
+            if ob_flag > 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
+                ob_bottom = float(row["ict_ob_bottom"])
+                ob_top = float(row["ict_ob_top"])
+                in_ob_long = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+            else:
+                # 退回日线多头 OB
+                ob_bottom = float(row.get("ob_long_bottom", np.nan))
+                ob_top = float(row.get("ob_long_top", np.nan))
+                in_ob_long = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+
+            if in_ob_long and bull_signal:
+                # 计算止损、R:R、以损定仓
+                if np.isnan(ob_bottom) or ob_bottom <= 0 or ob_bottom >= price:
+                    stop = price * (1.0 - 0.005)
                 else:
-                    ob_top = float(row.get("ob_short_top", np.nan))
-                    ob_bottom = float(row.get("ob_short_bottom", np.nan))
-                    in_ob_short = _price_in_range(price, ob_bottom, ob_top, config.ob_tolerance_pct)
+                    stop = ob_bottom
 
-                if in_ob_short and bear_rev:
-                    can_open_short = True
+                risk_per_share = price - stop
+                if risk_per_share <= 0:
+                    continue
 
-                    # === 原有开空逻辑 ===
-                    if np.isnan(ob_top) or ob_top <= 0 or ob_top <= price:
-                        stop = price * (1.0 + 0.005)
-                    else:
-                        stop = ob_top
+                # 风险预算：弱多可以打折
+                if trend == TrendState.STRONG_LONG:
+                    risk_budget_pct = config.risk_per_trade_pct
+                else:
+                    risk_budget_pct = config.risk_per_trade_pct * 0.5
 
-                    risk_per_share = stop - price
-                    ...
-                            target = price - config.min_rr * risk_per_share
-                            entry_px = price * (1.0 - config.slippage_pct)
-                            if (entry_px - target) / (stop - entry_px) >= config.min_rr:
-                                position_side = "short"
-                                position_qty = int(qty)
-                                entry_price = float(entry_px)
-                                stop_price = float(stop)
-                                target_price = float(target)
-                                cash += entry_price * position_qty
-                                opened_short = True
+                risk_budget = equity * risk_budget_pct
+                max_position_value = equity * config.max_position_pct
+
+                qty = int(risk_budget / risk_per_share)
+                qty = (qty // config.lot_size) * config.lot_size
+
+                if qty <= 0:
+                    continue
+
+                position_value = qty * price
+                if position_value > max_position_value:
+                    qty = int(max_position_value // price)
+                    qty = (qty // config.lot_size) * config.lot_size
+
+                if qty <= 0:
+                    continue
+
+                # 按 min_rr 设目标 & 过滤
+                target = price + config.min_rr * risk_per_share
+                entry_px = price * (1.0 + config.slippage_pct)
+
+                if (target - entry_px) / (entry_px - stop) < config.min_rr:
+                    continue
+
+                # 开仓
+                position_side = "long"
+                position_qty = int(qty)
+                entry_price = float(entry_px)
+                stop_price = float(stop)
+                target_price = float(target)
+                cash -= entry_price * position_qty
 
 
-关键是：
+空头方向同理，只是 trend 换成 WEAK/STRONG_SHORT，OB 换空头 OB，信号用 bear_entry_signal，止损/目标反过来就行。
 
-can_open_long/short = 条件判断通过（位置 + 反转K线）
+六、调试 & 可视化（简述）
 
-opened_long/short = 实际开仓成功（包括R:R和仓位计算）
+你后面可以在 UI 上做两件事来验证逻辑：
 
-(4) 每根 K 线末尾 append debug_row
+日线图上用 trend_state 分段上色（前面已经给过思路）；
 
-在循环末尾（已经算出当前 equity 之后），加：
+15m 图上画 bull/bear entry 信号：
 
-        # 持仓状态字符串
-        pos_state = position_side if position_side is not None else "flat"
+在 _plot_main_chart 里，如果当前周期是 15m，并且 df 包含这两列：
 
-        debug_rows.append({
-            "datetime": dt,
-            "close": price,
-            "trend_state": str(trend),          # 方便在表里看
-            "in_exec_ob_flag": ob_flag,         # 当前bar的OB标记
-            "bull_rev": bull_rev,
-            "bear_rev": bear_rev,
-            "can_open_long": can_open_long,
-            "can_open_short": can_open_short,
-            "opened_long": opened_long,
-            "opened_short": opened_short,
-            "closed_pos": closed_pos,
-            "position_side": pos_state,
-            "position_qty": int(position_qty),
-            "stop_price": float(stop_price) if stop_price else np.nan,
-            "target_price": float(target_price) if target_price else np.nan,
-            "equity": float(equity),
-        })
-
-1.4 回测结束后构造 debug DataFrame
-
-在函数 return 前，构造 debug_df 并放进结果：
-
-    equity_index = merged["datetime"]
-    equity_series = pd.Series(equity_values, index=equity_index, name="equity")
-
-    debug_df = pd.DataFrame(debug_rows)
-    debug_df.set_index("datetime", inplace=True)
-
-    return IctBacktestResult(
-        trades=trades,
-        equity=equity_series,
-        config=config,
-        debug=debug_df,
+if "bull_entry_signal" in df.columns:
+    idx = df.index[df["bull_entry_signal"] == 1]
+    fig.add_trace(
+        go.Scatter(
+            x=df.loc[idx, "datetime"],
+            y=df.loc[idx, "low"] * 0.995,
+            mode="markers",
+            marker_symbol="triangle-up",
+            marker_size=8,
+            name="多头信号",
+        ),
+        row=1, col=1,
+    )
+if "bear_entry_signal" in df.columns:
+    idx = df.index[df["bear_entry_signal"] == 1]
+    fig.add_trace(
+        go.Scatter(
+            x=df.loc[idx, "datetime"],
+            y=df.loc[idx, "high"] * 1.005,
+            mode="markers",
+            marker_symbol="triangle-down",
+            marker_size=8,
+            name="空头信号",
+        ),
+        row=1, col=1,
     )
 
-二、UI 层：Streamlit 里展示调试表
 
-在 ui/asset_lab_app.py 中，你现在大致是这样调用回测的：
+这样你就能直观看到：
 
-res = run_ict_mtf_backtest(daily_bars, df, cfg_mtf)
-st.subheader("ICT 多周期回测资金曲线")
-_plot_equity_curve(res.equity)
+日线上：什么时候算多头/空头/震荡；
 
-2.1 加一个“显示调试明细”的开关
-
-紧接着加：
-
-show_debug = st.checkbox("显示调试明细（当前周期）", value=False)
-
-if show_debug:
-    debug_df = res.debug.copy()
-
-    # 可选：加一个过滤选项
-    view_mode = st.selectbox(
-        "查看模式",
-        ["全部bar", "只看有入场机会的bar", "只看实际开仓的bar", "只看平仓bar"],
-        index=0,
-    )
-
-    if view_mode == "只看有入场机会的bar":
-        debug_df = debug_df[(debug_df["can_open_long"]) | (debug_df["can_open_short"])]
-    elif view_mode == "只看实际开仓的bar":
-        debug_df = debug_df[(debug_df["opened_long"]) | (debug_df["opened_short"])]
-    elif view_mode == "只看平仓bar":
-        debug_df = debug_df[debug_df["closed_pos"]]
-
-    st.write(f"共 {len(debug_df)} 行")
-    st.dataframe(debug_df.tail(300))  # 最近300根，防止太大
-
-
-这样：
-
-你在 UI 上切换“日线 / 60 / 30 / 15 / 5 分钟”时，
-run_ict_mtf_backtest 会针对当前周期重算一遍回测；
-
-勾上“显示调试明细”，就能看到这个周期下每一根 K 的判断全过程；
-
-如果你怀疑“为什么这儿没有开仓”，就用“只看有入场机会的 bar”看看，是不是 R:R 过滤掉了，还是 OB 没命中，还是根本没识别成反转 K 线。
+15 分钟上：哪些 K 被识别成“可入场”的反转或 pinbar，
+再结合 OB 区和交易记录，看策略逻辑是不是跟你肉眼预期一致。
