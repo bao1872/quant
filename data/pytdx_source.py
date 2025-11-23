@@ -24,8 +24,10 @@ class PytdxDataSource(DataSource):
         self.host = host
         self.port = port
         self.enable_fallback = enable_fallback
-        self.api = TdxHq_API()
+        self.api = None
         self._connected = False
+        self._ip: str | None = None
+        self._port: int | None = None
 
     def __enter__(self) -> "PytdxDataSource":
         self.connect()
@@ -39,37 +41,42 @@ class PytdxDataSource(DataSource):
     def connect(self) -> None:
         if self._connected:
             return
-        ip = self.host
-        prt = self.port
+        self._ensure_client()
+        self._connected = True
+
+    def _ensure_client(self) -> None:
+        from .tdx_server_selector import get_best_tdx_server
+        if self.api is not None and self._ip is not None and self._port is not None:
+            return
+        ip, prt = (self.host, self.port)
         if ip == "auto":
-            ip, prt = self._auto_select_host()
-            self.host = ip
-            self.port = prt
+            ip, prt = get_best_tdx_server()
+        self.api = TdxHq_API()
         ok = self.api.connect(ip, prt)
         if not ok:
             raise RuntimeError(f"Failed to connect pytdx {ip}:{prt}")
-        self._connected = True
-
-    def _auto_select_host(self) -> tuple[str, int]:
-        candidates = [
-            ("119.147.164.60", 7709),
-            ("180.153.18.171", 7709),
-            ("114.80.149.19", 7709),
-            ("115.238.90.165", 7709),
-            ("123.125.108.23", 7709),
-            ("218.108.98.244", 7709),
-        ]
-        for ip, port in candidates:
-            ok = self.api.connect(ip, port)
-            if ok:
-                self.api.disconnect()
-                return ip, port
-        return candidates[0]
+        self._ip = ip
+        self._port = prt
 
     def disconnect(self) -> None:
-        if self._connected:
+        if self._connected and self.api is not None:
             self.api.disconnect()
             self._connected = False
+
+    def _reconnect_new_best(self) -> None:
+        from .tdx_server_selector import select_new_best_server
+        if self.api is not None:
+            self.api.disconnect()
+        ip, prt = select_new_best_server()
+        self.api = TdxHq_API()
+        ok = self.api.connect(ip, prt)
+        if not ok:
+            raise RuntimeError(f"Failed to connect pytdx {ip}:{prt}")
+        self._ip = ip
+        self._port = prt
+
+    def get_current_server(self) -> tuple[str | None, int | None]:
+        return self._ip, self._port
 
     # ---------- 工具函数 ----------
 
@@ -126,19 +133,42 @@ class PytdxDataSource(DataSource):
 
         # pytdx get_security_bars 返回从 start 开始的 count 条
         # 为了取最近 count 条，通常从 0 开始，取足够多，然后截 tail。
-        raw = self.api.get_security_bars(
-            category=9,  # 日线
-            market=market,
-            code=code,
-            start=0,
-            count=count,
-        )
-        df = self._bars_to_df(raw)
-        if df.empty or ("datetime" not in df.columns):
+        step = 800
+        start = 0
+        frames: list[pd.DataFrame] = []
+        while True:
+            raw = self.api.get_security_bars(
+                category=9,
+                market=market,
+                code=code,
+                start=start,
+                count=step,
+            )
+            df = self._bars_to_df(raw)
+            if df.empty or ("datetime" not in df.columns):
+                self._reconnect_new_best()
+                raw = self.api.get_security_bars(
+                    category=9,
+                    market=market,
+                    code=code,
+                    start=start,
+                    count=step,
+                )
+                df = self._bars_to_df(raw)
+            if df.empty:
+                break
+            frames.append(df)
+            if len(df) < step:
+                break
+            start += step
+        if not frames:
             return pd.DataFrame()
-        df = df.sort_values("datetime").reset_index(drop=True)
-        df["ts_code"] = ts_code
-        return df
+        out = pd.concat(frames, ignore_index=True)
+        out = out.sort_values("datetime").reset_index(drop=True)
+        if len(out) > count:
+            out = out.tail(count).reset_index(drop=True)
+        out["ts_code"] = ts_code
+        return out
 
     def get_minute_bars(
         self,
@@ -164,20 +194,43 @@ class PytdxDataSource(DataSource):
             raise ValueError(f"不支持的分钟频率: {freq}")
         category = freq_map[freq]
 
-        raw = self.api.get_security_bars(
-            category=category,
-            market=market,
-            code=code,
-            start=0,
-            count=count,
-        )
-        df = self._bars_to_df(raw)
-        if df.empty or ("datetime" not in df.columns):
+        step = 800
+        start = 0
+        frames: list[pd.DataFrame] = []
+        while True:
+            raw = self.api.get_security_bars(
+                category=category,
+                market=market,
+                code=code,
+                start=start,
+                count=step,
+            )
+            df = self._bars_to_df(raw)
+            if df.empty or ("datetime" not in df.columns):
+                self._reconnect_new_best()
+                raw = self.api.get_security_bars(
+                    category=category,
+                    market=market,
+                    code=code,
+                    start=start,
+                    count=step,
+                )
+                df = self._bars_to_df(raw)
+            if df.empty:
+                break
+            frames.append(df)
+            if len(df) < step:
+                break
+            start += step
+        if not frames:
             return pd.DataFrame()
-        df = df.sort_values("datetime").reset_index(drop=True)
-        df["ts_code"] = ts_code
-        df["freq"] = freq
-        return df
+        out = pd.concat(frames, ignore_index=True)
+        out = out.sort_values("datetime").reset_index(drop=True)
+        if len(out) > count:
+            out = out.tail(count).reset_index(drop=True)
+        out["ts_code"] = ts_code
+        out["freq"] = freq
+        return out
 
     def get_kline(
         self,
@@ -421,17 +474,14 @@ class PytdxDataSource(DataSource):
 
 
 if __name__ == "__main__":
-    # 简单自测：尝试连一次 pytdx 并获取一只股票的日线 & 分钟线
     src = PytdxDataSource()
     try:
         df_daily = src.get_daily_bars("000001.SZ", count=5)
         print("Daily bars sample:")
         print(df_daily.head())
-
         df_min = src.get_minute_bars("000001.SZ", freq="1m", count=5)
         print("Minute bars sample:")
         print(df_min.head())
-
         df_tick = src.get_ticks("000001.SZ", count=10)
         print("Ticks sample:")
         print(df_tick.head())

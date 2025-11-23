@@ -1,282 +1,355 @@
-【任务背景】
-目前项目中日线和分钟线分别用 stock_daily / stock_minute 存储，更新逻辑在 data/jobs.py + data/updater.py + data/repository.py 中，数据来源主要是 data/pytdx_source.py。
-我现在希望统一成一张表 stock_kline，通过 freq 字段区分不同周期（例如 "1d" / "60m" / "15m"），方便后续缠论和特征工程统一使用。
-特别要求：
+任务总目标
+在现有项目基础上，不改缠论核心(chan/)，实现一个最小版本的 Streamlit 缠论可视化：
 
-每个周期的数据时间起点要一致，即对于同一只股票，在配置的历史区间内，"1d"、"60m"、"15m" 这几个 freq 覆盖的交易日范围一致；
+在 asset_lab_app 中增加一个开关：「叠加缠论结构」。
 
-第一次全量更新时，要从配置的起始日期回补所有 freq；
+当开关打开时，在主 K 线图上叠加显示：
 
-之后增量更新时，要能“查出 stock_kline 里缺哪些交易日的数据，并补齐”。
+必选：笔端点（Bi）；
 
-任务 A：设计并创建 stock_kline，并迁移写入逻辑
-A-1 表结构与索引
+可选：线段 Segment、中枢 Center、信号 Signal（用勾选框控制）。
 
-在数据库中新增一张表 stock_kline（PostgreSQL），字段建议如下（按现有项目风格实现）：
+所有数据均从数据库读取：
 
-ts_code：string，例如 "SH.688122" / "SZ.000426"
+行情：stock_kline；
 
-freq：string，例如 "1d", "60m", "15m"
+缠论结构：stock_chan_bi / stock_chan_segment / stock_chan_center / stock_chan_signal。
 
-datetime：timestamp，K 线结束时间（分钟线用精确时间，日线用当日收盘时间或 00:00）
+你要写完后 自己带着检查逻辑，保证：
 
-trade_date：date，datetime::date（方便按自然日扫描）
+当前图表范围内的 bis/segment/center/signal 数量打印出来；
 
-open, high, low, close：numeric
+肉眼能对得上时间区间与 K 线。
 
-volume：bigint
+一、修改范围与禁止修改
 
-amount：numeric（可选）
+允许修改 / 新增：
 
-约束与索引：
+新增模块（建议）：chan/view_loader.py 或 services/chan_view_service.py
 
-唯一约束/主键：(ts_code, freq, datetime)
+修改 / 新增：
 
-索引：
+ui/asset_lab_app.py（或你实际的主分析页文件，下面统称 asset_lab_app）
 
-(ts_code, freq, trade_date)
+如有必要，可以在 data/repository.py 中新增只读查询函数，但不要改写入逻辑。
 
-如有必要，再加 (ts_code, freq, datetime DESC) 方便取最后一根
+禁止修改 / 删除：
 
-注意：不要删除现有 stock_daily / stock_minute，先保留兼容，后面再逐步迁移。
+chan/ 中的抽取、落库逻辑（chan/types.py, chan/extract.py, chan/persist.py, chan/pipeline.py, chan/validate.py 等）。
 
-A-2 Repository 层：新增统一写入方法
+third_party/chan.py。
 
-在 data/repository.py 中新增：
+data/updater.py, data/jobs.py 的函数签名。
 
-def upsert_stock_kline(
+任何 ML / 策略 / 回测模块。
+
+二、数据加载层：只读 DB，返回 ChanResult
+1. 新增模块：chan/view_loader.py
+
+在 chan/ 目录下新建 view_loader.py（只读，不写 DB），实现：
+
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import List
+
+import pandas as pd
+
+from .types import Bi, Segment, Center, Signal, ChanResult
+from db import get_engine
+from sqlalchemy import text
+
+@dataclass
+class ChanViewData:
+    kline: pd.DataFrame       # datetime, open/high/low/close/volume
+    bis: List[Bi]
+    segments: List[Segment]
+    centers: List[Center]
+    signals: List[Signal]
+
+
+def load_kline(
     ts_code: str,
     freq: str,
-    df: pd.DataFrame,
-) -> int:
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
     """
-    将 df 中的 K 线写入 stock_kline。
-    要求 df 至少包含:
-      - datetime
-      - open, high, low, close, volume
-      - 可选 amount
-    逻辑：
-      1) df 为空则直接返回 0
-      2) 复制 df，增加 trade_date = datetime.dt.date
-      3) 计算当前批次的时间窗 [min_dt, max_dt]
-      4) delete from stock_kline where ts_code=:ts and freq=:freq and datetime between :t1 and :t2
-      5) 批量插入当前 df
-      6) 返回插入行数
+    从 stock_kline 读取指定 code+freq+时间窗口的 K 线。
+    要求返回列至少包含: datetime, open, high, low, close, volume。
     """
-
-
-要求：
-
-不用 try-except 吃掉异常；
-
-删除、插入都使用目前项目统一的 get_engine() / text() 风格；
-
-保持与 upsert_stock_daily / upsert_stock_minute 一致的“删后插”方式。
-
-可选：在不破坏现有代码的前提下，将 upsert_stock_daily / upsert_stock_minute 改成对 upsert_stock_kline 的轻量封装（比如 freq 固定为 "1d" / "15m"），但不要强行改掉所有调用者，避免一下子改挂。
-
-A-3 DataSource 层：统一日线 / 分钟线获取接口（以 kline 为单位）
-
-在 data/pytdx_source.py 中：
-
-明确频率映射（参考 pytdx 文档）：
-
-# 示例，需按 pytdx 实际 category 映射确认
-FREQ_CATEGORY = {
-    "1m": 0,
-    "5m": 1,
-    "15m": 2,
-    "30m": 3,
-    "60m": 4,
-}
-
-
-保留日线、分钟线原有方法，但同时新增一个统一接口：
-
-class PytdxDataSource(...):
     ...
 
-    def get_kline(
-        self,
-        ts_code: str,
-        freq: str,
-        start: datetime | None = None,
-        end: datetime | None = None,
-        count: int | None = None,
-    ) -> pd.DataFrame:
-        """
-        返回指定股票、周期的 K 线数据，列包含 datetime/open/high/low/close/volume/amount。
-        - freq: "1d", "60m", "15m" 等
-        - start/end: 优先按日期区间过滤
-        - count: 在无法按日期精确过滤时，用 count 回溯（例如 pytdx 限制）
-        """
 
-
-具体内部实现可以基于现有 get_daily_bars / get_minute_bars，再按日期切片；保持风格一致即可。
-
-任务 B：统一更新逻辑，保证各个周期的起点一致
-
-核心目标：
-
-对于每一个 ts_code，在一个配置好的“历史区间”内（例如最近 500 个交易日）
-
-freq="1d" 的日线覆盖整个区间；
-
-每个分钟周期（例如 "60m", "15m"）在 同样的交易日集合 上都有数据（每个交易日至少要有一根 K）。
-
-B-1 新增配置项
-
-在项目配置中（例如 config.py 或 data/jobs 的顶部），新增两类参数：
-
-KLINE_FREQS = ["1d", "60m", "15m"]
-KLINE_HISTORY_DAYS = 500  # 或者一个日期 KLINE_START_DATE = date(2020,1,1)
-
-
-你可以任选一种表达方式，要求是：
-
-能明确一个“历史起点”：比如 today - KLINE_HISTORY_DAYS；
-
-之后所有 freq 都以这个起点为下限，保证覆盖范围一致。
-
-B-2 Updater 层：新增统一的 update 函数
-
-在 data/updater.py 中新增：
-
-def update_kline_for_universe(
-    trade_date: date,
-    freqs: list[str],
-    history_days: int = 500,
-) -> None:
-    """
-    对股票池中的所有股票，在给定 freqs 上更新 K 线数据，写入 stock_kline。
-    要求：
-      - 第一次运行时，从 trade_date 往前 history_days 天起补齐所有 freq
-      - 之后每天运行时，只补齐缺失的部分
-    """
-
-
-建议实现逻辑：
-
-从 data/basic_universe.get_basic_universe() 获取当前股票池（ts_code 列表）；
-
-对每个 ts_code、每个 freq：
-
-计算本次目标覆盖区间 [start_date_target, trade_date]：
-start_date_target = trade_date - history_days；
-
-查询 stock_kline 中当前 ts_code+freq 的覆盖区间（见任务 C）；
-
-推导“缺失时间段”（例如完全没有数据 / 只有最近一段 / 中间有缺口）；
-
-调用 PytdxDataSource.get_kline(ts_code, freq, start=missing_start, end=missing_end, ...) 拉数据，
-再交给 upsert_stock_kline 写入。
-
-要求：
-
-逻辑上能覆盖“第一次全量 + 后续增量”；
-
-不要求把“中间有缺口”的情况做得很复杂，至少要能处理“没有数据时全量补齐”和“有数据时从 last_date 往后补”。
-
-任务 C：提供“缺失交易日检查”与验证脚本
-
-为了确保数据起点对齐 + 没有缺交易日，需要你实现：
-
-C-1 Repository 层：查询覆盖区间和缺失日期
-
-在 data/repository.py 中新增：
-
-def get_kline_date_range(ts_code: str, freq: str) -> tuple[date | None, date | None]:
-    """
-    返回给定 ts_code+freq 在 stock_kline 中的 (min_trade_date, max_trade_date)。
-    如果没有记录，返回 (None, None)。
-    """
-
-def get_kline_missing_dates(
+def load_chan_structures(
     ts_code: str,
     freq: str,
-    start_date: date,
-    end_date: date,
-    trade_calendar: list[date] | None = None,
-) -> list[date]:
+    start: datetime,
+    end: datetime,
+) -> ChanResult:
     """
-    返回在 [start_date, end_date] 之间，stock_kline 中缺失的交易日列表。
-    - 如果给定 trade_calendar，则以 trade_calendar 为基准；
-    - 否则可以简单使用 stock_kline 中出现过的 trade_date 去推断连续性。
+    从 stock_chan_bi / stock_chan_segment / stock_chan_center / stock_chan_signal
+    读取指定 code+freq+时间窗口的缠论结构，组装为 ChanResult。
     """
+    ...
 
 
-（如果项目里已有交易日历相关代码，可以直接复用；否则可以简单使用 stock_daily / stock_kline 自己的 distinct trade_date 做近似。）
-
-C-2 验证脚本：scripts/validate_kline_coverage.py
-
-在 scripts/ 下新增脚本（例如 scripts/validate_kline_coverage.py）：
-
-功能：
-
-遍历股票池中若干只股票（可以限制前 N 只），对每个 freq in KLINE_FREQS：
-
-调用 get_kline_date_range(ts_code, "1d") 得到基准起止日期（start_day, end_day）；
-
-对其它 freq（"60m", "15m"）调用 get_kline_missing_dates(ts_code, freq, start_day, end_day)；
-
-统计每个 freq 缺失的交易日数量。
-
-总结输出类似：
-
-=== SH.688122 ===
-1d: range=2022-01-05 .. 2025-02-20 (0 missing)
-60m: range=2022-01-05 .. 2025-02-20 (missing_days=1 -> [2023-04-03])
-15m: range=2022-01-05 .. 2025-02-20 (missing_days=0)
-...
-TOTAL:
-  codes_checked: 50
-  freq=1d: total_missing_days=0
-  freq=60m: total_missing_days=1
-  freq=15m: total_missing_days=0
+def get_chan_view_data(
+    ts_code: str,
+    freq: str,
+    start: datetime,
+    end: datetime,
+) -> ChanViewData:
+    """
+    统一入口：返回画图所需的全部数据。
+    """
+    kline = load_kline(...)
+    chan = load_chan_structures(...)
+    return ChanViewData(
+        kline=kline,
+        bis=chan.bis,
+        segments=chan.segments,
+        centers=chan.centers,
+        signals=chan.signals,
+    )
 
 
-若发现缺失天数过多（比如 >0），脚本退出前给出明显的 WARNING 或直接 raise，方便后续 CI/自动化检测。
+实现要求：
 
-要求：
+load_kline：
 
-不要用 try-except 把异常吃掉；
+从 stock_kline 读取 ts_code, freq 匹配，datetime between start and end；
 
-核心逻辑要有注释和 docstring；
+按 datetime 升序排序；
 
-便于我在本地直接跑：
+如果没有数据，返回空 DataFrame，不抛异常。
 
-python scripts/validate_kline_coverage.py
+load_chan_structures：
 
-任务 D：工作完成后的自我说明（你给我的汇总）
+从四张 chan 表读取当前窗口内的记录；
 
-完成上述改动后，请在说明里回答这三点（方便我验收）：
+按你之前 chan/types.py 里的 dataclass 构造 Bi/Segment/Center/Signal；
 
-schema & 代码改动摘要
+ChanResult 内的列表可以是“窗口内全部元素”，不必精确裁边；
 
-stock_kline 的最终字段列表 / 主键 / 索引；
+如果某张表在该窗口内为空，对应列表就是空。
 
-新增/修改了哪些函数（upsert_stock_kline, update_kline_for_universe, get_kline_date_range, get_kline_missing_dates 等）。
+该模块只读，不写 DB。
 
-你是如何保证“各周期起点一致 + 不缺交易日”的？
+三、Streamlit UI：在 asset_lab_app 上加缠论叠加
 
-具体是如何利用 KLINE_HISTORY_DAYS 或起始日期的；
+在 ui/asset_lab_app.py（或对应的主页面）中：
 
-validate_kline_coverage.py 的检查逻辑简介。
+1. 侧边栏控件
 
-你实际跑了什么命令，输出是什么？
+在现有 sidebar 上增加：
 
-至少包括：
+import streamlit as st
+from datetime import datetime, timedelta
 
-python -m data.jobs 或你设计的入口，用于执行一次 K 线更新；
+from chan.view_loader import get_chan_view_data
 
-python scripts/validate_kline_coverage.py 输出的摘要（可以贴一小段）。
+# ...已有控件...
 
-如果发现存在缺失日期，也请说明你是如何修复的。
+st.sidebar.markdown("### 缠论展示")
+show_chan = st.sidebar.checkbox("叠加缠论结构", value=False)
 
-请注意：
+if show_chan:
+    show_bi = st.sidebar.checkbox("笔 (Bi)", value=True)
+    show_seg = st.sidebar.checkbox("线段 (Segment)", value=False)
+    show_center = st.sidebar.checkbox("中枢 (Center)", value=False)
+    show_signal = st.sidebar.checkbox("信号 (Signal)", value=False)
+else:
+    show_bi = show_seg = show_center = show_signal = False
 
-不要改第三方 third_party/chan.py；
 
-现有使用 stock_daily / stock_minute 的地方先尽量保持兼容（或者在说明里明确标注“已废弃，仅用于历史数据，不再更新”）；
+日期范围：可以沿用你现有的选择逻辑（例如“最近 200 根K线”），或者简单写：
 
-不使用大范围 try-except 把错误吞掉，让问题暴露出来，便于修正。 
+根据 freq 决定窗口长度，例如：
+
+"1d" → 最近 250 交易日；
+
+"60m" → 最近 120 交易日；
+
+"15m" → 最近 60 交易日。
+
+在主逻辑中生成 start_dt, end_dt 用于 get_chan_view_data。
+
+2. 调用数据服务
+
+在绘制价格图之前：
+
+view = get_chan_view_data(code, freq, start_dt, end_dt)
+df = view.kline
+
+
+如果 df 为空，直接在页面提示：
+
+if df.empty:
+    st.warning("当前周期无行情数据")
+    st.stop()
+
+3. 用 Plotly 叠加画图（第一版至少要实现“价格 + 笔”）
+
+假设你目前已有绘制 K 线的逻辑（可能是 Plotly），请在原图基础上增加缠论元素：
+
+(1) 基础 K 线
+
+沿用现有代码，例如：
+
+import plotly.graph_objects as go
+
+fig = go.Figure()
+fig.add_trace(
+    go.Candlestick(
+        x=df["datetime"],
+        open=df["open"],
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        name="K线",
+    )
+)
+
+
+(2) 笔端点
+
+如果 show_bi 为 True：
+
+从 view.bis 提取起点和终点：
+
+bi_starts_x = [bi.start_ts for bi in view.bis]
+bi_starts_y = [bi.start_price for bi in view.bis]
+bi_ends_x = [bi.end_ts for bi in view.bis]
+bi_ends_y = [bi.end_price for bi in view.bis]
+
+
+画两个散点：
+
+if show_bi and view.bis:
+    fig.add_trace(
+        go.Scatter(
+            x=bi_starts_x,
+            y=bi_starts_y,
+            mode="markers",
+            name="Bi start",
+            marker=dict(symbol="circle", size=6),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=bi_ends_x,
+            y=bi_ends_y,
+            mode="markers",
+            name="Bi end",
+            marker=dict(symbol="x", size=6),
+        )
+    )
+
+
+(3) 线段（Segment）
+
+如果 show_seg 为 True：
+
+对每个 segment，用一条斜线连起止点即可（简易版）：
+
+if show_seg and view.segments:
+    for seg in view.segments:
+        fig.add_trace(
+            go.Scatter(
+                x=[seg.start_ts, seg.end_ts],
+                y=[seg.low, seg.high] if seg.direction == "UP" else [seg.high, seg.low],
+                mode="lines",
+                name=f"Seg {seg.seg_id}",
+                line=dict(width=2, dash="dot"),
+                showlegend=False,
+            )
+        )
+
+
+(4) 中枢（Center）
+
+如果 show_center 为 True：
+
+用矩形标出时间 [start_ts, end_ts] × 价格 [low, high]：
+
+if show_center and view.centers:
+    for center in view.centers:
+        fig.add_shape(
+            type="rect",
+            x0=center.start_ts,
+            x1=center.end_ts,
+            y0=center.low,
+            y1=center.high,
+            line=dict(width=0),
+            fillcolor="rgba(0, 0, 255, 0.1)",
+            layer="below",
+        )
+
+
+(5) 信号（Signal）
+
+如果 show_signal 为 True：
+
+if show_signal and view.signals:
+    buy_x = [s.ts for s in view.signals if s.signal_type.startswith("BUY")]
+    buy_y = [s.price for s in view.signals if s.signal_type.startswith("BUY")]
+    sell_x = [s.ts for s in view.signals if s.signal_type.startswith("SELL")]
+    sell_y = [s.price for s in view.signals if s.signal_type.startswith("SELL")]
+
+    if buy_x:
+        fig.add_trace(
+            go.Scatter(
+                x=buy_x,
+                y=buy_y,
+                mode="markers",
+                name="Buy",
+                marker=dict(symbol="triangle-up", size=10),
+            )
+        )
+    if sell_x:
+        fig.add_trace(
+            go.Scatter(
+                x=sell_x,
+                y=sell_y,
+                mode="markers",
+                name="Sell",
+                marker=dict(symbol="triangle-down", size=10),
+            )
+        )
+
+
+最后：
+
+st.plotly_chart(fig, use_container_width=True)
+
+四、自验证要求（让 Trae 自己验）
+
+实现完后，请你在答案中说明你做了哪些自测，至少包括：
+
+打印元素数量
+
+在 get_chan_view_data 返回前打印（或用 logging）：
+
+[ChanView] {ts_code} {freq} {start_dt}..{end_dt} 
+  kline_rows=XXX bis=Y segments=Z centers=W signals=V
+
+
+在 Streamlit 页面上增加一个 debug 展示（可选）：
+
+比如在图下方加一段：
+
+st.caption(
+    f"Chan 元素数量: bi={len(view.bis)}, seg={len(view.segments)}, "
+    f"center={len(view.centers)}, signal={len(view.signals)}"
+)
+
+
+手动用一只你提到过的票做例子（例如 西部超导 / 兴业银锡 / 万兴科技）：
+
+选 "1d" 和 "60m" 各看一段时间：
+
+截图或描述：
+
+笔端点是否贴着 K 线极值；
+
+线段和中枢位置是否大致符合直觉。

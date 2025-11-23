@@ -45,17 +45,15 @@ def _get_all_stock_codes(settings: Optional[Settings] = None) -> List[str]:
 
 def update_daily_bars(
     trade_date: date,
-    count: int = 240,
+    count: int = 500,
     settings: Optional[Settings] = None,
 ) -> None:
     """
-    更新所有股票的日线数据。
+    更新所有股票的最近 count=500 个交易日的日线数据，统一写入 stock_kline。
 
-    简化逻辑：
-    - 对每个 ts_code：
-      - 从 pytdx 获取最近 count 条日线；
-      - 判断其中哪些日期晚于 DB 中已有的最后日期；
-      - 将这部分数据 upsert 到 StockDaily。
+    - 对每个 ts_code：从 pytdx 获取最近 500 根日线（对应最近 500 个有成交的交易日）。
+    - 采用“删后插”批量 upsert 到 stock_kline（通过 repository.upsert_stock_kline）。
+    - 不再向旧表 stock_daily 写入。
     """
     ts_codes = _get_all_stock_codes(settings)
     if not ts_codes:
@@ -64,18 +62,19 @@ def update_daily_bars(
 
     print(f"[update_daily_bars] Start for {len(ts_codes)} stocks, trade_date={trade_date}")
 
+    RAW_COUNT = 2000
     with PytdxDataSource() as ds:
-        for i, ts_code in enumerate(tqdm(ts_codes, desc="daily", unit="stk"), start=1):
-            last_date = repository.get_last_trade_date_for_stock(ts_code)
-            df = ds.get_daily_bars(ts_code, count=count)
-            if df.empty:
+        for ts_code in tqdm(ts_codes, desc="daily", unit="stk"):
+            df_raw = ds.get_daily_bars(ts_code, count=RAW_COUNT)
+            if df_raw.empty:
+                print(f"WARNING: {ts_code} daily bars empty")
                 continue
-            df["trade_date"] = df["datetime"].dt.date
-            df_new = df[df["trade_date"] > last_date] if last_date is not None else df
-            if df_new.empty:
-                continue
-            # repository.upsert_stock_daily(ts_code, df_new)
-            repository.upsert_stock_kline(ts_code, "1d", df_new)
+            df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
+            last_dates = sorted(df_raw["datetime"].dt.date.unique())[-count:]
+            df_500 = df_raw[df_raw["datetime"].dt.date.isin(last_dates)].copy()
+            if len(last_dates) < 400:
+                print(f"WARNING: {ts_code} only {len(last_dates)} daily trading days (<400)")
+            repository.upsert_stock_kline(ts_code, "1d", df_500)
 
     print("[update_daily_bars] Done.")
 
@@ -224,3 +223,48 @@ def update_kline_for_universe(
                     df = ds.get_kline(ts_code, fq, start=s, end=e, count=None)
                     if not df.empty:
                         repository.upsert_stock_kline(ts_code, fq, df)
+
+def update_minute_kline_for_universe(
+    trade_date: date,
+    freqs: List[str],
+    settings: Optional[Settings] = None,
+) -> None:
+    """
+    对股票池在指定分钟 freqs 上做“先查缺口再回补”，使分钟线时间范围与最近 500 个有成交的日线交易日保持一致。
+
+    逻辑：
+    - 取 freq='1d' 最近 500 个且 volume>0 的交易日作为 trading_dates（升序）。
+    - 对每个分钟 freq：从 stock_kline 查询已有 distinct trade_date，计算缺失集合。
+    - 若存在缺失，按缺失集合的最小/最大日期范围从 pytdx 拉取分钟线并写入 stock_kline。
+    """
+    ts_codes = _get_all_stock_codes(settings)
+    if not ts_codes:
+        print("[update_minute_kline_for_universe] No stock_basic records found.")
+        return
+    BARS_PER_DAY = {"60m": 4, "30m": 8, "15m": 16}
+    with PytdxDataSource() as ds:
+        for ts_code in tqdm(ts_codes, desc="minute_univ", unit="stk"):
+            trading_dates = repository.get_recent_trading_dates(ts_code, limit=500)
+            if not trading_dates:
+                print(f"WARNING: {ts_code} no recent trading dates for 1d")
+                continue
+            start_date = min(trading_dates)
+            end_date = max(trading_dates)
+            target_days = len(trading_dates)
+            for fq in freqs:
+                if fq == "1d":
+                    continue
+                if fq not in BARS_PER_DAY:
+                    raise ValueError(f"不支持的分钟频率: {fq}")
+                bars_per_day = BARS_PER_DAY[fq]
+                count_needed = target_days * bars_per_day + bars_per_day * 5
+                df_raw = ds.get_minute_bars(ts_code, freq=fq, count=count_needed)
+                if df_raw.empty:
+                    print(f"WARNING: {ts_code} minute {fq} bars empty")
+                    continue
+                df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
+                df_raw["trade_date"] = df_raw["datetime"].dt.date
+                mask = (df_raw["trade_date"] >= start_date) & (df_raw["trade_date"] <= end_date)
+                df_window = df_raw.loc[mask].copy()
+                df_window = df_window[df_window["trade_date"].isin(trading_dates)].copy()
+                repository.upsert_stock_kline(ts_code, fq, df_window)

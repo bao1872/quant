@@ -14,6 +14,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from data.repository import get_all_stock_basics
+from chan.view_loader import get_chan_view_data
 from data.source_factory import get_data_source
 from factors.ict_smc import compute_ict_structures, ICTConfig
 from factors.harmonic_patterns import detect_harmonic_patterns
@@ -108,7 +109,7 @@ def _daily_recent_high(df: pd.DataFrame) -> float:
     return float(close.iloc[-1]) if len(close) > 0 else float("nan")
 
 
-def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, freq_label: str, key_suffix: str = "main"):
+def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, freq_label: str, key_suffix: str = "main", show_chan: bool = False, show_bi: bool = False, show_seg: bool = False, show_center: bool = False, show_signal: bool = False, chan_view: object | None = None):
     if "datetime" in df.columns:
         x = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     else:
@@ -290,6 +291,32 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                 row=1,
                 col=1,
             )
+    if show_chan and chan_view is not None:
+        xfmt = "%Y-%m-%d %H:%M:%S"
+        if show_bi and chan_view.bis:
+            bi_starts_x = [b.start_ts.strftime(xfmt) for b in chan_view.bis]
+            bi_starts_y = [b.start_price for b in chan_view.bis]
+            bi_ends_x = [b.end_ts.strftime(xfmt) for b in chan_view.bis]
+            bi_ends_y = [b.end_price for b in chan_view.bis]
+            fig.add_trace(go.Scatter(x=bi_starts_x, y=bi_starts_y, mode="markers", name="Bi start", marker=dict(symbol="circle", size=6)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=bi_ends_x, y=bi_ends_y, mode="markers", name="Bi end", marker=dict(symbol="x", size=6)), row=1, col=1)
+        if show_seg and chan_view.segments:
+            for s in chan_view.segments:
+                xs = [s.start_ts.strftime(xfmt), s.end_ts.strftime(xfmt)]
+                ys = [s.low, s.high] if str(s.direction).upper().startswith("UP") else [s.high, s.low]
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=f"Seg {s.seg_id}", line=dict(width=2, dash="dot"), showlegend=False), row=1, col=1)
+        if show_center and chan_view.centers:
+            for c in chan_view.centers:
+                fig.add_shape(type="rect", x0=c.start_ts.strftime(xfmt), x1=c.end_ts.strftime(xfmt), y0=c.low, y1=c.high, line=dict(width=0), fillcolor="rgba(0,0,255,0.1)", layer="below", row=1, col=1)
+        if show_signal and chan_view.signals:
+            buy_x = [g.ts.strftime(xfmt) for g in chan_view.signals if str(g.signal_type).upper().startswith("BUY")]
+            buy_y = [g.price for g in chan_view.signals if str(g.signal_type).upper().startswith("BUY")]
+            sell_x = [g.ts.strftime(xfmt) for g in chan_view.signals if str(g.signal_type).upper().startswith("SELL")]
+            sell_y = [g.price for g in chan_view.signals if str(g.signal_type).upper().startswith("SELL")]
+            if buy_x:
+                fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10)), row=1, col=1)
+            if sell_x:
+                fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10)), row=1, col=1)
     st.plotly_chart(fig, use_container_width=True, key=f"plotly-main-{ts_code}-{freq_label}-{key_suffix}")
 
 
@@ -330,6 +357,15 @@ def main():
         st.error("stock_basic 为空")
         return
     ts = st.sidebar.selectbox("选择股票", options=ts_codes, format_func=lambda x: code_to_name.get(x, x))
+    st.sidebar.markdown("### 缠论展示")
+    show_chan = st.sidebar.checkbox("叠加缠论结构", value=False)
+    if show_chan:
+        show_bi = st.sidebar.checkbox("笔 (Bi)", value=True)
+        show_seg = st.sidebar.checkbox("线段 (Segment)", value=False)
+        show_center = st.sidebar.checkbox("中枢 (Center)", value=False)
+        show_signal = st.sidebar.checkbox("信号 (Signal)", value=False)
+    else:
+        show_bi = show_seg = show_center = show_signal = False
     show_ict = st.sidebar.checkbox("叠加 ICT 结构", value=True)
     show_harm = st.sidebar.checkbox("叠加谐波形态", value=True)
     run_rr3_bt = st.sidebar.checkbox("运行 ICT R:R≥3 策略回测", value=True)
@@ -370,7 +406,17 @@ def main():
         with st.spinner("检测谐波形态..."):
             pats = detect_harmonic_patterns(df, ts, interval)
             df.attrs["harmonic_patterns"] = pats
-    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="top")
+    freq_map_db = {"日线": "1d", "60分钟": "60m", "30分钟": "30m", "15分钟": "15m", "5分钟": "5m"}
+    chan_view = None
+    if show_chan:
+        if "datetime" in df.columns and len(df) > 0:
+            start_dt = pd.to_datetime(df["datetime"].iloc[0])
+            end_dt = pd.to_datetime(df["datetime"].iloc[-1])
+            chan_view = get_chan_view_data(ts, freq_map_db.get(freq_label, "1d"), start_dt, end_dt)
+            st.caption(
+                f"Chan 元素数量: bi={len(chan_view.bis)}, seg={len(chan_view.segments)}, center={len(chan_view.centers)}, signal={len(chan_view.signals)}"
+            )
+    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="top", show_chan=show_chan, show_bi=show_bi, show_seg=show_seg, show_center=show_center, show_signal=show_signal, chan_view=chan_view)
     
 
     if run_rr3_bt:
@@ -431,7 +477,7 @@ def main():
 
     # 主图（含买卖标记）
     st.subheader("主图（含买卖标记）")
-    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="main")
+    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="main", show_chan=show_chan, show_bi=show_bi, show_seg=show_seg, show_center=show_center, show_signal=show_signal, chan_view=chan_view)
 
 
 if __name__ == "__main__":

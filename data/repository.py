@@ -217,6 +217,9 @@ def _ensure_stock_kline(eng) -> None:
             "create index if not exists idx_stock_kline_ts_freq_date on public.stock_kline(ts_code, freq, trade_date)"
         ))
         conn.execute(text(
+            "create index if not exists idx_stock_kline_code_freq_date on public.stock_kline(ts_code, freq, trade_date)"
+        ))
+        conn.execute(text(
             "create index if not exists idx_stock_kline_ts_freq_dt_desc on public.stock_kline(ts_code, freq, datetime desc)"
         ))
 
@@ -244,6 +247,31 @@ def upsert_stock_kline(ts_code: str, freq: str, df: pd.DataFrame) -> int:
         out.insert(0, "ts_code", ts_code)
         out.to_sql("stock_kline", conn, if_exists="append", index=False)
     return len(df)
+
+
+def get_recent_trading_dates(ts_code: str, limit: int) -> List[date]:
+    """
+    返回该股票在 stock_kline 中 freq='1d' 的最近 limit 个有成交的交易日（volume>0），按时间升序。
+    """
+    eng = get_engine()
+    _ensure_stock_kline(eng)
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        df = pd.read_sql(
+            text(
+                "select trade_date, volume from stock_kline where ts_code=:ts and freq='1d' order by trade_date desc limit :lim"
+            ),
+            conn,
+            params={"ts": ts_code, "lim": int(limit)},
+            parse_dates=["trade_date"],
+        )
+    if df.empty:
+        return []
+    df = df[df["volume"].astype(float) > 0]
+    dates = df["trade_date"].dt.date.tolist()
+    dates.reverse()
+    return dates
 
 
 def get_kline_date_range(ts_code: str, freq: str) -> tuple[date | None, date | None]:
