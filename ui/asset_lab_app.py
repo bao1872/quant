@@ -15,6 +15,9 @@ import streamlit as st
 
 from data.repository import get_all_stock_basics
 from data.source_factory import get_data_source
+from db.connection import get_engine
+from sqlalchemy import text
+from data.pytdx_source import PytdxDataSource
 from factors.ict_smc import compute_ict_structures, ICTConfig
 from factors.harmonic_patterns import detect_harmonic_patterns
 from backtest.bar_backtest import run_backtest_one_unit
@@ -43,25 +46,80 @@ def _load_stock_universe() -> Tuple[List[str], Dict[str, str]]:
 
 
 def _load_bars(asset_type: str, ts_code: str, freq_label: str, bar_count: int) -> pd.DataFrame:
+    freq_map = {
+        "日线": "1d",
+        "60分钟": "60m",
+        "30分钟": "30m",
+        "15分钟": "15m",
+        "5分钟": "5m",
+    }
+    fq = freq_map.get(freq_label, "1d")
+    eng = get_engine()
+    q = text(f"select datetime, open, high, low, close, volume from stock_kline where ts_code=:ts and freq=:fq order by datetime desc limit {int(bar_count)}")
+    df_db = pd.DataFrame()
+    with eng.connect() as conn:
+        df_db = pd.read_sql(q, conn, params={"ts": ts_code, "fq": fq}, parse_dates=["datetime"]) if eng is not None else pd.DataFrame()
+    df_db = df_db.sort_values("datetime").reset_index(drop=True) if not df_db.empty else pd.DataFrame(columns=["datetime","open","high","low","close","volume"])[:0]
+    if len(df_db) >= int(bar_count):
+        if fq != "1d" and "datetime" in df_db.columns:
+            per_day = df_db.groupby(pd.to_datetime(df_db["datetime"]).dt.date).size()
+            exp = {"60m": 4, "30m": 8, "15m": 16, "5m": 48}.get(fq)
+            if exp is not None:
+                med = int(per_day.tail(10).median()) if len(per_day) > 0 else 0
+                if med != exp:
+                    df_db = pd.DataFrame(columns=["datetime","open","high","low","close","volume"])[:0]
+        if not df_db.empty:
+            return df_db.tail(int(bar_count)).reset_index(drop=True)
     ds = get_data_source(asset_type)
-    if freq_label == "日线":
-        bars = ds.get_daily_bars(ts_code, count=bar_count)
+    if fq == "1d":
+        df_src = ds.get_daily_bars(ts_code, count=bar_count)
     else:
-        freq_map = {
-            "60分钟": "60m",
-            "30分钟": "30m",
-            "15分钟": "15m",
-            "5分钟": "5m",
-        }
-        freq = freq_map.get(freq_label)
-        bars = ds.get_minute_bars(ts_code, freq=freq, count=bar_count)
-    if bars is None or bars.empty:
-        raise RuntimeError(f"{ts_code} 在 {freq_label} 周期没有数据")
-    keep = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in bars.columns]
-    bars = bars[keep].copy()
-    if "datetime" in bars.columns:
-        bars = bars.sort_values("datetime")
-    return bars.reset_index(drop=True)
+        # 对分钟频率，按与日线同区间进行分页抓取，保证日内根数正确
+        df_day = ds.get_daily_bars(ts_code, count=max(bar_count, 240))
+        if df_day is None or df_day.empty:
+            df_src = ds.get_minute_bars(ts_code, freq=fq, count=bar_count)
+        else:
+            start_date = pd.to_datetime(df_day["datetime"]).dt.date.iloc[0]
+            end_date = pd.to_datetime(df_day["datetime"]).dt.date.iloc[-1]
+            market, code = PytdxDataSource.ts_code_to_tdx(ts_code)
+            cat_map = {"5m": 0, "15m": 1, "30m": 2, "60m": 3}
+            category = cat_map.get(fq)
+            rows = []
+            start_idx = 0
+            page = 600
+            while True:
+                raw = ds.api.get_security_bars(category=category, market=market, code=code, start=start_idx, count=page)
+                if not raw:
+                    break
+                dft = PytdxDataSource._bars_to_df(raw)
+                if dft is None or dft.empty:
+                    break
+                dft = dft.sort_values("datetime").reset_index(drop=True)
+                sdt = pd.to_datetime(dft["datetime"]).dt.date
+                mask = (sdt >= start_date) & (sdt <= end_date)
+                dft = dft.loc[mask]
+                if not dft.empty:
+                    rows.append(dft[["datetime", "open", "high", "low", "close", "volume"]].copy())
+                earliest = pd.to_datetime(dft["datetime"]).min() if not dft.empty else None
+                if earliest is not None and earliest.date() <= start_date:
+                    break
+                if len(raw) < page:
+                    break
+                start_idx += page
+            df_src = (pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["datetime","open","high","low","close","volume"]))
+    if df_src is None or df_src.empty:
+        return df_db.reset_index(drop=True)
+    keep = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df_src.columns]
+    df_src = df_src[keep].copy()
+    df_src["datetime"] = pd.to_datetime(df_src["datetime"]) if "datetime" in df_src.columns else pd.to_datetime([])
+    if not df_db.empty:
+        have = set(pd.to_datetime(df_db["datetime"]).tolist())
+        df_src = df_src[~df_src["datetime"].isin(have)]
+    df_all = pd.concat([df_db, df_src], ignore_index=True)
+    df_all = df_all.sort_values("datetime").reset_index(drop=True)
+    if len(df_all) > int(bar_count):
+        df_all = df_all.tail(int(bar_count)).reset_index(drop=True)
+    return df_all
 
 
 def _build_demo_signal(df: pd.DataFrame) -> pd.Series:
@@ -129,26 +187,7 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
         row=1,
         col=1,
     )
-    if "trend_state" in df.columns:
-        ts = df["trend_state"].tolist()
-        idxs = df.index.tolist()
-        start = 0
-        for i in range(1, len(ts) + 1):
-            if i == len(ts) or ts[i] != ts[start]:
-                state = ts[start]
-                x0 = x[start]
-                x1 = x[i - 1]
-                color_map = {
-                    int(TrendState.STRONG_LONG): "rgba(255,0,0,0.08)",
-                    int(TrendState.WEAK_LONG): "rgba(255,165,0,0.08)",
-                    int(TrendState.WEAK_SHORT): "rgba(135,206,250,0.08)",
-                    int(TrendState.STRONG_SHORT): "rgba(0,128,0,0.08)",
-                    int(TrendState.FLAT): None,
-                }
-                color = color_map.get(int(state), None)
-                if color is not None:
-                    fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.25, layer="below", line_width=0, row=1, col=1)
-                start = i
+    # 趋势分区可视化已移除
     if show_ict:
         if "ict_choch_flag" in df.columns:
             bull_idx = df.index[df["ict_choch_flag"] > 0]
@@ -229,72 +268,6 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
     fig.update_yaxes(title_text="成交量", row=2, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1)
     fig.update_layout(xaxis_rangeslider_visible=False, height=900)
-    # 叠加买卖位置标记
-    if "bt_trades" in df.attrs:
-        rows = df.attrs["bt_trades"]
-        entry_x: list = []
-        entry_y: list = []
-        exit_x: list = []
-        exit_y: list = []
-        for r in rows:
-            ei = r.get("entry_idx")
-            xi = r.get("exit_idx")
-            if ei is not None and ei in df.index:
-                entry_x.append(x[ei])
-                entry_y.append(float(df.loc[ei, "close"]))
-            else:
-                ed = r.get("entry_dt")
-                if ed is not None:
-                    ed_str = ed.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ed, "strftime") else str(ed)
-                    entry_x.append(ed_str)
-                    if "datetime" in df.columns:
-                        idx_match = df.index[df["datetime"].astype("datetime64[ns]") == ed]
-                        if len(idx_match) > 0:
-                            entry_y.append(float(df.loc[idx_match[0], "close"]))
-                        else:
-                            entry_y.append(float(df["close"].iloc[0]))
-                    else:
-                        entry_y.append(float(df["close"].iloc[0]))
-            if xi is not None and xi in df.index:
-                exit_x.append(x[xi])
-                exit_y.append(float(df.loc[xi, "close"]))
-            else:
-                xd = r.get("exit_dt")
-                if xd is not None:
-                    xd_str = xd.strftime("%Y-%m-%d %H:%M:%S") if hasattr(xd, "strftime") else str(xd)
-                    exit_x.append(xd_str)
-                    if "datetime" in df.columns:
-                        idx_match2 = df.index[df["datetime"].astype("datetime64[ns]") == xd]
-                        if len(idx_match2) > 0:
-                            exit_y.append(float(df.loc[idx_match2[0], "close"]))
-                        else:
-                            exit_y.append(float(df["close"].iloc[-1]))
-                    else:
-                        exit_y.append(float(df["close"].iloc[-1]))
-        if entry_x and entry_y:
-            fig.add_trace(
-                go.Scatter(
-                    x=entry_x,
-                    y=entry_y,
-                    mode="markers",
-                    marker=dict(symbol="circle-open", size=10, line=dict(width=2, color="blue")),
-                    name="入场",
-                ),
-                row=1,
-                col=1,
-            )
-        if exit_x and exit_y:
-            fig.add_trace(
-                go.Scatter(
-                    x=exit_x,
-                    y=exit_y,
-                    mode="markers",
-                    marker=dict(symbol="x", size=10, color="black"),
-                    name="出场",
-                ),
-                row=1,
-                col=1,
-            )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -337,9 +310,10 @@ def main():
     ts = st.sidebar.selectbox("选择股票", options=ts_codes, format_func=lambda x: code_to_name.get(x, x))
     show_ict = st.sidebar.checkbox("叠加 ICT 结构", value=True)
     show_harm = st.sidebar.checkbox("叠加谐波形态", value=True)
-    run_rr3_bt = st.sidebar.checkbox("运行 ICT R:R≥3 策略回测", value=True)
+    run_rr3_bt = st.sidebar.checkbox("运行 ICT R:R≥3 策略回测", value=False)
     with st.spinner("拉取K线..."):
         df = _load_bars(asset_type, ts, freq_label, bar_count)
+    
     L_list = [3, 4, 5, 6, 8, 10, 12]
     stats_map = ob_swing_tuner.evaluate_swing_lengths(df, L_list)
     best_L = (
@@ -354,9 +328,7 @@ def main():
         with st.spinner("计算ICT结构..."):
             df = compute_ict_structures(df, cfg_strategy)
             df = attach_entry_signals(df)
-            if freq_label == "日线":
-                dt_df = compute_daily_trend_with_fallback(df, swing_len=20)
-                df = df.merge(dt_df[["datetime", "trend_state"]], on="datetime", how="left")
+            # 趋势分区计算已移除
     if show_harm:
         interval_map = {
             "日线": "1D",
@@ -428,9 +400,7 @@ def main():
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
             df.attrs["bt_trades"] = rows
 
-    # 主图（含买卖标记）
-    st.subheader("主图（含买卖标记）")
-    _plot_main_chart(df, ts, show_ict, show_harm)
+    
 
 
 if __name__ == "__main__":

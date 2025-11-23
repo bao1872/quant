@@ -192,6 +192,60 @@ def upsert_stock_minute(
     return len(df)
 
 
+# -------- StockKline --------
+
+def upsert_stock_kline(ts_code: str, freq: str, df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        return 0
+    df = df.copy()
+    df["trade_date"] = pd.to_datetime(df["datetime"]).dt.date
+    eng = get_engine()
+    with eng.begin() as conn:
+        if _table_exists(eng, "stock_kline"):
+            min_date = df["trade_date"].min()
+            max_date = df["trade_date"].max()
+            conn.execute(
+                text("delete from stock_kline where ts_code=:ts and freq=:fq and trade_date>=:d1 and trade_date<=:d2"),
+                {"ts": ts_code, "fq": freq, "d1": min_date, "d2": max_date},
+            )
+        out = df[["datetime", "open", "high", "low", "close", "volume", "amount", "trade_date"]].copy()
+        out.insert(0, "freq", freq)
+        out.insert(0, "ts_code", ts_code)
+        out.to_sql("stock_kline", conn, if_exists="append", index=False)
+    return len(df)
+
+
+def get_kline_missing_dates(ts_code: str, freq: str, start_date: date, end_date: date, trade_calendar: Optional[Iterable[date]] = None) -> list[date]:
+    eng = get_engine()
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        df_min = pd.DataFrame()
+        df_day = pd.DataFrame()
+        if _table_exists(eng, "stock_kline"):
+            df_min = pd.read_sql(
+                text("select trade_date from stock_kline where ts_code=:ts and freq=:fq and trade_date>=:d1 and trade_date<=:d2"),
+                conn,
+                params={"ts": ts_code, "fq": freq, "d1": start_date, "d2": end_date},
+                parse_dates=["trade_date"],
+            )
+            df_day = pd.read_sql(
+                text("select trade_date from stock_kline where ts_code=:ts and freq='1d' and trade_date>=:d1 and trade_date<=:d2"),
+                conn,
+                params={"ts": ts_code, "d1": start_date, "d2": end_date},
+                parse_dates=["trade_date"],
+            )
+    if trade_calendar is not None:
+        base_dates = sorted(list({pd.to_datetime(d).date() for d in trade_calendar}))
+    else:
+        base_dates = sorted(list(pd.to_datetime(df_day.get("trade_date", pd.Series(dtype="datetime64[ns]") )).dt.date.unique())) if not df_day.empty else []
+    if not base_dates:
+        base_dates = pd.date_range(start=pd.Timestamp(start_date), end=pd.Timestamp(end_date), freq="D").date.tolist()
+    have_dates = sorted(list(pd.to_datetime(df_min.get("trade_date", pd.Series(dtype="datetime64[ns]") )).dt.date.unique())) if not df_min.empty else []
+    missing = sorted(list(set(base_dates) - set(have_dates)))
+    return missing
+
+
 if __name__ == "__main__":
     # 自测：构造虚拟 df 写入，再读取最后交易日
     from datetime import datetime

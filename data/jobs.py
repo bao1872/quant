@@ -13,7 +13,7 @@ from datetime import date as _date
 from datetime import timedelta as _timedelta
 from datetime import time as _time
 
-from .updater import update_daily_bars, update_minute_bars, collect_full_day_ticks
+from .updater import update_daily_bars, update_minute_bars, collect_full_day_ticks, update_kline_for_universe
 from .concepts_cache import update_concepts_cache, update_hk_industry_cache, validate_concepts_cache_count
 from factors.bollinger import compute_stock_bollinger_for_date, compute_concept_bollinger_for_date, _table_columns, compute_stock_bollinger_from_db_range, compute_concept_bollinger_from_db_range
 from db.connection import get_engine
@@ -29,15 +29,13 @@ from dataclasses import dataclass
 import numpy as np
 import logging
 from pathlib import Path
-from config import TICK_BASE_DIR
+from config import TICK_BASE_DIR, KLINE_FREQS, KLINE_HISTORY_DAYS
 import pyarrow.parquet as pq
 
 
 def job_update_ohlc(trade_date: _date) -> None:
     print(f"[job_update_ohlc] trade_date={trade_date}")
-    update_daily_bars(trade_date=trade_date, count=600)
-    job_update_minute_60m(trade_date)
-    job_update_minute_15m(trade_date)
+    update_kline_for_universe(trade_date=trade_date, freqs=KLINE_FREQS, history_days=KLINE_HISTORY_DAYS)
 
 
 def _validate_minute_for_date(d: _date) -> int:
