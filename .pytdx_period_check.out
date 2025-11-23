@@ -1,0 +1,6 @@
+init
+lens 360 800 800 800
+lens 360 800 800 800
+mismatch_60m 0 360
+mismatch_30m 0 200
+mismatch_15m 0 100

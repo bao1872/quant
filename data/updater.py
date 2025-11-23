@@ -26,7 +26,7 @@ from db.models import StockBasic
 from db.connection import get_session
 from .pytdx_source import PytdxDataSource
 from . import repository
-from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT, Settings
+from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT, Settings, KLINE_FREQS, KLINE_HISTORY_DAYS
 
 _BASICS_CACHE: List[str] | None = None
 
@@ -74,7 +74,8 @@ def update_daily_bars(
             df_new = df[df["trade_date"] > last_date] if last_date is not None else df
             if df_new.empty:
                 continue
-            repository.upsert_stock_daily(ts_code, df_new)
+            # repository.upsert_stock_daily(ts_code, df_new)
+            repository.upsert_stock_kline(ts_code, "1d", df_new)
 
     print("[update_daily_bars] Done.")
 
@@ -105,7 +106,8 @@ def update_minute_bars(
             df = ds.get_minute_bars(ts_code, freq=freq, count=count)
             if df.empty:
                 continue
-            repository.upsert_stock_minute(ts_code, df, freq=freq)
+            # repository.upsert_stock_minute(ts_code, df, freq=freq)
+            repository.upsert_stock_kline(ts_code, freq, df)
 
     print("[update_minute_bars] Done.")
 
@@ -184,3 +186,41 @@ def collect_full_day_ticks(trade_date: date, settings: Optional[Settings] = None
             store.save_ticks(ts_code, trade_date, df_tick, already_sorted=True)
     print("[collect_full_day_ticks] Done.")
     # 本地存储模式：不刷新数据库索引
+
+
+def update_kline_for_universe(
+    trade_date: date,
+    freqs: List[str],
+    history_days: int = KLINE_HISTORY_DAYS,
+    settings: Optional[Settings] = None,
+) -> None:
+    """
+    对股票池中的所有股票，在给定 freqs 上更新 K 线数据，写入 stock_kline。
+    第一次运行时，从 trade_date 往前 history_days 天起补齐所有 freq；之后每天运行时，只补齐缺失的部分。
+    """
+    ts_codes = _get_all_stock_codes(settings)
+    if not ts_codes:
+        print("[update_kline_for_universe] No stock_basic records found.")
+        return
+    start_date_target = pd.to_datetime(trade_date) - pd.Timedelta(days=history_days)
+    start_date_target = start_date_target.date()
+    with PytdxDataSource() as ds:
+        for ts_code in tqdm(ts_codes, desc="kline", unit="stk"):
+            base_start, base_end = repository.get_kline_date_range(ts_code, "1d")
+            if base_start is None or base_end is None:
+                df_day = ds.get_kline(ts_code, "1d", count=history_days + 20)
+                repository.upsert_stock_kline(ts_code, "1d", df_day)
+                base_start, base_end = repository.get_kline_date_range(ts_code, "1d")
+            for fq in freqs:
+                if fq == "1d":
+                    continue
+                cur_start, cur_end = repository.get_kline_date_range(ts_code, fq)
+                target_start = base_start or start_date_target
+                target_end = trade_date
+                missing = repository.get_kline_missing_dates(ts_code, fq, target_start, target_end, trade_calendar=None)
+                if missing:
+                    s = min(missing)
+                    e = max(missing)
+                    df = ds.get_kline(ts_code, fq, start=s, end=e, count=None)
+                    if not df.empty:
+                        repository.upsert_stock_kline(ts_code, fq, df)

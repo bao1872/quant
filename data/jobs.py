@@ -13,7 +13,8 @@ from datetime import date as _date
 from datetime import timedelta as _timedelta
 from datetime import time as _time
 
-from .updater import update_daily_bars, update_minute_bars, collect_full_day_ticks
+from .updater import update_daily_bars, update_minute_bars, collect_full_day_ticks, update_kline_for_universe
+from config import KLINE_FREQS, KLINE_HISTORY_DAYS
 from .concepts_cache import update_concepts_cache, update_hk_industry_cache, validate_concepts_cache_count
 from factors.bollinger import compute_stock_bollinger_for_date, compute_concept_bollinger_for_date, _table_columns, compute_stock_bollinger_from_db_range, compute_concept_bollinger_from_db_range
 from db.connection import get_engine
@@ -35,9 +36,10 @@ import pyarrow.parquet as pq
 
 def job_update_ohlc(trade_date: _date) -> None:
     print(f"[job_update_ohlc] trade_date={trade_date}")
-    update_daily_bars(trade_date=trade_date, count=600)
+    update_daily_bars(trade_date=trade_date, count=500)
     job_update_minute_60m(trade_date)
     job_update_minute_15m(trade_date)
+    job_update_minute_30m(trade_date)
 
 
 def _validate_minute_for_date(d: _date) -> int:
@@ -78,10 +80,86 @@ def job_collect_full_day_ticks(trade_date: _date) -> None:
     collect_full_day_ticks(trade_date)
 
 
+def job_update_kline(trade_date: _date) -> None:
+    print(f"[job_update_kline] trade_date={trade_date}")
+    update_kline_for_universe(trade_date=trade_date, freqs=KLINE_FREQS, history_days=KLINE_HISTORY_DAYS)
+
+
 def job_finalize_ticks_and_levels(trade_date: _date) -> None:
     print(f"[job_finalize_ticks_and_levels] trade_date={trade_date}")
     provider = AbuPriceLevelProvider()
     provider.precompute(trade_date)
+
+
+def job_update_kline_task1(trade_date: _date, settings=None) -> None:
+    print(f"[job_update_kline_task1] trade_date={trade_date}")
+    eng = get_engine()
+    basics = get_all_stock_basics()
+    from config import STOCK_POOL_LIMIT, Settings
+    from .pytdx_source import PytdxDataSource
+    ts_codes = [s.ts_code for s in basics]
+    limit = (settings.stock_pool_limit if isinstance(settings, Settings) else STOCK_POOL_LIMIT)
+    if limit is not None:
+        ts_codes = ts_codes[:limit]
+    if not ts_codes:
+        print("[job_update_kline_task1] empty stock_basic")
+        return
+    start_target = (pd.to_datetime(trade_date) - pd.Timedelta(days=KLINE_HISTORY_DAYS)).date()
+    with PytdxDataSource() as ds:
+        for ts_code in tqdm(ts_codes, desc="task1_kline", unit="stk"):
+            with eng.connect() as conn:
+                df_day_range = pd.read_sql(
+                    text("select min(trade_date) as d1, max(trade_date) as d2 from stock_kline where ts_code=:ts and freq='1d'"),
+                    conn,
+                    params={"ts": ts_code},
+                    parse_dates=["d1","d2"],
+                )
+            need_init_day = df_day_range.empty or pd.isna(df_day_range["d1"].iloc[0]) or pd.isna(df_day_range["d2"].iloc[0])
+            if need_init_day:
+                df_day = ds.get_kline(ts_code, "1d", count=KLINE_HISTORY_DAYS + 20)
+                if not df_day.empty:
+                    repository.upsert_stock_kline(ts_code, "1d", df_day)
+                    with eng.connect() as conn:
+                        df_day_range = pd.read_sql(
+                            text("select min(trade_date) as d1, max(trade_date) as d2 from stock_kline where ts_code=:ts and freq='1d'"),
+                            conn,
+                            params={"ts": ts_code},
+                            parse_dates=["d1","d2"],
+                        )
+            base_start = start_target
+            base_end = trade_date
+            if not df_day_range.empty and not pd.isna(df_day_range["d1"].iloc[0]):
+                d1 = df_day_range["d1"].iloc[0]
+                base_start = d1.date() if hasattr(d1, "date") else d1
+            with eng.connect() as conn:
+                df_cal = pd.read_sql(
+                    text("select distinct trade_date from stock_kline where ts_code=:ts and freq='1d' and trade_date>=:d1 and trade_date<=:d2 order by trade_date"),
+                    conn,
+                    params={"ts": ts_code, "d1": base_start, "d2": base_end},
+                    parse_dates=["trade_date"],
+                )
+            calendar = set(df_cal["trade_date"].dt.date.tolist()) if not df_cal.empty else set()
+            if not calendar:
+                continue
+            for fq in KLINE_FREQS:
+                if fq == "1d":
+                    continue
+                with eng.connect() as conn:
+                    df_have = pd.read_sql(
+                        text("select distinct trade_date from stock_kline where ts_code=:ts and freq=:fq and trade_date>=:d1 and trade_date<=:d2 order by trade_date"),
+                        conn,
+                        params={"ts": ts_code, "fq": fq, "d1": base_start, "d2": base_end},
+                        parse_dates=["trade_date"],
+                    )
+                have = set(df_have["trade_date"].dt.date.tolist()) if not df_have.empty else set()
+                missing = sorted(list(calendar - have))
+                if not missing:
+                    continue
+                s = min(missing)
+                e = max(missing)
+                df = ds.get_kline(ts_code, fq, start=s, end=e, count=None)
+                if not df.empty:
+                    repository.upsert_stock_kline(ts_code, fq, df)
 
 
 def _list_tick_parquet_for_date(d: _date) -> list[Path]:

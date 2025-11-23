@@ -1,59 +1,282 @@
-我已经安装好了 baostock，并完成了 chan 子模块的“抽象 → 抽取 → 落库 → 校验”实现。
+【任务背景】
+目前项目中日线和分钟线分别用 stock_daily / stock_minute 存储，更新逻辑在 data/jobs.py + data/updater.py + data/repository.py 中，数据来源主要是 data/pytdx_source.py。
+我现在希望统一成一张表 stock_kline，通过 freq 字段区分不同周期（例如 "1d" / "60m" / "15m"），方便后续缠论和特征工程统一使用。
+特别要求：
 
-现在请你帮我做一次 端到端的实验 + 校验，覆盖三只股票：
+每个周期的数据时间起点要一致，即对于同一只股票，在配置的历史区间内，"1d"、"60m"、"15m" 这几个 freq 覆盖的交易日范围一致；
 
-西部超导：SH.688122
+第一次全量更新时，要从配置的起始日期回补所有 freq；
 
-兴业银锡：SZ.000426
+之后增量更新时，要能“查出 stock_kline 里缺哪些交易日的数据，并补齐”。
 
-万兴科技：SZ.300624
+任务 A：设计并创建 stock_kline，并迁移写入逻辑
+A-1 表结构与索引
 
-具体任务
+在数据库中新增一张表 stock_kline（PostgreSQL），字段建议如下（按现有项目风格实现）：
 
-在一个简单的脚本（例如 scripts/run_chan_experiment.py）中，调用：
+ts_code：string，例如 "SH.688122" / "SZ.000426"
 
-from chan.pipeline import run_chan_for_symbol_to_db
+freq：string，例如 "1d", "60m", "15m"
 
-# 对 3 只股票、["day", "60m"] 两个级别、2023-01-01 ~ 2023-12-31 跑缠论并落库
+datetime：timestamp，K 线结束时间（分钟线用精确时间，日线用当日收盘时间或 00:00）
+
+trade_date：date，datetime::date（方便按自然日扫描）
+
+open, high, low, close：numeric
+
+volume：bigint
+
+amount：numeric（可选）
+
+约束与索引：
+
+唯一约束/主键：(ts_code, freq, datetime)
+
+索引：
+
+(ts_code, freq, trade_date)
+
+如有必要，再加 (ts_code, freq, datetime DESC) 方便取最后一根
+
+注意：不要删除现有 stock_daily / stock_minute，先保留兼容，后面再逐步迁移。
+
+A-2 Repository 层：新增统一写入方法
+
+在 data/repository.py 中新增：
+
+def upsert_stock_kline(
+    ts_code: str,
+    freq: str,
+    df: pd.DataFrame,
+) -> int:
+    """
+    将 df 中的 K 线写入 stock_kline。
+    要求 df 至少包含:
+      - datetime
+      - open, high, low, close, volume
+      - 可选 amount
+    逻辑：
+      1) df 为空则直接返回 0
+      2) 复制 df，增加 trade_date = datetime.dt.date
+      3) 计算当前批次的时间窗 [min_dt, max_dt]
+      4) delete from stock_kline where ts_code=:ts and freq=:freq and datetime between :t1 and :t2
+      5) 批量插入当前 df
+      6) 返回插入行数
+    """
 
 
 要求：
 
-使用 data_src="baostock"，autype="qfq"；
+不用 try-except 吃掉异常；
 
-对每只股票跑完后，打印每个 freq 在 stock_chan_bi / stock_chan_segment / stock_chan_center / stock_chan_signal 中的记录数。
+删除、插入都使用目前项目统一的 get_engine() / text() 风格；
 
-在同一个脚本或单独的 scripts/check_chan_experiment.py 中，调用：
+保持与 upsert_stock_daily / upsert_stock_minute 一致的“删后插”方式。
 
-from chan.validate import check_bi_direction, check_bi_time_order, check_center_range
+可选：在不破坏现有代码的前提下，将 upsert_stock_daily / upsert_stock_minute 改成对 upsert_stock_kline 的轻量封装（比如 freq 固定为 "1d" / "15m"），但不要强行改掉所有调用者，避免一下子改挂。
 
+A-3 DataSource 层：统一日线 / 分钟线获取接口（以 kline 为单位）
 
-对这 3 只股票的 "day" 级别进行检查，打印结果类似：
+在 data/pytdx_source.py 中：
 
-=== SH.688122 day ===
-direction_errors: X
-time_errors: Y
-center_errors: Z
+明确频率映射（参考 pytdx 文档）：
 
-
-确保：
-
-不改动 third_party/chan.py；
-
-不使用 try-except 吞异常；
-
-所有命令可以通过：
-
-python scripts/run_chan_experiment.py
-python scripts/check_chan_experiment.py
+# 示例，需按 pytdx 实际 category 映射确认
+FREQ_CATEGORY = {
+    "1m": 0,
+    "5m": 1,
+    "15m": 2,
+    "30m": 3,
+    "60m": 4,
+}
 
 
-直接运行。
+保留日线、分钟线原有方法，但同时新增一个统一接口：
 
-最后，请在任务说明里总结：
+class PytdxDataSource(...):
+    ...
 
-3 只股票分别在 4 个 chan 表里的记录数量（按 freq 分组）；
+    def get_kline(
+        self,
+        ts_code: str,
+        freq: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        count: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        返回指定股票、周期的 K 线数据，列包含 datetime/open/high/low/close/volume/amount。
+        - freq: "1d", "60m", "15m" 等
+        - start/end: 优先按日期区间过滤
+        - count: 在无法按日期精确过滤时，用 count 回溯（例如 pytdx 限制）
+        """
 
-三个校验函数的返回值（direction/time/center 错误数）；
 
-如果错误数不为 0，简单分析一下可能的原因并给出你建议的下一步。
+具体内部实现可以基于现有 get_daily_bars / get_minute_bars，再按日期切片；保持风格一致即可。
+
+任务 B：统一更新逻辑，保证各个周期的起点一致
+
+核心目标：
+
+对于每一个 ts_code，在一个配置好的“历史区间”内（例如最近 500 个交易日）
+
+freq="1d" 的日线覆盖整个区间；
+
+每个分钟周期（例如 "60m", "15m"）在 同样的交易日集合 上都有数据（每个交易日至少要有一根 K）。
+
+B-1 新增配置项
+
+在项目配置中（例如 config.py 或 data/jobs 的顶部），新增两类参数：
+
+KLINE_FREQS = ["1d", "60m", "15m"]
+KLINE_HISTORY_DAYS = 500  # 或者一个日期 KLINE_START_DATE = date(2020,1,1)
+
+
+你可以任选一种表达方式，要求是：
+
+能明确一个“历史起点”：比如 today - KLINE_HISTORY_DAYS；
+
+之后所有 freq 都以这个起点为下限，保证覆盖范围一致。
+
+B-2 Updater 层：新增统一的 update 函数
+
+在 data/updater.py 中新增：
+
+def update_kline_for_universe(
+    trade_date: date,
+    freqs: list[str],
+    history_days: int = 500,
+) -> None:
+    """
+    对股票池中的所有股票，在给定 freqs 上更新 K 线数据，写入 stock_kline。
+    要求：
+      - 第一次运行时，从 trade_date 往前 history_days 天起补齐所有 freq
+      - 之后每天运行时，只补齐缺失的部分
+    """
+
+
+建议实现逻辑：
+
+从 data/basic_universe.get_basic_universe() 获取当前股票池（ts_code 列表）；
+
+对每个 ts_code、每个 freq：
+
+计算本次目标覆盖区间 [start_date_target, trade_date]：
+start_date_target = trade_date - history_days；
+
+查询 stock_kline 中当前 ts_code+freq 的覆盖区间（见任务 C）；
+
+推导“缺失时间段”（例如完全没有数据 / 只有最近一段 / 中间有缺口）；
+
+调用 PytdxDataSource.get_kline(ts_code, freq, start=missing_start, end=missing_end, ...) 拉数据，
+再交给 upsert_stock_kline 写入。
+
+要求：
+
+逻辑上能覆盖“第一次全量 + 后续增量”；
+
+不要求把“中间有缺口”的情况做得很复杂，至少要能处理“没有数据时全量补齐”和“有数据时从 last_date 往后补”。
+
+任务 C：提供“缺失交易日检查”与验证脚本
+
+为了确保数据起点对齐 + 没有缺交易日，需要你实现：
+
+C-1 Repository 层：查询覆盖区间和缺失日期
+
+在 data/repository.py 中新增：
+
+def get_kline_date_range(ts_code: str, freq: str) -> tuple[date | None, date | None]:
+    """
+    返回给定 ts_code+freq 在 stock_kline 中的 (min_trade_date, max_trade_date)。
+    如果没有记录，返回 (None, None)。
+    """
+
+def get_kline_missing_dates(
+    ts_code: str,
+    freq: str,
+    start_date: date,
+    end_date: date,
+    trade_calendar: list[date] | None = None,
+) -> list[date]:
+    """
+    返回在 [start_date, end_date] 之间，stock_kline 中缺失的交易日列表。
+    - 如果给定 trade_calendar，则以 trade_calendar 为基准；
+    - 否则可以简单使用 stock_kline 中出现过的 trade_date 去推断连续性。
+    """
+
+
+（如果项目里已有交易日历相关代码，可以直接复用；否则可以简单使用 stock_daily / stock_kline 自己的 distinct trade_date 做近似。）
+
+C-2 验证脚本：scripts/validate_kline_coverage.py
+
+在 scripts/ 下新增脚本（例如 scripts/validate_kline_coverage.py）：
+
+功能：
+
+遍历股票池中若干只股票（可以限制前 N 只），对每个 freq in KLINE_FREQS：
+
+调用 get_kline_date_range(ts_code, "1d") 得到基准起止日期（start_day, end_day）；
+
+对其它 freq（"60m", "15m"）调用 get_kline_missing_dates(ts_code, freq, start_day, end_day)；
+
+统计每个 freq 缺失的交易日数量。
+
+总结输出类似：
+
+=== SH.688122 ===
+1d: range=2022-01-05 .. 2025-02-20 (0 missing)
+60m: range=2022-01-05 .. 2025-02-20 (missing_days=1 -> [2023-04-03])
+15m: range=2022-01-05 .. 2025-02-20 (missing_days=0)
+...
+TOTAL:
+  codes_checked: 50
+  freq=1d: total_missing_days=0
+  freq=60m: total_missing_days=1
+  freq=15m: total_missing_days=0
+
+
+若发现缺失天数过多（比如 >0），脚本退出前给出明显的 WARNING 或直接 raise，方便后续 CI/自动化检测。
+
+要求：
+
+不要用 try-except 把异常吃掉；
+
+核心逻辑要有注释和 docstring；
+
+便于我在本地直接跑：
+
+python scripts/validate_kline_coverage.py
+
+任务 D：工作完成后的自我说明（你给我的汇总）
+
+完成上述改动后，请在说明里回答这三点（方便我验收）：
+
+schema & 代码改动摘要
+
+stock_kline 的最终字段列表 / 主键 / 索引；
+
+新增/修改了哪些函数（upsert_stock_kline, update_kline_for_universe, get_kline_date_range, get_kline_missing_dates 等）。
+
+你是如何保证“各周期起点一致 + 不缺交易日”的？
+
+具体是如何利用 KLINE_HISTORY_DAYS 或起始日期的；
+
+validate_kline_coverage.py 的检查逻辑简介。
+
+你实际跑了什么命令，输出是什么？
+
+至少包括：
+
+python -m data.jobs 或你设计的入口，用于执行一次 K 线更新；
+
+python scripts/validate_kline_coverage.py 输出的摘要（可以贴一小段）。
+
+如果发现存在缺失日期，也请说明你是如何修复的。
+
+请注意：
+
+不要改第三方 third_party/chan.py；
+
+现有使用 stock_daily / stock_minute 的地方先尽量保持兼容（或者在说明里明确标注“已废弃，仅用于历史数据，不再更新”）；
+
+不使用大范围 try-except 把错误吞掉，让问题暴露出来，便于修正。 

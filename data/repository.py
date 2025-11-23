@@ -192,6 +192,116 @@ def upsert_stock_minute(
     return len(df)
 
 
+# -------- StockKline --------
+
+def _ensure_stock_kline(eng) -> None:
+    with eng.begin() as conn:
+        conn.execute(text(
+            """
+            create table if not exists public.stock_kline (
+                ts_code text not null,
+                freq text not null,
+                datetime timestamp not null,
+                trade_date date not null,
+                open double precision not null,
+                high double precision not null,
+                low double precision not null,
+                close double precision not null,
+                volume bigint not null,
+                amount double precision,
+                primary key (ts_code, freq, datetime)
+            )
+            """
+        ))
+        conn.execute(text(
+            "create index if not exists idx_stock_kline_ts_freq_date on public.stock_kline(ts_code, freq, trade_date)"
+        ))
+        conn.execute(text(
+            "create index if not exists idx_stock_kline_ts_freq_dt_desc on public.stock_kline(ts_code, freq, datetime desc)"
+        ))
+
+
+def upsert_stock_kline(ts_code: str, freq: str, df: pd.DataFrame) -> int:
+    """
+    将 df 中的 K 线写入 stock_kline。
+    要求 df 至少包含 datetime/open/high/low/close/volume，可选 amount。
+    删除 [min_dt, max_dt] 区间旧记录后批量插入。
+    """
+    if df is None or df.empty:
+        return 0
+    eng = get_engine()
+    _ensure_stock_kline(eng)
+    df = df.copy()
+    df["trade_date"] = df["datetime"].dt.date
+    min_dt = df["datetime"].min()
+    max_dt = df["datetime"].max()
+    with eng.begin() as conn:
+        conn.execute(text(
+            "delete from stock_kline where ts_code=:ts and freq=:fq and datetime>=:t1 and datetime<=:t2"
+        ), {"ts": ts_code, "fq": freq, "t1": min_dt, "t2": max_dt})
+        out = df[["datetime","trade_date","open","high","low","close","volume","amount"]].copy()
+        out.insert(0, "freq", freq)
+        out.insert(0, "ts_code", ts_code)
+        out.to_sql("stock_kline", conn, if_exists="append", index=False)
+    return len(df)
+
+
+def get_kline_date_range(ts_code: str, freq: str) -> tuple[date | None, date | None]:
+    """
+    返回给定 ts_code+freq 在 stock_kline 中的 (min_trade_date, max_trade_date)。
+    如果没有记录，返回 (None, None)。
+    """
+    eng = get_engine()
+    _ensure_stock_kline(eng)
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        df = pd.read_sql(
+            text("select min(trade_date) as d1, max(trade_date) as d2 from stock_kline where ts_code=:ts and freq=:fq"),
+            conn,
+            params={"ts": ts_code, "fq": freq},
+            parse_dates=["d1","d2"],
+        )
+    if df.empty:
+        return None, None
+    d1 = df["d1"].iloc[0]
+    d2 = df["d2"].iloc[0]
+    if pd.isna(d1) or pd.isna(d2):
+        return None, None
+    return (d1.date() if hasattr(d1, "date") else d1, d2.date() if hasattr(d2, "date") else d2)
+
+
+def get_kline_missing_dates(
+    ts_code: str,
+    freq: str,
+    start_date: date,
+    end_date: date,
+    trade_calendar: List[date] | None = None,
+) -> List[date]:
+    """
+    返回在 [start_date, end_date] 之间，stock_kline 中缺失的交易日列表。
+    如果提供 trade_calendar，以其为基准；否则使用 stock_kline 出现过的 trade_date 去推断连续性。
+    """
+    eng = get_engine()
+    _ensure_stock_kline(eng)
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        df = pd.read_sql(
+            text("select distinct trade_date from stock_kline where ts_code=:ts and freq=:fq and trade_date>=:d1 and trade_date<=:d2 order by trade_date"),
+            conn,
+            params={"ts": ts_code, "fq": freq, "d1": start_date, "d2": end_date},
+            parse_dates=["trade_date"],
+        )
+    have = set(df["trade_date"].dt.date.tolist()) if not df.empty else set()
+    if trade_calendar is None:
+        base = have
+    else:
+        base = set([d for d in trade_calendar if start_date <= d <= end_date])
+    missing = sorted(list(base - have))
+    return missing
+
+
 if __name__ == "__main__":
     # 自测：构造虚拟 df 写入，再读取最后交易日
     from datetime import datetime

@@ -154,10 +154,11 @@ class PytdxDataSource(DataSource):
         market, code = self.ts_code_to_tdx(ts_code)
 
         freq_map = {
-            "5m": 0,
-            "15m": 1,
-            "30m": 2,
-            "60m": 3,
+            "1m": 0,
+            "5m": 1,
+            "15m": 2,
+            "30m": 3,
+            "60m": 4,
         }
         if freq not in freq_map:
             raise ValueError(f"不支持的分钟频率: {freq}")
@@ -177,6 +178,34 @@ class PytdxDataSource(DataSource):
         df["ts_code"] = ts_code
         df["freq"] = freq
         return df
+
+    def get_kline(
+        self,
+        ts_code: str,
+        freq: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        count: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        返回指定股票、周期的 K 线数据，列包含 datetime/open/high/low/close/volume/amount。
+        - freq: "1d", "60m", "30m", "15m" 等
+        - start/end: 优先按日期区间过滤
+        - count: 在无法按日期精确过滤时，用 count 回溯
+        """
+        if freq == "1d":
+            n = count or 240
+            df = self.get_daily_bars(ts_code, count=n)
+        else:
+            n = count or 800
+            df = self.get_minute_bars(ts_code, freq=freq, count=n)
+        if df.empty:
+            return df
+        if start is not None:
+            df = df[df["datetime"] >= pd.to_datetime(start)]
+        if end is not None:
+            df = df[df["datetime"] <= pd.to_datetime(end)]
+        return df.sort_values("datetime").reset_index(drop=True)
 
     def get_ticks(
         self,
