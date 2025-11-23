@@ -153,12 +153,29 @@ def get_chan_view_data(ts_code: str, freq: str, start: datetime, end: datetime) 
     kline = load_kline(ts_code, freq, start, end)
     chan = load_chan_structures(ts_code, freq, start, end)
     print(
-        f"[ChanView] ts={ts_code} chan_code={ts_to_chan_code(ts_code)} freq_in={freq} freq_db={freq} range={pd.to_datetime(start)}..{pd.to_datetime(end)}"
-    )
-    print(
-        f"  kline_rows={len(kline)} bis={len(chan.bis)} segments={len(chan.segments)} centers={len(chan.centers)} signals={len(chan.signals)}"
+        "[ChanView]",
+        "ts_code=", ts_code,
+        "freq=", freq,
+        "range=", pd.to_datetime(start), "->", pd.to_datetime(end),
+        "kline_rows=", len(kline),
+        "bis=", len(chan.bis),
+        "segments=", len(chan.segments),
+        "centers=", len(chan.centers),
+        "signals=", len(chan.signals),
     )
     return ChanViewData(kline=kline, bis=chan.bis, segments=chan.segments, centers=chan.centers, signals=chan.signals)
+
+
+def get_chan_view_data_realtime(ts_code: str, freq: str, kline_df: pd.DataFrame) -> ChanViewData:
+    from .pipeline import run_chan_for_df
+    if kline_df is None or kline_df.empty:
+        return ChanViewData(kline=pd.DataFrame(columns=["datetime","open","high","low","close","volume"])[:0], bis=[], segments=[], centers=[], signals=[])
+    df = kline_df.sort_values("datetime").reset_index(drop=True)
+    res_map = run_chan_for_df(ts_code, freq, df)
+    res = res_map.get(freq)
+    if res is None:
+        return ChanViewData(kline=df, bis=[], segments=[], centers=[], signals=[])
+    return ChanViewData(kline=df, bis=res.bis, segments=res.segments, centers=res.centers, signals=res.signals)
 
 
 if __name__ == "__main__":

@@ -1,306 +1,195 @@
-仓库：当前这个 quant-chan 项目
+仓库：d:\quant
 目标：
 
-在行情数据层增加一个 HybridDataSource，实现“优先从数据库 stock_kline 读取，不足部分再用 PytdxDataSource 从 pytdx 获取并回写 DB”的逻辑；
+Streamlit UI 中缠论元素（笔/线段/中枢/信号）全部改成实时计算，直接基于当前 K 线 df 计算 CChan 结果，不再从 stock_chan_* 表读取。
 
-修改 get_data_source("stock")，让 Streamlit UI 使用 HybridDataSource；
+原有 run_chan_backfill.py + stock_chan_* 继续保留，只用于离线/批量分析，UI 不再依赖这些表。
 
-检查并验证“60 分钟”周期的映射与实际取数是否正确（不能返回日线），如有问题修复。
+修改范围：chan/pipeline.py、chan/view_loader.py、ui/asset_lab_app.py，除非确有必要，不改其他模块。
 
-请严格控制改动范围，只修改与行情数据源/周期映射直接相关的代码，其他业务逻辑不要动。
+一、新增：基于 DataFrame 的缠论计算函数（不访问 DB）
 
-一、实现 HybridDataSource（DB 优先）
+文件： chan/pipeline.py
 
-文件范围：
+在现有的 run_chan_for_symbol 旁边，新增一个函数，例如：
 
-data/base_source.py（只读，参考接口定义，不要大改）
+from typing import Dict
+from .types import ChanResult  # 已有类型
 
-data/pytdx_source.py（只读，用作内部真实数据源）
-
-data/repository.py（增加读取 stock_kline 的简单查询函数）
-
-新增：data/hybrid_source.py
-
-1. 在 repository 里增加一个取最近 N 根 K 线的函数
-
-在 data/repository.py 里新增，例如：
-
-def get_recent_kline(
+def run_chan_for_df(
     ts_code: str,
     freq: str,
-    count: int,
-) -> pd.DataFrame:
+    kline_df: pd.DataFrame,
+) -> Dict[str, ChanResult]:
     """
-    从 stock_kline 中取某只股票、某个 freq 的最近 count 根 K 线，
-    按 datetime 升序返回。没有数据则返回空 DataFrame。
+    基于已经准备好的 K 线 DataFrame 做缠论计算，不访问任何外部行情源/数据库。
+    - ts_code: '000001.SZ'
+    - freq: '1d' / '60m' 等（UI 已经统一）
+    - kline_df: 至少包含 ['datetime','open','high','low','close','volume'] 列，按时间升序
+    返回结构同 run_chan_for_symbol：{freq_key: ChanResult}
     """
-    eng = get_engine()
-    _ensure_stock_kline(eng)
-    from sqlalchemy import text as _text
-    with eng.connect() as conn:
-        conn.rollback()
-        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-        sql = _text(
-            """
-            select ts_code, freq, datetime, open, high, low, close, volume, amount
-            from stock_kline
-            where ts_code = :ts and freq = :fq
-            order by datetime desc
-            limit :n
-            """
-        )
-        df = pd.read_sql(
-            sql,
-            conn,
-            params={"ts": ts_code, "fq": freq, "n": count},
-            parse_dates=["datetime"],
-        )
-    if df.empty:
-        return df
-    return df.sort_values("datetime").reset_index(drop=True)
+
+    # 1) 构造 CChan 所需的 KL_TYPE（参考原 run_chan_for_symbol 的映射逻辑）
+    #    例如: freq '1d' -> KL_TYPE.K_DAY, '60m' -> KL_TYPE.K_60M ...
+    #    请直接复用 pipeline 里已有的映射函数/字典，避免重复写。
+    kl_type = _freq_to_kl_type(freq)  # 这里用你项目里已有的函数/字典
+
+    # 2) 利用 third_party/chan 里的能力，把 DataFrame 转为 CChan 可用的 K 线序列
+    #    查找现有 "from_df" 或类似的辅助函数（例如 create_kl_from_df / kl_df_adapter），
+    #    没有的话仿照 baostock 数据源构造 K 线对象列表。
+    #
+    # 伪代码（具体实现按 third_party/chan.py 的接口来）：
+    #
+    #   kl_data = convert_df_to_kl(kline_df, kl_type)
+    #   cchan = build_cchan_for_df(ts_code, kl_type, kl_data)
+    #   cchan.run()
+    #   result = extract_chan_result(cchan)  # 同 run_chan_for_symbol 中的提取逻辑
+    #
+    # 3) 返回 {freq_key: ChanResult}，freq_key 与原先保持一致（'1d'、'60m' 等）
+
+    ...
 
 
 要求：
 
-不要改已有的写入逻辑（upsert_stock_kline 等），只新增查询函数；
+这个函数绝对不允许去访问 baostock、pytdx 或 DB，只用传进来的 kline_df。
 
-freq 的值与现有逻辑保持一致：日线 "1d"，分钟 "60m" / "30m" / "15m" / "5m" 等。
+ChanResult 的构造方式、内容要与 run_chan_for_symbol 完全一致（bis/segments/centers/signals 类型一致），可以复用已有的提取函数。
 
-2. 新增 HybridDataSource 实现
+如果你在 third_party/chan.py 里找到了“基于 DataFrame 的初始化方式”，就按它来；如果没有，就参照当前 baostock / db 数据源构造 K 线序列，只是把“取数”换成用 kline_df。
 
-新建文件：data/hybrid_source.py，内容示例：
+二、新增：UI 专用的实时 ChanView 构造函数
 
-from __future__ import annotations
+文件： chan/view_loader.py
 
-from datetime import date, datetime
-from typing import Optional
+保留原来的基于 DB 的 get_chan_view_data（供离线分析用），但新增一个专门给 UI 用的函数，例如：
 
-import pandas as pd
+from .pipeline import run_chan_for_df
+from .types import ChanViewData  # 已有
 
-from .base_source import DataSource
-from .pytdx_source import PytdxDataSource
-from . import repository
-
-
-class HybridDataSource(DataSource):
+def get_chan_view_data_realtime(
+    ts_code: str,
+    freq: str,
+    kline_df: pd.DataFrame,
+) -> ChanViewData:
     """
-    DB 优先的数据源：
-    - get_daily_bars / get_minute_bars：
-      先从 stock_kline 取最近 N 根；
-      如果数量不足，再从 PytdxDataSource 拉取，写回 stock_kline，再从 DB 统一取。
-    - get_ticks：直接走 PytdxDataSource（暂不落库）。
+    基于 UI 已经加载好的 K 线 DataFrame 实时计算缠论结构，不读 stock_chan_*。
+    - ts_code: '000001.SZ'
+    - freq: '1d'/'60m'/...
+    - kline_df: K 线 DataFrame（同 UI 主图使用的 df）
     """
+    if kline_df is None or kline_df.empty:
+        return ChanViewData.empty()
 
-    def __init__(self, inner: Optional[PytdxDataSource] = None) -> None:
-        self._inner = inner or PytdxDataSource()
+    # 按时间排序，确保一致
+    df = kline_df.sort_values("datetime").reset_index(drop=True)
 
-    # --- 日线 ---
+    res_map = run_chan_for_df(ts_code, freq, df)
+    # res_map 的 key 一般是 '1d'/'60m'，用 freq 取对应结果
+    chan_res = res_map.get(freq)
+    if chan_res is None:
+        return ChanViewData.empty()
 
-    def get_daily_bars(self, ts_code: str, count: int = 240) -> pd.DataFrame:
-        freq = "1d"
-        df_db = repository.get_recent_kline(ts_code, freq, count)
-        if len(df_db) >= count:
-            return df_db
-
-        # 不足部分用 pytdx 补
-        df_remote = self._inner.get_daily_bars(ts_code, count=count)
-        if not df_remote.empty:
-            repository.upsert_stock_kline(ts_code, freq, df_remote)
-            df_db = repository.get_recent_kline(ts_code, freq, count)
-            if not df_db.empty:
-                return df_db
-
-        # 兜底：至少返回远端数据
-        return df_remote
-
-    # --- 分钟线 ---
-
-    def get_minute_bars(
-        self,
-        ts_code: str,
-        freq: str = "1m",
-        count: int = 240,
-    ) -> pd.DataFrame:
-        # freq 直接作为 stock_kline.freq 使用（例如 "60m"、"30m"）
-        df_db = repository.get_recent_kline(ts_code, freq, count)
-        if len(df_db) >= count:
-            return df_db
-
-        df_remote = self._inner.get_minute_bars(ts_code, freq=freq, count=count)
-        if not df_remote.empty:
-            repository.upsert_stock_kline(ts_code, freq, df_remote)
-            df_db = repository.get_recent_kline(ts_code, freq, count)
-            if not df_db.empty:
-                return df_db
-
-        return df_remote
-
-    # --- tick 直接透传 ---
-
-    def get_ticks(
-        self,
-        ts_code: str,
-        trade_date: Optional[date] = None,
-        count: int = 2000,
-    ) -> pd.DataFrame:
-        return self._inner.get_ticks(ts_code, trade_date=trade_date, count=count)
-
-    # 可选：如果上层需要 get_kline，可以简单复用 inner 的逻辑，
-    # 或根据需要再加一层 DB 优先封装。
+    # 把 ChanResult 转为 ChanViewData（现有 get_chan_view_data 里已经有类似转换逻辑，直接复用）
+    # 比如:
+    #   return ChanViewData(
+    #       kline=df,
+    #       bis=chan_res.bis,
+    #       segments=chan_res.segments,
+    #       centers=chan_res.centers,
+    #       signals=chan_res.signals,
+    #   )
+    ...
 
 
 要求：
 
-HybridDataSource 必须继承 DataSource 并实现 get_daily_bars / get_minute_bars / get_ticks 三个方法；
+ChanViewData 的结构要与现在 UI 使用的完全一致；
 
-不要删除/改动 PytdxDataSource 原有逻辑，Hybrid 只是一个上层包装；
+构造逻辑尽量复用原 get_chan_view_data 里已有的代码，只是数据来源不同（不再查询 stock_chan_*）。
 
-对于 UI 场景，不需要额外实现更复杂的接口（回测/批处理仍可用原有 PytdxDataSource）。
+三、修改 UI：用实时计算替代 DB 读取
 
-二、修改 get_data_source("stock") 使用 HybridDataSource
+文件： ui/asset_lab_app.py
 
-文件：data/source_factory.py
+在文件顶部，原来是：
 
-当前逻辑：
-
-from .base_source import DataSource
-from .pytdx_source import PytdxDataSource
-
-def get_data_source(asset_type: AssetType) -> DataSource:
-    if asset_type == "stock":
-        return PytdxDataSource()
-    raise NotImplementedError(...)
+from chan.view_loader import get_chan_view_data
 
 
-修改为：
+请改成同时导入实时版本（保留原函数供其他模块使用）：
 
-from .base_source import DataSource
-from .hybrid_source import HybridDataSource
-
-def get_data_source(asset_type: AssetType) -> DataSource:
-    if asset_type == "stock":
-        return HybridDataSource()
-    raise NotImplementedError(f"asset_type={asset_type} 未实现")
+from chan.view_loader import get_chan_view_data_realtime
 
 
-要求：
+在主逻辑里（大概在 main() 中），当前代码类似：
 
-保证其他地方如果直接 with PytdxDataSource() as ds: 的代码行为不变（Hybrid 只影响通过 get_data_source("stock") 获得的数据源，即主要是 UI）。
-
-保持 __main__ 部分的简单测试可运行（可以改成 HybridDataSource 也行）。
-
-三、检查并验证“60分钟”周期映射
-
-文件：
-
-ui/asset_lab_app.py
-
-data/pytdx_source.py
-
-1. 检查 UI 周期映射（目前看是正确的）
-
-在 ui/asset_lab_app.py：
-
-SUPPORTED_FREQS = ["日线", "60分钟", "30分钟", "15分钟", "5分钟"]
-
-def _load_bars(...):
-    ds = get_data_source(asset_type)
-    if freq_label == "日线":
-        bars = ds.get_daily_bars(ts_code, count=bar_count)
-    else:
-        freq_map = {
-            "60分钟": "60m",
-            "30分钟": "30m",
-            "15分钟": "15m",
-            "5分钟": "5m",
-        }
-        freq = freq_map.get(freq_label)
-        bars = ds.get_minute_bars(ts_code, freq=freq, count=bar_count)
+if show_chan and not df.empty and "datetime" in df.columns:
+    start_dt = ...
+    end_dt = ...
+    freq_db = freq_map_db.get(freq_label, "1d")
+    chan_view = get_chan_view_data(ts, freq_db, start_dt, end_dt)
+    st.caption(
+        f"Chan 元素数量: bi={len(chan_view.bis)}, ..."
+    )
 
 
-根据这段代码，“60分钟”映射到 "60m"，逻辑本身是对的，不要改坏，除非你在排查中发现别处有冲突。
+请改为使用实时计算版本：
 
-2. 检查 PytdxDataSource 的分钟周期映射
-
-在 data/pytdx_source.py 中的 get_minute_bars（已存在）：
-
-freq_map = {
-    "1m": 0,
-    "5m": 1,
-    "15m": 2,
-    "30m": 3,
-    "60m": 4,
-}
-category = freq_map[freq]
-...
-raw = self.api.get_security_bars(
-    category=category,
-    market=market,
-    code=code,
-    start=start,
-    count=step,
-)
+chan_view = None
+if show_chan and not df.empty and "datetime" in df.columns:
+    freq_db = freq_map_db.get(freq_label, "1d")
+    chan_view = get_chan_view_data_realtime(ts, freq_db, df)
+    st.caption(
+        f"Chan 元素数量: bi={len(chan_view.bis)}, "
+        f"seg={len(chan_view.segments)}, "
+        f"center={len(chan_view.centers)}, "
+        f"signal={len(chan_view.signals)}"
+    )
 
 
-从代码来看 "60m" -> category=4，对应的是 60 分钟线，不是日线。
-这里逻辑看上去也没错。
-
-3. 写一个简单测试脚本验证 60 分钟没有“用成日线”
-
-请新增一个简单的调试脚本（例如 scripts/debug_freq_mapping.py），做以下事情：
-
-使用 HybridDataSource 或直接 PytdxDataSource：
-
-取一只常见股票（如 "000001.SZ" 或用户常用的一只），
-
-分别调用：
-
-get_daily_bars(ts_code, count=50)
-
-get_minute_bars(ts_code, freq="60m", count=50)
-
-打印两者的：
-
-行数；
-
-datetime 的间隔（例如 diff = df["datetime"].diff().value_counts().head()）；
-
-确认：
-
-日线的 datetime 间隔是“按天”；
-
-60 分钟的 datetime 间隔是“按小时”，并且在同一天内有多根。
-
-如果发现 60 分钟数据和日线完全一样（行数/时间戳都一致），则说明有 bug，请在最终总结里说明是哪一步错了并修复（可能是 ts_code_to_tdx / 市场代码错误导致实际取的是指数等，也可能是 TDX category 映射问题）。
+_plot_main_chart(...) 里使用的 chan_view 保持不变，只要它来自实时计算的新函数即可。
 
 要求：
 
-不要只靠“肉眼看图”，要用简单的程序对比 datetime 间隔来确认；
+UI 里的缠论流程 彻底不再调用旧版 get_chan_view_data（读 DB 的那条链）；
 
-修复后，确保此测试脚本输出符合预期，再给出结果说明。
+stock_chan_bi/segment/center/signal 表对 UI 来说变成“可选离线数据”，即使为空，UI 也能实时画出缠论。
 
-四、测试说明（TRAE 完成后需要做的）
+四、验证（完成后必须做）
 
-请在完成上述改动后，至少做以下验证，并在最终回复中说明结果：
+启动 UI：
 
-DB 优先逻辑验证：
+streamlit run d:\quant\ui\asset_lab_app.py
 
-先手动清空/删除某只股票在 stock_kline 中某个周期的数据（如 "1d"），
 
-通过 Streamlit UI 打开该票的“日线”，确认：
+选择一只数据库里缠论元素为空但 K 线已有的数据的股票（或者新加一只今天刚拉行情但没回补缠论的票）：
 
-第一次打开时，会通过 HybridDataSource 调用 pytdx 拉数据，并写入 stock_kline；
+周期：日线或 60 分钟；
 
-再次打开同一股票、同一周期时，即使断开 pytdx（可以暂时改 HybridDataSource 内部不连网），也能从 DB 取到完整数据。
+勾选“叠加缠论结构”及子选项；
 
-60 分钟验证：
+预期：
 
-使用第 3 部分的 debug_freq_mapping.py，确认：
+即使 stock_chan_* 里这只票对应周期为 0 行，UI 仍能展示出笔/线段/中枢/信号；
 
-日线与 60 分钟的时间间隔明显不同；
+说明 UI 的缠论完全来自实时计算，而不是 DB。
 
-Streamlit UI 中选择“60分钟”时，图形的横轴密度和日线明显不同（同一时间窗口内有更多 K）。
+再选一只你已经回补过缠论的票，对比：
 
-回归检查：
+确认实时计算的 Chan 元素数量、形态与之前 DB 版大致一致（小差异可以接受，因为实时用的是最新行情）。
 
-确认 UI 的“日线 / 60 分钟 / 30 分钟 / 15 分钟 / 5 分钟”各周期都能正常加载，不出现原有功能损坏。
+整个过程中，不允许出现任何 baostock 登录日志；
+实时计算必须基于 UI 已经加载好的 df，不再额外去拉行情 / 读 chan 表。
+
+五、提交总结时请说明
+
+完成后，请在总结里写清楚：
+
+新增了 chan/pipeline.py: run_chan_for_df，基于 DataFrame 的缠论计算，不访问任何外部数据源；
+
+新增了 chan/view_loader.py: get_chan_view_data_realtime，将 ChanResult 包装成 ChanViewData；
+
+ui/asset_lab_app.py 中 UI 缠论展示改为调用 get_chan_view_data_realtime(ts, freq_db, df)；
+
+实测在 stock_chan_* 为空的股票上，UI 仍能实时显示缠论元素。

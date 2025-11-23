@@ -14,7 +14,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from data.repository import get_all_stock_basics
-from chan.view_loader import get_chan_view_data
+from chan.view_loader import get_chan_view_data_realtime
 from data.source_factory import get_data_source
 from factors.ict_smc import compute_ict_structures, ICTConfig
 from factors.harmonic_patterns import detect_harmonic_patterns
@@ -110,14 +110,19 @@ def _daily_recent_high(df: pd.DataFrame) -> float:
 
 
 def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, freq_label: str, key_suffix: str = "main", show_chan: bool = False, show_bi: bool = False, show_seg: bool = False, show_center: bool = False, show_signal: bool = False, chan_view: object | None = None):
+    freq_map_db = {"日线": "1d", "60分钟": "60m", "30分钟": "30m", "15分钟": "15m", "5分钟": "5m"}
+    freq_db = freq_map_db.get(freq_label, "1d")
     if "datetime" in df.columns:
-        x = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        if freq_db == "1d":
+            x_labels = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d")
+        else:
+            x_labels = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d %H:%M:%S")
     else:
-        x = df.index.astype(str)
+        x_labels = df.index.astype(str)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
     fig.add_trace(
         go.Candlestick(
-            x=x,
+            x=x_labels,
             open=df["open"],
             high=df["high"],
             low=df["low"],
@@ -142,24 +147,28 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                     color = "rgba(200, 0, 0, 0.07)"
                 else:
                     color = "rgba(128, 128, 128, 0.04)"
-                x0 = seg.start.strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.start, "strftime") else str(seg.start)
-                x1 = seg.end.strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.end, "strftime") else str(seg.end)
+                if freq_db == "1d":
+                    x0 = pd.to_datetime(seg.start).strftime("%Y-%m-%d") if hasattr(seg.start, "strftime") else str(seg.start)
+                    x1 = pd.to_datetime(seg.end).strftime("%Y-%m-%d") if hasattr(seg.end, "strftime") else str(seg.end)
+                else:
+                    x0 = seg.start.strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.start, "strftime") else str(seg.start)
+                    x1 = seg.end.strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.end, "strftime") else str(seg.end)
                 fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.9, line_width=0, row=1, col=1)
     if show_ict:
         if "ict_choch_flag" in df.columns:
             bull_idx = df.index[df["ict_choch_flag"] > 0]
             bear_idx = df.index[df["ict_choch_flag"] < 0]
             if len(bull_idx) > 0:
-                fig.add_trace(go.Scatter(x=[x[i] for i in bull_idx], y=df.loc[bull_idx, "close"], mode="markers", marker=dict(size=10, symbol="triangle-up", color="red"), name="Bull CHOCH"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=[x_labels[i] for i in bull_idx], y=df.loc[bull_idx, "close"], mode="markers", marker=dict(size=10, symbol="triangle-up", color="red"), name="Bull CHOCH"), row=1, col=1)
             if len(bear_idx) > 0:
-                fig.add_trace(go.Scatter(x=[x[i] for i in bear_idx], y=df.loc[bear_idx, "close"], mode="markers", marker=dict(size=10, symbol="triangle-down", color="green"), name="Bear CHOCH"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=[x_labels[i] for i in bear_idx], y=df.loc[bear_idx, "close"], mode="markers", marker=dict(size=10, symbol="triangle-down", color="green"), name="Bear CHOCH"), row=1, col=1)
         if "ict_bos_flag" in df.columns:
             bos_up_idx = df.index[df["ict_bos_flag"] > 0]
             bos_dn_idx = df.index[df["ict_bos_flag"] < 0]
             if len(bos_up_idx) > 0:
-                fig.add_trace(go.Scatter(x=[x[i] for i in bos_up_idx], y=df.loc[bos_up_idx, "close"], mode="markers", marker=dict(size=10, symbol="square-open", line=dict(width=2)), name="Bull BOS"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=[x_labels[i] for i in bos_up_idx], y=df.loc[bos_up_idx, "close"], mode="markers", marker=dict(size=10, symbol="square-open", line=dict(width=2)), name="Bull BOS"), row=1, col=1)
             if len(bos_dn_idx) > 0:
-                fig.add_trace(go.Scatter(x=[x[i] for i in bos_dn_idx], y=df.loc[bos_dn_idx, "close"], mode="markers", marker=dict(size=10, symbol="square-open", line=dict(width=2)), name="Bear BOS"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=[x_labels[i] for i in bos_dn_idx], y=df.loc[bos_dn_idx, "close"], mode="markers", marker=dict(size=10, symbol="square-open", line=dict(width=2)), name="Bear BOS"), row=1, col=1)
             if "ict_bos_level" in df.columns:
                 recent_levels = df["ict_bos_level"].where(df["ict_bos_level"].notna()).dropna().tail(10)
                 for y in recent_levels:
@@ -207,7 +216,7 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
     vol = df["volume"] if "volume" in df.columns else pd.Series([0] * len(df))
     up = df["close"] >= df["open"]
     vol_colors = ["red" if bool(u) else "green" for u in up]
-    fig.add_trace(go.Bar(x=x, y=vol, name="成交量", marker_color=vol_colors), row=2, col=1)
+    fig.add_trace(go.Bar(x=x_labels, y=vol, name="成交量", marker_color=vol_colors), row=2, col=1)
     close = pd.to_numeric(df["close"], errors="coerce").fillna(0.0)
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
@@ -215,9 +224,9 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
     dea = diff.ewm(span=9, adjust=False).mean()
     macd = (diff - dea) * 2.0
     macd_colors = ["red" if float(v) >= 0 else "green" for v in macd]
-    fig.add_trace(go.Scatter(x=x, y=diff, name="DIFF", line=dict(color="#FF0000")), row=3, col=1)
-    fig.add_trace(go.Scatter(x=x, y=dea, name="DEA", line=dict(color="#0000FF")), row=3, col=1)
-    fig.add_trace(go.Bar(x=x, y=macd, name="MACD", marker_color=macd_colors), row=3, col=1)
+    fig.add_trace(go.Scatter(x=x_labels, y=diff, name="DIFF", line=dict(color="#FF0000")), row=3, col=1)
+    fig.add_trace(go.Scatter(x=x_labels, y=dea, name="DEA", line=dict(color="#0000FF")), row=3, col=1)
+    fig.add_trace(go.Bar(x=x_labels, y=macd, name="MACD", marker_color=macd_colors), row=3, col=1)
     fig.update_xaxes(type="category", row=1, col=1)
     fig.update_xaxes(type="category", row=2, col=1)
     fig.update_xaxes(type="category", row=3, col=1)
@@ -236,7 +245,7 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
             ei = r.get("entry_idx")
             xi = r.get("exit_idx")
             if ei is not None and ei in df.index:
-                entry_x.append(x[ei])
+                entry_x.append(x_labels[ei])
                 entry_y.append(float(df.loc[ei, "close"]))
             else:
                 ed = r.get("entry_dt")
@@ -252,7 +261,7 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                     else:
                         entry_y.append(float(df["close"].iloc[0]))
             if xi is not None and xi in df.index:
-                exit_x.append(x[xi])
+                exit_x.append(x_labels[xi])
                 exit_y.append(float(df.loc[xi, "close"]))
             else:
                 xd = r.get("exit_dt")
@@ -292,27 +301,36 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                 col=1,
             )
     if show_chan and chan_view is not None:
-        xfmt = "%Y-%m-%d %H:%M:%S"
+        def _to_x_labels_for_chan(ts_list, fq):
+            if not ts_list:
+                return []
+            ts = pd.to_datetime(ts_list)
+            fmt = "%Y-%m-%d" if fq == "1d" else "%Y-%m-%d %H:%M:%S"
+            return list(ts.strftime(fmt))
         if show_bi and chan_view.bis:
-            bi_starts_x = [b.start_ts.strftime(xfmt) for b in chan_view.bis]
+            bi_starts_x = _to_x_labels_for_chan([b.start_ts for b in chan_view.bis], freq_db)
             bi_starts_y = [b.start_price for b in chan_view.bis]
-            bi_ends_x = [b.end_ts.strftime(xfmt) for b in chan_view.bis]
+            bi_ends_x = _to_x_labels_for_chan([b.end_ts for b in chan_view.bis], freq_db)
             bi_ends_y = [b.end_price for b in chan_view.bis]
             fig.add_trace(go.Scatter(x=bi_starts_x, y=bi_starts_y, mode="markers", name="Bi start", marker=dict(symbol="circle", size=6)), row=1, col=1)
             fig.add_trace(go.Scatter(x=bi_ends_x, y=bi_ends_y, mode="markers", name="Bi end", marker=dict(symbol="x", size=6)), row=1, col=1)
         if show_seg and chan_view.segments:
             for s in chan_view.segments:
-                xs = [s.start_ts.strftime(xfmt), s.end_ts.strftime(xfmt)]
+                xs = _to_x_labels_for_chan([s.start_ts, s.end_ts], freq_db)
                 ys = [s.low, s.high] if str(s.direction).upper().startswith("UP") else [s.high, s.low]
                 fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=f"Seg {s.seg_id}", line=dict(width=2, dash="dot"), showlegend=False), row=1, col=1)
         if show_center and chan_view.centers:
             for c in chan_view.centers:
-                fig.add_shape(type="rect", x0=c.start_ts.strftime(xfmt), x1=c.end_ts.strftime(xfmt), y0=c.low, y1=c.high, line=dict(width=0), fillcolor="rgba(0,0,255,0.1)", layer="below", row=1, col=1)
+                x0 = _to_x_labels_for_chan([c.start_ts], freq_db)[0]
+                x1 = _to_x_labels_for_chan([c.end_ts], freq_db)[0]
+                fig.add_shape(type="rect", x0=x0, x1=x1, y0=c.low, y1=c.high, line=dict(width=0), fillcolor="rgba(0,0,255,0.1)", layer="below", row=1, col=1)
         if show_signal and chan_view.signals:
-            buy_x = [g.ts.strftime(xfmt) for g in chan_view.signals if str(g.signal_type).upper().startswith("BUY")]
-            buy_y = [g.price for g in chan_view.signals if str(g.signal_type).upper().startswith("BUY")]
-            sell_x = [g.ts.strftime(xfmt) for g in chan_view.signals if str(g.signal_type).upper().startswith("SELL")]
-            sell_y = [g.price for g in chan_view.signals if str(g.signal_type).upper().startswith("SELL")]
+            buys = [g for g in chan_view.signals if str(g.signal_type).upper().startswith("BUY")]
+            sells = [g for g in chan_view.signals if str(g.signal_type).upper().startswith("SELL")]
+            buy_x = _to_x_labels_for_chan([g.ts for g in buys], freq_db)
+            buy_y = [g.price for g in buys]
+            sell_x = _to_x_labels_for_chan([g.ts for g in sells], freq_db)
+            sell_y = [g.price for g in sells]
             if buy_x:
                 fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10)), row=1, col=1)
             if sell_x:
@@ -358,17 +376,17 @@ def main():
         return
     ts = st.sidebar.selectbox("选择股票", options=ts_codes, format_func=lambda x: code_to_name.get(x, x))
     st.sidebar.markdown("### 缠论展示")
-    show_chan = st.sidebar.checkbox("叠加缠论结构", value=False)
+    show_chan = st.sidebar.checkbox("叠加缠论结构", value=True)
     if show_chan:
         show_bi = st.sidebar.checkbox("笔 (Bi)", value=True)
-        show_seg = st.sidebar.checkbox("线段 (Segment)", value=False)
-        show_center = st.sidebar.checkbox("中枢 (Center)", value=False)
-        show_signal = st.sidebar.checkbox("信号 (Signal)", value=False)
+        show_seg = st.sidebar.checkbox("线段 (Segment)", value=True)
+        show_center = st.sidebar.checkbox("中枢 (Center)", value=True)
+        show_signal = st.sidebar.checkbox("信号 (Signal)", value=True)
     else:
         show_bi = show_seg = show_center = show_signal = False
-    show_ict = st.sidebar.checkbox("叠加 ICT 结构", value=True)
-    show_harm = st.sidebar.checkbox("叠加谐波形态", value=True)
-    run_rr3_bt = st.sidebar.checkbox("运行 ICT R:R≥3 策略回测", value=True)
+    show_ict = st.sidebar.checkbox("叠加 ICT 结构", value=False)
+    show_harm = st.sidebar.checkbox("叠加谐波形态", value=False)
+    run_rr3_bt = st.sidebar.checkbox("运行 ICT R:R≥3 策略回测", value=False)
     with st.spinner("拉取K线..."):
         df = _load_bars(asset_type, ts, freq_label, bar_count)
     L_list = [3, 4, 5, 6, 8, 10, 12]
@@ -412,7 +430,7 @@ def main():
         if "datetime" in df.columns and len(df) > 0:
             start_dt = pd.to_datetime(df["datetime"].iloc[0])
             end_dt = pd.to_datetime(df["datetime"].iloc[-1])
-            chan_view = get_chan_view_data(ts, freq_map_db.get(freq_label, "1d"), start_dt, end_dt)
+            chan_view = get_chan_view_data_realtime(ts, freq_map_db.get(freq_label, "1d"), df)
             st.caption(
                 f"Chan 元素数量: bi={len(chan_view.bis)}, seg={len(chan_view.segments)}, center={len(chan_view.centers)}, signal={len(chan_view.signals)}"
             )
@@ -475,9 +493,7 @@ def main():
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
             df.attrs["bt_trades"] = rows
 
-    # 主图（含买卖标记）
-    st.subheader("主图（含买卖标记）")
-    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="main", show_chan=show_chan, show_bi=show_bi, show_seg=show_seg, show_center=show_center, show_signal=show_signal, chan_view=chan_view)
+    
 
 
 if __name__ == "__main__":

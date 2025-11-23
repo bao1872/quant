@@ -41,6 +41,57 @@ def run_chan_for_symbol_to_db(
     for _, r in res.items():
         save_chan_result_to_db(r)
 
+
+def run_chan_for_df(
+    ts_code: str,
+    freq: str,
+    kline_df,
+) -> Dict[str, ChanResult]:
+    import pandas as pd
+    from Common.CEnum import DATA_FIELD, KL_TYPE
+    from Common.CTime import CTime
+    from KLine.KLine_Unit import CKLine_Unit
+
+    lv_alias = {
+        "1d": "day",
+        "60m": "60m",
+        "30m": "30m",
+        "15m": "15m",
+        "5m": "5m",
+        "1m": "1m",
+    }
+    freq_key = str(freq).lower()
+    lv_name = lv_alias.get(freq_key, freq_key)
+    run_cfg = ChanRunConfig(code=ts_to_chan_code(ts_code), lv_list=[lv_name], autype="qfq", data_src="csv")
+    chan = build_cchan_by_run_config(run_cfg, chan_cfg_overrides={"trigger_step": True})
+
+    df = kline_df.copy()
+    df = df.sort_values("datetime").reset_index(drop=True)
+    kl_list = []
+    for _, row in df.iterrows():
+        dt = pd.to_datetime(row["datetime"])  # type: ignore
+        t = CTime(int(dt.year), int(dt.month), int(dt.day), int(dt.hour), int(dt.minute))
+        kl_dict = {
+            DATA_FIELD.FIELD_TIME: t,
+            DATA_FIELD.FIELD_OPEN: float(row["open"]),
+            DATA_FIELD.FIELD_HIGH: float(row["high"]),
+            DATA_FIELD.FIELD_LOW: float(row["low"]),
+            DATA_FIELD.FIELD_CLOSE: float(row["close"]),
+        }
+        kl_list.append(CKLine_Unit(kl_dict))
+    m = {
+        "1d": KL_TYPE.K_DAY,
+        "60m": KL_TYPE.K_60M,
+        "30m": KL_TYPE.K_30M,
+        "15m": KL_TYPE.K_15M,
+        "5m": KL_TYPE.K_5M,
+        "1m": KL_TYPE.K_1M,
+    }
+    chan.trigger_load({m[freq_key]: kl_list})
+    for lv in chan.lv_list:
+        chan.kl_datas[lv].cal_seg_and_zs()
+    return extract_all_levels(chan)
+
 if __name__ == "__main__":
     from Common.CEnum import DATA_FIELD
     from Common.CTime import CTime
