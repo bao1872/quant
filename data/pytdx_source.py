@@ -110,6 +110,10 @@ class PytdxDataSource(DataSource):
             df["datetime"] = df["datetime"].apply(
                 lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M") if " " in str(x) else datetime.strptime(x, "%Y-%m-%d")
             )
+        elif {"year", "month", "day", "hour", "minute"}.issubset(set(df.columns)):
+            df["datetime"] = pd.to_datetime(
+                dict(year=df["year"], month=df["month"], day=df["day"]) 
+            ) + pd.to_timedelta(df["hour"].astype(int), unit="h") + pd.to_timedelta(df["minute"].astype(int), unit="m")
         elif "date" in df.columns:
             df["datetime"] = pd.to_datetime(df["date"], format="%Y-%m-%d", errors="coerce")
             df = df.drop(columns=[c for c in ["date"] if c in df.columns])
@@ -133,7 +137,7 @@ class PytdxDataSource(DataSource):
 
         # pytdx get_security_bars 返回从 start 开始的 count 条
         # 为了取最近 count 条，通常从 0 开始，取足够多，然后截 tail。
-        step = 800
+        step = 500
         start = 0
         frames: list[pd.DataFrame] = []
         while True:
@@ -184,17 +188,17 @@ class PytdxDataSource(DataSource):
         market, code = self.ts_code_to_tdx(ts_code)
 
         freq_map = {
-            "1m": 0,
-            "5m": 1,
-            "15m": 2,
-            "30m": 3,
-            "60m": 4,
+            "1m": 8,
+            "5m": 0,
+            "15m": 1,
+            "30m": 2,
+            "60m": 3,
         }
         if freq not in freq_map:
             raise ValueError(f"不支持的分钟频率: {freq}")
         category = freq_map[freq]
 
-        step = 800
+        step = 500
         start = 0
         frames: list[pd.DataFrame] = []
         while True:

@@ -1,355 +1,306 @@
-任务总目标
-在现有项目基础上，不改缠论核心(chan/)，实现一个最小版本的 Streamlit 缠论可视化：
+仓库：当前这个 quant-chan 项目
+目标：
 
-在 asset_lab_app 中增加一个开关：「叠加缠论结构」。
+在行情数据层增加一个 HybridDataSource，实现“优先从数据库 stock_kline 读取，不足部分再用 PytdxDataSource 从 pytdx 获取并回写 DB”的逻辑；
 
-当开关打开时，在主 K 线图上叠加显示：
+修改 get_data_source("stock")，让 Streamlit UI 使用 HybridDataSource；
 
-必选：笔端点（Bi）；
+检查并验证“60 分钟”周期的映射与实际取数是否正确（不能返回日线），如有问题修复。
 
-可选：线段 Segment、中枢 Center、信号 Signal（用勾选框控制）。
+请严格控制改动范围，只修改与行情数据源/周期映射直接相关的代码，其他业务逻辑不要动。
 
-所有数据均从数据库读取：
+一、实现 HybridDataSource（DB 优先）
 
-行情：stock_kline；
+文件范围：
 
-缠论结构：stock_chan_bi / stock_chan_segment / stock_chan_center / stock_chan_signal。
+data/base_source.py（只读，参考接口定义，不要大改）
 
-你要写完后 自己带着检查逻辑，保证：
+data/pytdx_source.py（只读，用作内部真实数据源）
 
-当前图表范围内的 bis/segment/center/signal 数量打印出来；
+data/repository.py（增加读取 stock_kline 的简单查询函数）
 
-肉眼能对得上时间区间与 K 线。
+新增：data/hybrid_source.py
 
-一、修改范围与禁止修改
+1. 在 repository 里增加一个取最近 N 根 K 线的函数
 
-允许修改 / 新增：
+在 data/repository.py 里新增，例如：
 
-新增模块（建议）：chan/view_loader.py 或 services/chan_view_service.py
+def get_recent_kline(
+    ts_code: str,
+    freq: str,
+    count: int,
+) -> pd.DataFrame:
+    """
+    从 stock_kline 中取某只股票、某个 freq 的最近 count 根 K 线，
+    按 datetime 升序返回。没有数据则返回空 DataFrame。
+    """
+    eng = get_engine()
+    _ensure_stock_kline(eng)
+    from sqlalchemy import text as _text
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        sql = _text(
+            """
+            select ts_code, freq, datetime, open, high, low, close, volume, amount
+            from stock_kline
+            where ts_code = :ts and freq = :fq
+            order by datetime desc
+            limit :n
+            """
+        )
+        df = pd.read_sql(
+            sql,
+            conn,
+            params={"ts": ts_code, "fq": freq, "n": count},
+            parse_dates=["datetime"],
+        )
+    if df.empty:
+        return df
+    return df.sort_values("datetime").reset_index(drop=True)
 
-修改 / 新增：
 
-ui/asset_lab_app.py（或你实际的主分析页文件，下面统称 asset_lab_app）
+要求：
 
-如有必要，可以在 data/repository.py 中新增只读查询函数，但不要改写入逻辑。
+不要改已有的写入逻辑（upsert_stock_kline 等），只新增查询函数；
 
-禁止修改 / 删除：
+freq 的值与现有逻辑保持一致：日线 "1d"，分钟 "60m" / "30m" / "15m" / "5m" 等。
 
-chan/ 中的抽取、落库逻辑（chan/types.py, chan/extract.py, chan/persist.py, chan/pipeline.py, chan/validate.py 等）。
+2. 新增 HybridDataSource 实现
 
-third_party/chan.py。
+新建文件：data/hybrid_source.py，内容示例：
 
-data/updater.py, data/jobs.py 的函数签名。
+from __future__ import annotations
 
-任何 ML / 策略 / 回测模块。
-
-二、数据加载层：只读 DB，返回 ChanResult
-1. 新增模块：chan/view_loader.py
-
-在 chan/ 目录下新建 view_loader.py（只读，不写 DB），实现：
-
-from dataclasses import dataclass
-from datetime import datetime, date
-from typing import List
+from datetime import date, datetime
+from typing import Optional
 
 import pandas as pd
 
-from .types import Bi, Segment, Center, Signal, ChanResult
-from db import get_engine
-from sqlalchemy import text
-
-@dataclass
-class ChanViewData:
-    kline: pd.DataFrame       # datetime, open/high/low/close/volume
-    bis: List[Bi]
-    segments: List[Segment]
-    centers: List[Center]
-    signals: List[Signal]
+from .base_source import DataSource
+from .pytdx_source import PytdxDataSource
+from . import repository
 
 
-def load_kline(
-    ts_code: str,
-    freq: str,
-    start: datetime,
-    end: datetime,
-) -> pd.DataFrame:
+class HybridDataSource(DataSource):
     """
-    从 stock_kline 读取指定 code+freq+时间窗口的 K 线。
-    要求返回列至少包含: datetime, open, high, low, close, volume。
+    DB 优先的数据源：
+    - get_daily_bars / get_minute_bars：
+      先从 stock_kline 取最近 N 根；
+      如果数量不足，再从 PytdxDataSource 拉取，写回 stock_kline，再从 DB 统一取。
+    - get_ticks：直接走 PytdxDataSource（暂不落库）。
     """
-    ...
+
+    def __init__(self, inner: Optional[PytdxDataSource] = None) -> None:
+        self._inner = inner or PytdxDataSource()
+
+    # --- 日线 ---
+
+    def get_daily_bars(self, ts_code: str, count: int = 240) -> pd.DataFrame:
+        freq = "1d"
+        df_db = repository.get_recent_kline(ts_code, freq, count)
+        if len(df_db) >= count:
+            return df_db
+
+        # 不足部分用 pytdx 补
+        df_remote = self._inner.get_daily_bars(ts_code, count=count)
+        if not df_remote.empty:
+            repository.upsert_stock_kline(ts_code, freq, df_remote)
+            df_db = repository.get_recent_kline(ts_code, freq, count)
+            if not df_db.empty:
+                return df_db
+
+        # 兜底：至少返回远端数据
+        return df_remote
+
+    # --- 分钟线 ---
+
+    def get_minute_bars(
+        self,
+        ts_code: str,
+        freq: str = "1m",
+        count: int = 240,
+    ) -> pd.DataFrame:
+        # freq 直接作为 stock_kline.freq 使用（例如 "60m"、"30m"）
+        df_db = repository.get_recent_kline(ts_code, freq, count)
+        if len(df_db) >= count:
+            return df_db
+
+        df_remote = self._inner.get_minute_bars(ts_code, freq=freq, count=count)
+        if not df_remote.empty:
+            repository.upsert_stock_kline(ts_code, freq, df_remote)
+            df_db = repository.get_recent_kline(ts_code, freq, count)
+            if not df_db.empty:
+                return df_db
+
+        return df_remote
+
+    # --- tick 直接透传 ---
+
+    def get_ticks(
+        self,
+        ts_code: str,
+        trade_date: Optional[date] = None,
+        count: int = 2000,
+    ) -> pd.DataFrame:
+        return self._inner.get_ticks(ts_code, trade_date=trade_date, count=count)
+
+    # 可选：如果上层需要 get_kline，可以简单复用 inner 的逻辑，
+    # 或根据需要再加一层 DB 优先封装。
 
 
-def load_chan_structures(
-    ts_code: str,
-    freq: str,
-    start: datetime,
-    end: datetime,
-) -> ChanResult:
-    """
-    从 stock_chan_bi / stock_chan_segment / stock_chan_center / stock_chan_signal
-    读取指定 code+freq+时间窗口的缠论结构，组装为 ChanResult。
-    """
-    ...
+要求：
+
+HybridDataSource 必须继承 DataSource 并实现 get_daily_bars / get_minute_bars / get_ticks 三个方法；
+
+不要删除/改动 PytdxDataSource 原有逻辑，Hybrid 只是一个上层包装；
+
+对于 UI 场景，不需要额外实现更复杂的接口（回测/批处理仍可用原有 PytdxDataSource）。
+
+二、修改 get_data_source("stock") 使用 HybridDataSource
+
+文件：data/source_factory.py
+
+当前逻辑：
+
+from .base_source import DataSource
+from .pytdx_source import PytdxDataSource
+
+def get_data_source(asset_type: AssetType) -> DataSource:
+    if asset_type == "stock":
+        return PytdxDataSource()
+    raise NotImplementedError(...)
 
 
-def get_chan_view_data(
-    ts_code: str,
-    freq: str,
-    start: datetime,
-    end: datetime,
-) -> ChanViewData:
-    """
-    统一入口：返回画图所需的全部数据。
-    """
-    kline = load_kline(...)
-    chan = load_chan_structures(...)
-    return ChanViewData(
-        kline=kline,
-        bis=chan.bis,
-        segments=chan.segments,
-        centers=chan.centers,
-        signals=chan.signals,
-    )
+修改为：
+
+from .base_source import DataSource
+from .hybrid_source import HybridDataSource
+
+def get_data_source(asset_type: AssetType) -> DataSource:
+    if asset_type == "stock":
+        return HybridDataSource()
+    raise NotImplementedError(f"asset_type={asset_type} 未实现")
 
 
-实现要求：
+要求：
 
-load_kline：
+保证其他地方如果直接 with PytdxDataSource() as ds: 的代码行为不变（Hybrid 只影响通过 get_data_source("stock") 获得的数据源，即主要是 UI）。
 
-从 stock_kline 读取 ts_code, freq 匹配，datetime between start and end；
+保持 __main__ 部分的简单测试可运行（可以改成 HybridDataSource 也行）。
 
-按 datetime 升序排序；
+三、检查并验证“60分钟”周期映射
 
-如果没有数据，返回空 DataFrame，不抛异常。
+文件：
 
-load_chan_structures：
+ui/asset_lab_app.py
 
-从四张 chan 表读取当前窗口内的记录；
+data/pytdx_source.py
 
-按你之前 chan/types.py 里的 dataclass 构造 Bi/Segment/Center/Signal；
+1. 检查 UI 周期映射（目前看是正确的）
 
-ChanResult 内的列表可以是“窗口内全部元素”，不必精确裁边；
+在 ui/asset_lab_app.py：
 
-如果某张表在该窗口内为空，对应列表就是空。
+SUPPORTED_FREQS = ["日线", "60分钟", "30分钟", "15分钟", "5分钟"]
 
-该模块只读，不写 DB。
-
-三、Streamlit UI：在 asset_lab_app 上加缠论叠加
-
-在 ui/asset_lab_app.py（或对应的主页面）中：
-
-1. 侧边栏控件
-
-在现有 sidebar 上增加：
-
-import streamlit as st
-from datetime import datetime, timedelta
-
-from chan.view_loader import get_chan_view_data
-
-# ...已有控件...
-
-st.sidebar.markdown("### 缠论展示")
-show_chan = st.sidebar.checkbox("叠加缠论结构", value=False)
-
-if show_chan:
-    show_bi = st.sidebar.checkbox("笔 (Bi)", value=True)
-    show_seg = st.sidebar.checkbox("线段 (Segment)", value=False)
-    show_center = st.sidebar.checkbox("中枢 (Center)", value=False)
-    show_signal = st.sidebar.checkbox("信号 (Signal)", value=False)
-else:
-    show_bi = show_seg = show_center = show_signal = False
+def _load_bars(...):
+    ds = get_data_source(asset_type)
+    if freq_label == "日线":
+        bars = ds.get_daily_bars(ts_code, count=bar_count)
+    else:
+        freq_map = {
+            "60分钟": "60m",
+            "30分钟": "30m",
+            "15分钟": "15m",
+            "5分钟": "5m",
+        }
+        freq = freq_map.get(freq_label)
+        bars = ds.get_minute_bars(ts_code, freq=freq, count=bar_count)
 
 
-日期范围：可以沿用你现有的选择逻辑（例如“最近 200 根K线”），或者简单写：
+根据这段代码，“60分钟”映射到 "60m"，逻辑本身是对的，不要改坏，除非你在排查中发现别处有冲突。
 
-根据 freq 决定窗口长度，例如：
+2. 检查 PytdxDataSource 的分钟周期映射
 
-"1d" → 最近 250 交易日；
+在 data/pytdx_source.py 中的 get_minute_bars（已存在）：
 
-"60m" → 最近 120 交易日；
-
-"15m" → 最近 60 交易日。
-
-在主逻辑中生成 start_dt, end_dt 用于 get_chan_view_data。
-
-2. 调用数据服务
-
-在绘制价格图之前：
-
-view = get_chan_view_data(code, freq, start_dt, end_dt)
-df = view.kline
-
-
-如果 df 为空，直接在页面提示：
-
-if df.empty:
-    st.warning("当前周期无行情数据")
-    st.stop()
-
-3. 用 Plotly 叠加画图（第一版至少要实现“价格 + 笔”）
-
-假设你目前已有绘制 K 线的逻辑（可能是 Plotly），请在原图基础上增加缠论元素：
-
-(1) 基础 K 线
-
-沿用现有代码，例如：
-
-import plotly.graph_objects as go
-
-fig = go.Figure()
-fig.add_trace(
-    go.Candlestick(
-        x=df["datetime"],
-        open=df["open"],
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        name="K线",
-    )
+freq_map = {
+    "1m": 0,
+    "5m": 1,
+    "15m": 2,
+    "30m": 3,
+    "60m": 4,
+}
+category = freq_map[freq]
+...
+raw = self.api.get_security_bars(
+    category=category,
+    market=market,
+    code=code,
+    start=start,
+    count=step,
 )
 
 
-(2) 笔端点
+从代码来看 "60m" -> category=4，对应的是 60 分钟线，不是日线。
+这里逻辑看上去也没错。
 
-如果 show_bi 为 True：
+3. 写一个简单测试脚本验证 60 分钟没有“用成日线”
 
-从 view.bis 提取起点和终点：
+请新增一个简单的调试脚本（例如 scripts/debug_freq_mapping.py），做以下事情：
 
-bi_starts_x = [bi.start_ts for bi in view.bis]
-bi_starts_y = [bi.start_price for bi in view.bis]
-bi_ends_x = [bi.end_ts for bi in view.bis]
-bi_ends_y = [bi.end_price for bi in view.bis]
+使用 HybridDataSource 或直接 PytdxDataSource：
 
+取一只常见股票（如 "000001.SZ" 或用户常用的一只），
 
-画两个散点：
+分别调用：
 
-if show_bi and view.bis:
-    fig.add_trace(
-        go.Scatter(
-            x=bi_starts_x,
-            y=bi_starts_y,
-            mode="markers",
-            name="Bi start",
-            marker=dict(symbol="circle", size=6),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=bi_ends_x,
-            y=bi_ends_y,
-            mode="markers",
-            name="Bi end",
-            marker=dict(symbol="x", size=6),
-        )
-    )
+get_daily_bars(ts_code, count=50)
 
+get_minute_bars(ts_code, freq="60m", count=50)
 
-(3) 线段（Segment）
+打印两者的：
 
-如果 show_seg 为 True：
+行数；
 
-对每个 segment，用一条斜线连起止点即可（简易版）：
+datetime 的间隔（例如 diff = df["datetime"].diff().value_counts().head()）；
 
-if show_seg and view.segments:
-    for seg in view.segments:
-        fig.add_trace(
-            go.Scatter(
-                x=[seg.start_ts, seg.end_ts],
-                y=[seg.low, seg.high] if seg.direction == "UP" else [seg.high, seg.low],
-                mode="lines",
-                name=f"Seg {seg.seg_id}",
-                line=dict(width=2, dash="dot"),
-                showlegend=False,
-            )
-        )
+确认：
 
+日线的 datetime 间隔是“按天”；
 
-(4) 中枢（Center）
+60 分钟的 datetime 间隔是“按小时”，并且在同一天内有多根。
 
-如果 show_center 为 True：
+如果发现 60 分钟数据和日线完全一样（行数/时间戳都一致），则说明有 bug，请在最终总结里说明是哪一步错了并修复（可能是 ts_code_to_tdx / 市场代码错误导致实际取的是指数等，也可能是 TDX category 映射问题）。
 
-用矩形标出时间 [start_ts, end_ts] × 价格 [low, high]：
+要求：
 
-if show_center and view.centers:
-    for center in view.centers:
-        fig.add_shape(
-            type="rect",
-            x0=center.start_ts,
-            x1=center.end_ts,
-            y0=center.low,
-            y1=center.high,
-            line=dict(width=0),
-            fillcolor="rgba(0, 0, 255, 0.1)",
-            layer="below",
-        )
+不要只靠“肉眼看图”，要用简单的程序对比 datetime 间隔来确认；
 
+修复后，确保此测试脚本输出符合预期，再给出结果说明。
 
-(5) 信号（Signal）
+四、测试说明（TRAE 完成后需要做的）
 
-如果 show_signal 为 True：
+请在完成上述改动后，至少做以下验证，并在最终回复中说明结果：
 
-if show_signal and view.signals:
-    buy_x = [s.ts for s in view.signals if s.signal_type.startswith("BUY")]
-    buy_y = [s.price for s in view.signals if s.signal_type.startswith("BUY")]
-    sell_x = [s.ts for s in view.signals if s.signal_type.startswith("SELL")]
-    sell_y = [s.price for s in view.signals if s.signal_type.startswith("SELL")]
+DB 优先逻辑验证：
 
-    if buy_x:
-        fig.add_trace(
-            go.Scatter(
-                x=buy_x,
-                y=buy_y,
-                mode="markers",
-                name="Buy",
-                marker=dict(symbol="triangle-up", size=10),
-            )
-        )
-    if sell_x:
-        fig.add_trace(
-            go.Scatter(
-                x=sell_x,
-                y=sell_y,
-                mode="markers",
-                name="Sell",
-                marker=dict(symbol="triangle-down", size=10),
-            )
-        )
+先手动清空/删除某只股票在 stock_kline 中某个周期的数据（如 "1d"），
 
+通过 Streamlit UI 打开该票的“日线”，确认：
 
-最后：
+第一次打开时，会通过 HybridDataSource 调用 pytdx 拉数据，并写入 stock_kline；
 
-st.plotly_chart(fig, use_container_width=True)
+再次打开同一股票、同一周期时，即使断开 pytdx（可以暂时改 HybridDataSource 内部不连网），也能从 DB 取到完整数据。
 
-四、自验证要求（让 Trae 自己验）
+60 分钟验证：
 
-实现完后，请你在答案中说明你做了哪些自测，至少包括：
+使用第 3 部分的 debug_freq_mapping.py，确认：
 
-打印元素数量
+日线与 60 分钟的时间间隔明显不同；
 
-在 get_chan_view_data 返回前打印（或用 logging）：
+Streamlit UI 中选择“60分钟”时，图形的横轴密度和日线明显不同（同一时间窗口内有更多 K）。
 
-[ChanView] {ts_code} {freq} {start_dt}..{end_dt} 
-  kline_rows=XXX bis=Y segments=Z centers=W signals=V
+回归检查：
 
-
-在 Streamlit 页面上增加一个 debug 展示（可选）：
-
-比如在图下方加一段：
-
-st.caption(
-    f"Chan 元素数量: bi={len(view.bis)}, seg={len(view.segments)}, "
-    f"center={len(view.centers)}, signal={len(view.signals)}"
-)
-
-
-手动用一只你提到过的票做例子（例如 西部超导 / 兴业银锡 / 万兴科技）：
-
-选 "1d" 和 "60m" 各看一段时间：
-
-截图或描述：
-
-笔端点是否贴着 K 线极值；
-
-线段和中枢位置是否大致符合直觉。
+确认 UI 的“日线 / 60 分钟 / 30 分钟 / 15 分钟 / 5 分钟”各周期都能正常加载，不出现原有功能损坏。

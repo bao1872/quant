@@ -18,7 +18,7 @@ def _ctime_to_dt(ct) -> datetime:
 
 def kl_type_to_freq_str(kl_type) -> str:
     m = {
-        KL_TYPE.K_DAY: "day",
+        KL_TYPE.K_DAY: "1d",
         KL_TYPE.K_60M: "60m",
         KL_TYPE.K_30M: "30m",
         KL_TYPE.K_15M: "15m",

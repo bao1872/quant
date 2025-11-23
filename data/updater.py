@@ -258,13 +258,26 @@ def update_minute_kline_for_universe(
                     raise ValueError(f"不支持的分钟频率: {fq}")
                 bars_per_day = BARS_PER_DAY[fq]
                 count_needed = target_days * bars_per_day + bars_per_day * 5
+                df_db = repository.get_recent_kline(ts_code, fq, count_needed)
+                missing_dates: List[date] = []
+                if not df_db.empty:
+                    df_db = df_db.sort_values("datetime").reset_index(drop=True)
+                    df_db["trade_date"] = pd.to_datetime(df_db["datetime"]).dt.date
+                    cnt = df_db.groupby("trade_date")["datetime"].nunique()
+                    missing_dates = [d for d in trading_dates if int(cnt.get(d, 0) or 0) < bars_per_day]
+                else:
+                    missing_dates = trading_dates
+                if not missing_dates:
+                    continue
+                s = min(missing_dates)
+                e = max(missing_dates)
                 df_raw = ds.get_minute_bars(ts_code, freq=fq, count=count_needed)
                 if df_raw.empty:
                     print(f"WARNING: {ts_code} minute {fq} bars empty")
                     continue
                 df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
-                df_raw["trade_date"] = df_raw["datetime"].dt.date
-                mask = (df_raw["trade_date"] >= start_date) & (df_raw["trade_date"] <= end_date)
+                df_raw["trade_date"] = pd.to_datetime(df_raw["datetime"]).dt.date
+                mask = (df_raw["trade_date"] >= s) & (df_raw["trade_date"] <= e)
                 df_window = df_raw.loc[mask].copy()
-                df_window = df_window[df_window["trade_date"].isin(trading_dates)].copy()
+                df_window = df_window[df_window["trade_date"].isin(missing_dates)].copy()
                 repository.upsert_stock_kline(ts_code, fq, df_window)

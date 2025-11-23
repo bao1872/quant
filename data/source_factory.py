@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 
 from .base_source import DataSource
-from .pytdx_source import PytdxDataSource
+from .hybrid_source import HybridDataSource
 
 
 AssetType = Literal["stock", "index_future", "gov_bond"]
@@ -11,7 +11,7 @@ AssetType = Literal["stock", "index_future", "gov_bond"]
 
 def get_data_source(asset_type: AssetType) -> DataSource:
     if asset_type == "stock":
-        return PytdxDataSource()
+        return HybridDataSource()
     raise NotImplementedError(f"asset_type={asset_type} 未实现")
 
 

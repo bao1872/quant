@@ -36,9 +36,9 @@ import pyarrow.parquet as pq
 
 def job_update_ohlc(trade_date: _date) -> None:
     print(f"[job_update_ohlc] trade_date={trade_date}")
-    update_daily_bars(trade_date=trade_date, count=500)
+    # update_daily_bars(trade_date=trade_date, count=500)
     from .updater import update_minute_kline_for_universe
-    update_minute_kline_for_universe(trade_date=trade_date, freqs=["60m", "15m"])
+    update_minute_kline_for_universe(trade_date=trade_date, freqs=["60m", "30m", "15m"]) 
 
 
 def _validate_minute_for_date(d: _date) -> int:

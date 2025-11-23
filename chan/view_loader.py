@@ -8,6 +8,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from db.connection import get_engine
+from .utils import ts_to_chan_code, ui_label_to_db_freq
 from .types import Bi, Segment, Center, Signal, ChanResult
 
 
@@ -152,7 +153,9 @@ def get_chan_view_data(ts_code: str, freq: str, start: datetime, end: datetime) 
     kline = load_kline(ts_code, freq, start, end)
     chan = load_chan_structures(ts_code, freq, start, end)
     print(
-        f"[ChanView] {ts_code} {freq} {pd.to_datetime(start)}..{pd.to_datetime(end)}\n"
+        f"[ChanView] ts={ts_code} chan_code={ts_to_chan_code(ts_code)} freq_in={freq} freq_db={freq} range={pd.to_datetime(start)}..{pd.to_datetime(end)}"
+    )
+    print(
         f"  kline_rows={len(kline)} bis={len(chan.bis)} segments={len(chan.segments)} centers={len(chan.centers)} signals={len(chan.signals)}"
     )
     return ChanViewData(kline=kline, bis=chan.bis, segments=chan.segments, centers=chan.centers, signals=chan.signals)

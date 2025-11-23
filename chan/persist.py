@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from db.connection import get_engine
 from .types import ChanResult
+from .utils import chan_to_ts_code
 
 
 def _ensure_chan_tables() -> None:
@@ -154,7 +155,7 @@ def save_chan_result_to_db(result: ChanResult) -> None:
         if result.bis:
             df_bi = pd.DataFrame([
                 {
-                    "code": b.code,
+                    "code": chan_to_ts_code(b.code),
                     "freq": b.freq,
                     "bi_id": b.bi_id,
                     "direction": b.direction,
@@ -177,7 +178,7 @@ def save_chan_result_to_db(result: ChanResult) -> None:
         if result.segments:
             df_seg = pd.DataFrame([
                 {
-                    "code": s.code,
+                    "code": chan_to_ts_code(s.code),
                     "freq": s.freq,
                     "seg_id": s.seg_id,
                     "direction": s.direction,
@@ -199,7 +200,7 @@ def save_chan_result_to_db(result: ChanResult) -> None:
         if result.centers:
             df_cen = pd.DataFrame([
                 {
-                    "code": c.code,
+                    "code": chan_to_ts_code(c.code),
                     "freq": c.freq,
                     "center_id": c.center_id,
                     "start_ts": c.start_ts,
@@ -218,7 +219,7 @@ def save_chan_result_to_db(result: ChanResult) -> None:
         if result.signals:
             df_sig = pd.DataFrame([
                 {
-                    "code": g.code,
+                    "code": chan_to_ts_code(g.code),
                     "freq": g.freq,
                     "signal_id": g.signal_id,
                     "ts": g.ts,

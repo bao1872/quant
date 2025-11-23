@@ -5,6 +5,7 @@ from typing import Dict, List
 from .engine import ChanRunConfig, build_cchan_by_run_config
 from .extract import extract_all_levels
 from .types import ChanResult
+from .utils import ts_to_chan_code
 from .persist import save_chan_result_to_db
 
 
@@ -17,7 +18,7 @@ def run_chan_for_symbol(
     autype: str = "qfq",
 ) -> Dict[str, ChanResult]:
     run_cfg = ChanRunConfig(
-        code=code,
+        code=ts_to_chan_code(code),
         begin_time=begin_time,
         end_time=end_time,
         lv_list=lv_list,

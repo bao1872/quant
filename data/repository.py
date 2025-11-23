@@ -359,3 +359,23 @@ if __name__ == "__main__":
 
     last_date = get_last_trade_date_for_stock(test_ts)
     print(f"Last trade date for {test_ts}: {last_date}")
+def get_recent_kline(ts_code: str, freq: str, count: int) -> pd.DataFrame:
+    eng = get_engine()
+    _ensure_stock_kline(eng)
+    from sqlalchemy import text as _text
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        sql = _text(
+            """
+            select ts_code, freq, datetime, open, high, low, close, volume, amount
+            from stock_kline
+            where ts_code = :ts and freq = :fq
+            order by datetime desc
+            limit :n
+            """
+        )
+        df = pd.read_sql(sql, conn, params={"ts": ts_code, "fq": freq, "n": int(count)}, parse_dates=["datetime"])
+    if df.empty:
+        return df
+    return df.sort_values("datetime").reset_index(drop=True)
