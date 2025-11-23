@@ -75,3 +75,27 @@ class TickFileIndex:
         self.time_start = time_start
         self.time_end = time_end
         self.checksum = checksum
+
+
+class StockChanBi:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class StockChanSegment:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class StockChanCenter:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class StockChanSignal:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)

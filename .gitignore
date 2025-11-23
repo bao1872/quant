@@ -6,3 +6,4 @@ data/tick/*
 *.txt
 *.ymal
 .trae/
+third_party/chan.py/*

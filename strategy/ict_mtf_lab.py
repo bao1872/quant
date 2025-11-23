@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import IntEnum, Enum
 from typing import List, Optional, Literal
 
 import numpy as np
 import pandas as pd
 
 from factors.ict_smc import ICTConfig, compute_ict_structures
+from analysis.ict_trend import compute_trend_from_swings, TrendKind
 
 
-class TrendState(int, Enum):
-    STRONG_SHORT = -2
-    WEAK_SHORT = -1
+class TrendState(IntEnum):
+    SHORT = -1
     FLAT = 0
-    WEAK_LONG = 1
-    STRONG_LONG = 2
+    LONG = 1
 
 
 @dataclass
@@ -246,6 +245,27 @@ def compute_daily_trend_with_fallback(df_daily: pd.DataFrame, swing_len: int = 2
     return out
 
 
+def compute_daily_trend_from_swings(df_daily: pd.DataFrame, swing_len: int = 20) -> pd.DataFrame:
+    cfg = ICTConfig(swing_length=swing_len)
+    df_ict = compute_ict_structures(df_daily, cfg).copy()
+    trend_res = compute_trend_from_swings(df_ict)
+    trend_kind = trend_res.trend_series
+    mapping = {
+        TrendKind.BEAR: TrendState.SHORT,
+        TrendKind.RANGE: TrendState.FLAT,
+        TrendKind.BULL: TrendState.LONG,
+    }
+    trend_state = trend_kind.map(mapping).astype(int)
+    out = df_ict[["datetime", "close"]].copy()
+    out["trend_state"] = trend_state
+    for col in ["ict_ob_long_top", "ict_ob_long_bottom", "ict_ob_short_top", "ict_ob_short_bottom"]:
+        if col in df_ict.columns:
+            out[col] = pd.to_numeric(df_ict[col], errors="coerce")
+        else:
+            out[col] = np.nan
+    out["trade_date"] = pd.to_datetime(out["datetime"]).dt.date
+    return out
+
 def _price_near_ob(price: float, bottom: float, top: float, tol_pct: float, abs_tick: float = 0.01) -> bool:
     if np.isnan(bottom) or np.isnan(top) or bottom <= 0 or top <= 0:
         return False
@@ -273,7 +293,7 @@ def run_ict_mtf_backtest(
         else:
             df.sort_index(inplace=True)
             df["datetime"] = df.index
-    daily_state = compute_daily_trend_with_fallback(df_daily, swing_len=int(config.swing_length_daily))
+    daily_state = compute_daily_trend_from_swings(df_daily, swing_len=int(config.swing_length_daily))
     daily_state = daily_state.set_index("trade_date")
     exec_cfg = ICTConfig(swing_length=config.swing_length_exec)
     exec_df = compute_ict_structures(df_exec, exec_cfg).copy()
@@ -281,7 +301,7 @@ def run_ict_mtf_backtest(
     exec_df["datetime"] = pd.to_datetime(exec_df["datetime"]) if "datetime" in exec_df.columns else pd.to_datetime(exec_df.index)
     exec_df["trade_date"] = exec_df["datetime"].dt.date
     merged = exec_df.merge(
-        daily_state[["trend_state", "ob_long_top", "ob_long_bottom", "ob_short_top", "ob_short_bottom"]],
+        daily_state[["trend_state", "ict_ob_long_top", "ict_ob_long_bottom", "ict_ob_short_top", "ict_ob_short_bottom"]],
         left_on="trade_date",
         right_index=True,
         how="left",
@@ -292,14 +312,10 @@ def run_ict_mtf_backtest(
             return val
         if isinstance(val, (int, np.integer)):
             v = int(val)
-            if v in (-2, -1, 0, 1, 2):
-                return TrendState(v)
-            return TrendState.FLAT
+            return TrendState(v) if v in (-1, 0, 1) else TrendState.FLAT
         if isinstance(val, str):
             s = val.strip()
-            if s in {"-2", "-1", "0", "1", "2"}:
-                return TrendState(int(s))
-            return TrendState.FLAT
+            return TrendState(int(s)) if s in {"-1", "0", "1"} else TrendState.FLAT
         return TrendState.FLAT
     merged["trend_state"] = merged["trend_state"].apply(_normalize_trend_state)
     cash = float(initial_capital)
@@ -344,7 +360,7 @@ def run_ict_mtf_backtest(
                 elif high >= target_price:
                     exit_px = target_price * (1.0 - config.slippage_pct)
                     exit_reason = "target"
-                elif trend in (TrendState.WEAK_SHORT, TrendState.STRONG_SHORT):
+                elif trend == TrendState.SHORT:
                     exit_px = price * (1.0 - config.slippage_pct)
                     exit_reason = "daily_flip"
             elif position_side == "short":
@@ -354,7 +370,7 @@ def run_ict_mtf_backtest(
                 elif low <= target_price:
                     exit_px = target_price * (1.0 + config.slippage_pct)
                     exit_reason = "target"
-                elif trend in (TrendState.WEAK_LONG, TrendState.STRONG_LONG):
+                elif trend == TrendState.LONG:
                     exit_px = price * (1.0 + config.slippage_pct)
                     exit_reason = "daily_flip"
             if exit_px is not None:
@@ -396,15 +412,15 @@ def run_ict_mtf_backtest(
         if position_side is None:
             can_open_long = False
             can_open_short = False
-            if trend in (TrendState.STRONG_LONG, TrendState.WEAK_LONG):
+            if trend == TrendState.LONG:
                 in_ob_long = False
                 if ob_flag > 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
                     ob_bottom = float(row["ict_ob_bottom"])
                     ob_top = float(row["ict_ob_top"])
                     in_ob_long = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
                 else:
-                    ob_bottom = float(row.get("ob_long_bottom", np.nan))
-                    ob_top = float(row.get("ob_long_top", np.nan))
+                    ob_bottom = float(row.get("ict_ob_long_bottom", np.nan))
+                    ob_top = float(row.get("ict_ob_long_top", np.nan))
                     in_ob_long = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
                 bull_signal = int(row.get("bull_entry_signal", 0)) == 1
                 if in_ob_long and bull_signal:
@@ -415,8 +431,7 @@ def run_ict_mtf_backtest(
                         stop = ob_bottom
                     risk_per_share = price - stop
                     if risk_per_share > 0:
-                        risk_budget_pct = config.risk_per_trade_pct if trend == TrendState.STRONG_LONG else (config.risk_per_trade_pct * 0.5)
-                        risk_budget = equity * risk_budget_pct
+                        risk_budget = equity * config.risk_per_trade_pct
                         max_position_value = equity * config.max_position_pct
                         qty = int(risk_budget / risk_per_share)
                         qty = (qty // config.lot_size) * config.lot_size
@@ -436,15 +451,15 @@ def run_ict_mtf_backtest(
                                 target_price = float(target)
                                 cash -= entry_price * position_qty
                                 opened_long = True
-            elif trend in (TrendState.STRONG_SHORT, TrendState.WEAK_SHORT):
+            elif trend == TrendState.SHORT:
                 in_ob_short = False
                 if ob_flag < 0 and "ict_ob_top" in row and "ict_ob_bottom" in row:
                     ob_top = float(row["ict_ob_top"])
                     ob_bottom = float(row["ict_ob_bottom"])
                     in_ob_short = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
                 else:
-                    ob_top = float(row.get("ob_short_top", np.nan))
-                    ob_bottom = float(row.get("ob_short_bottom", np.nan))
+                    ob_top = float(row.get("ict_ob_short_top", np.nan))
+                    ob_bottom = float(row.get("ict_ob_short_bottom", np.nan))
                     in_ob_short = _price_near_ob(price, ob_bottom, ob_top, config.ob_tolerance_pct)
                 bear_signal = int(row.get("bear_entry_signal", 0)) == 1
                 if in_ob_short and bear_signal:
@@ -455,8 +470,7 @@ def run_ict_mtf_backtest(
                         stop = ob_top
                     risk_per_share = stop - price
                     if risk_per_share > 0:
-                        risk_budget_pct = config.risk_per_trade_pct if trend == TrendState.STRONG_SHORT else (config.risk_per_trade_pct * 0.5)
-                        risk_budget = equity * risk_budget_pct
+                        risk_budget = equity * config.risk_per_trade_pct
                         max_position_value = equity * config.max_position_pct
                         qty = int(risk_budget / risk_per_share)
                         qty = (qty // config.lot_size) * config.lot_size
@@ -484,11 +498,33 @@ def run_ict_mtf_backtest(
             else:
                 equity = cash - price * position_qty
         pos_state = position_side if position_side is not None else "flat"
+        exec_in = False
+        if "ict_ob_top" in row and "ict_ob_bottom" in row:
+            exec_in = _price_near_ob(price, float(row["ict_ob_bottom"]), float(row["ict_ob_top"]), config.ob_tolerance_pct)
+        daily_in_long = False
+        daily_in_short = False
+        if not np.isnan(float(row.get("ict_ob_long_bottom", np.nan))) and not np.isnan(float(row.get("ict_ob_long_top", np.nan))):
+            daily_in_long = _price_near_ob(price, float(row.get("ict_ob_long_bottom")), float(row.get("ict_ob_long_top")), config.ob_tolerance_pct)
+        if not np.isnan(float(row.get("ict_ob_short_bottom", np.nan))) and not np.isnan(float(row.get("ict_ob_short_top", np.nan))):
+            daily_in_short = _price_near_ob(price, float(row.get("ict_ob_short_bottom")), float(row.get("ict_ob_short_top")), config.ob_tolerance_pct)
+        daily_in = bool(daily_in_long or daily_in_short)
+        any_in_ob = bool(exec_in or daily_in)
+        bull_pin = int(row.get("bull_pinbar_flag", 0))
+        bear_pin = int(row.get("bear_pinbar_flag", 0))
+        bull_sig = int(row.get("bull_entry_signal", 0))
+        bear_sig = int(row.get("bear_entry_signal", 0))
         debug_rows.append({
             "datetime": dt,
             "close": float(price),
             "trend_state": str(trend),
             "in_exec_ob_flag": float(ob_flag),
+            "in_ob": bool(any_in_ob),
+            "in_exec_ob": bool(exec_in),
+            "in_daily_ob": bool(daily_in),
+            "bull_pinbar_flag": int(bull_pin),
+            "bear_pinbar_flag": int(bear_pin),
+            "bull_entry_signal": int(bull_sig),
+            "bear_entry_signal": int(bear_sig),
             "bull_rev": bool(bull_rev),
             "bear_rev": bool(bear_rev),
             "can_open_long": bool('can_open_long' in locals() and can_open_long),

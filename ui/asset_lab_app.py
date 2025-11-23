@@ -20,7 +20,9 @@ from factors.harmonic_patterns import detect_harmonic_patterns
 from backtest.bar_backtest import run_backtest_one_unit
 from strategy.ict_rr3_simple import generate_rr3_long_signals, backtest_fullsize_rr3
 import analysis.ob_swing_tuner as ob_swing_tuner
-from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest, attach_entry_signals, compute_daily_trend_with_fallback, TrendState
+from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest
+from analysis.candle_signals import attach_entry_signals
+from analysis.ict_trend import compute_trend_from_swings, TrendKind
 
 
 ASSET_LABEL_TO_CODE: Dict[str, str] = {
@@ -106,7 +108,7 @@ def _daily_recent_high(df: pd.DataFrame) -> float:
     return float(close.iloc[-1]) if len(close) > 0 else float("nan")
 
 
-def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool):
+def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, freq_label: str, key_suffix: str = "main"):
     if "datetime" in df.columns:
         x = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     else:
@@ -129,26 +131,19 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
         row=1,
         col=1,
     )
-    if "trend_state" in df.columns:
-        ts = df["trend_state"].tolist()
-        idxs = df.index.tolist()
-        start = 0
-        for i in range(1, len(ts) + 1):
-            if i == len(ts) or ts[i] != ts[start]:
-                state = ts[start]
-                x0 = x[start]
-                x1 = x[i - 1]
-                color_map = {
-                    int(TrendState.STRONG_LONG): "rgba(255,0,0,0.08)",
-                    int(TrendState.WEAK_LONG): "rgba(255,165,0,0.08)",
-                    int(TrendState.WEAK_SHORT): "rgba(135,206,250,0.08)",
-                    int(TrendState.STRONG_SHORT): "rgba(0,128,0,0.08)",
-                    int(TrendState.FLAT): None,
-                }
-                color = color_map.get(int(state), None)
-                if color is not None:
-                    fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.25, layer="below", line_width=0, row=1, col=1)
-                start = i
+    if freq_label == "日线":
+        segments = df.attrs.get("trend_segments", None)
+        if segments:
+            for seg in segments:
+                if seg.kind == TrendKind.BULL:
+                    color = "rgba(0, 200, 0, 0.07)"
+                elif seg.kind == TrendKind.BEAR:
+                    color = "rgba(200, 0, 0, 0.07)"
+                else:
+                    color = "rgba(128, 128, 128, 0.04)"
+                x0 = seg.start.strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.start, "strftime") else str(seg.start)
+                x1 = seg.end.strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.end, "strftime") else str(seg.end)
+                fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.9, line_width=0, row=1, col=1)
     if show_ict:
         if "ict_choch_flag" in df.columns:
             bull_idx = df.index[df["ict_choch_flag"] > 0]
@@ -295,7 +290,7 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                 row=1,
                 col=1,
             )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"plotly-main-{ts_code}-{freq_label}-{key_suffix}")
 
 
 def _plot_equity_curve(equity: pd.Series):
@@ -353,10 +348,16 @@ def main():
     if show_ict:
         with st.spinner("计算ICT结构..."):
             df = compute_ict_structures(df, cfg_strategy)
-            df = attach_entry_signals(df)
-            if freq_label == "日线":
-                dt_df = compute_daily_trend_with_fallback(df, swing_len=20)
-                df = df.merge(dt_df[["datetime", "trend_state"]], on="datetime", how="left")
+    if freq_label == "日线":
+        trend_res = compute_trend_from_swings(df)
+        df["trend_kind"] = trend_res.trend_series
+        df.attrs["trend_segments"] = trend_res.segments
+        st.sidebar.write(f"日线趋势区间数量: {len(trend_res.segments)}")
+    if freq_label == "15分钟":
+        df = attach_entry_signals(df)
+        st.sidebar.write(
+            f"多头信号数: {int(df['bull_entry_signal'].sum())}, 空头信号数: {int(df['bear_entry_signal'].sum())}"
+        )
     if show_harm:
         interval_map = {
             "日线": "1D",
@@ -369,7 +370,7 @@ def main():
         with st.spinner("检测谐波形态..."):
             pats = detect_harmonic_patterns(df, ts, interval)
             df.attrs["harmonic_patterns"] = pats
-    _plot_main_chart(df, ts, show_ict, show_harm)
+    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="top")
     
 
     if run_rr3_bt:
@@ -389,7 +390,7 @@ def main():
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(x=x, y=res.equity.values, mode="lines", name="Equity"))
         fig_eq.update_layout(xaxis_title="时间", yaxis_title="资金", height=300)
-        st.plotly_chart(fig_eq, use_container_width=True)
+        st.plotly_chart(fig_eq, use_container_width=True, key=f"plotly-equity-{ts}-{freq_label}")
         show_debug = st.checkbox("显示调试明细（当前周期）", value=False)
         if show_debug:
             debug_df = res.debug.copy()
@@ -430,7 +431,7 @@ def main():
 
     # 主图（含买卖标记）
     st.subheader("主图（含买卖标记）")
-    _plot_main_chart(df, ts, show_ict, show_harm)
+    _plot_main_chart(df, ts, show_ict, show_harm, freq_label, key_suffix="main")
 
 
 if __name__ == "__main__":

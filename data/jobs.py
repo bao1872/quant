@@ -65,6 +65,14 @@ def job_update_minute_15m(trade_date: _date) -> None:
         print("[job_update_minute_15m] empty result")
 
 
+def job_update_minute_30m(trade_date: _date) -> None:
+    print(f"[job_update_minute_30m] trade_date={trade_date}")
+    update_minute_bars(trade_date=trade_date, freq="30m", count=240)
+    n = _validate_minute_for_date(trade_date)
+    if n == 0:
+        print("[job_update_minute_30m] empty result")
+
+
 def job_collect_full_day_ticks(trade_date: _date) -> None:
     print(f"[job_collect_full_day_ticks] trade_date={trade_date}")
     collect_full_day_ticks(trade_date)

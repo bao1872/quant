@@ -1,0 +1,55 @@
+chan:
+  zs_combine: true
+  zs_combine_mode: "zs"
+  one_bi_zs: false
+  zs_algo: "normal"
+  bi_algo: "normal"
+  bi_strict: true
+  gap_as_kl: true
+  bi_end_is_peak: true
+  bi_fx_check: "strict"
+  bi_allow_sub_peak: true
+  seg_algo: "chan"
+  left_seg_method: "peak"
+  mean_metrics: [5, 20]
+  trend_metrics: []
+  boll_n: 20
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  cal_demark: false
+  demark:
+    demark_len: 9
+    setup_bias: 4
+    countdown_bias: 2
+    max_countdown: 13
+    tiaokong_st: true
+    setup_cmp2close: true
+    countdown_cmp2close: true
+  cal_rsi: false
+  rsi_cycle: 14
+  cal_kdj: false
+  kdj_cycle: 9
+  trigger_step: false
+  skip_step: 0
+  kl_data_check: true
+  max_kl_misalgin_cnt: 2
+  max_kl_inconsistent_cnt: 5
+  print_warning: true
+  print_err_time: false
+  auto_skip_illegal_sub_lv: false
+  divergence_rate: 0.9
+  min_zs_cnt: 1
+  bsp1_only_multibi_zs: true
+  max_bs2_rate: 0.618
+  bs1_peak: true
+  macd_algo: "peak"
+  bs_type: "1,2,3a,3b,2s,1p"
+  bsp2_follow_1: true
+  bsp3_follow_1: true
+  bsp3_peak: false
+  bsp3a_max_zs_cnt: 1
+  bsp2s_follow_2: false
+  max_bsp2s_lv: null
+  strict_bsp3: false
