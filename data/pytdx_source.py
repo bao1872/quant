@@ -234,12 +234,20 @@ class PytdxDataSource(DataSource):
     ) -> pd.DataFrame:
         self.connect()
         market, code = self.ts_code_to_tdx(ts_code)
-        raw = self.api.get_transaction_data(market=market, code=code, start=0, count=count)
+
+        raw = self.api.get_transaction_data(
+            market=market,
+            code=code,
+            start=0,
+            count=count,
+        )
         if not raw:
             return pd.DataFrame()
+
         df = pd.DataFrame(raw)
         if "vol" in df.columns:
             df = df.rename(columns={"vol": "volume"})
+
         if "buyorsell" in df.columns:
             s = pd.to_numeric(df["buyorsell"], errors="coerce")
             df["side"] = s.map({0: "B", 1: "S", 2: "N"}).fillna("N")
@@ -250,8 +258,10 @@ class PytdxDataSource(DataSource):
             )
         else:
             df["side"] = "N"
+
         if "amount" not in df.columns and {"price", "volume"}.issubset(df.columns):
             df["amount"] = df["price"] * df["volume"]
+
         base_date = trade_date or date.today()
         if "time" in df.columns:
             def _parse_time(t: str) -> datetime:
@@ -267,6 +277,7 @@ class PytdxDataSource(DataSource):
             df["datetime"] = df["time"].apply(_parse_time)
         else:
             df["datetime"] = datetime.combine(base_date, datetime.min.time())
+
         df["ts_code"] = ts_code
         wanted = ["ts_code", "datetime", "price", "volume", "amount", "time", "side"]
         cols = [c for c in wanted if c in df.columns or c in ["ts_code", "datetime"]]
@@ -426,17 +437,6 @@ class PytdxDataSource(DataSource):
         out = pd.concat(all_rows, ignore_index=True)
         out = out.sort_values("datetime").reset_index(drop=True)
         return out
-
-# 模块级统一封装：以后项目中统一通过此函数获取 pytdx 分页行情
-def get_bars_range(
-    ts_code: str,
-    freq: str,
-    start_date: date,
-    end_date: date,
-    page: int = 600,
-) -> pd.DataFrame:
-    with PytdxDataSource() as ds:
-        return ds.get_bars_range(ts_code, freq, start_date, end_date, page=page)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,6 @@ from tqdm import tqdm
 from db.models import StockBasic
 from db.connection import get_session
 from .pytdx_source import PytdxDataSource
-from . import pytdx_source as tdx
 from . import repository
 from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT, Settings
 
@@ -220,7 +219,7 @@ def update_kline_for_universe(trade_date: date, freqs: List[str], history_days: 
                     continue
                 start_miss = min(missing)
                 end_miss = max(missing)
-                out = tdx.get_bars_range(ts, fq, start_miss, end_miss, page=600)
+                out = ds.get_bars_range(ts, fq, start_miss, end_miss, page=600)
                 if out is None:
                     continue
                 if out.empty:

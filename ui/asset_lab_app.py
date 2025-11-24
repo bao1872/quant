@@ -15,7 +15,6 @@ import streamlit as st
 
 from data.repository import get_all_stock_basics
 from data.source_factory import get_data_source
-import data.pytdx_source as tdx
 from db.connection import get_engine
 from sqlalchemy import text
 from data.pytdx_source import PytdxDataSource
