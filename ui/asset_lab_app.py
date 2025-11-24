@@ -70,7 +70,7 @@ def _load_bars(asset_type: str, ts_code: str, freq_label: str, bar_count: int) -
                     df_db = pd.DataFrame(columns=["datetime","open","high","low","close","volume"])[:0]
         if not df_db.empty:
             return df_db.tail(int(bar_count)).reset_index(drop=True)
-    ds = get_data_source(asset_type)
+    ds = PytdxDataSource()
     if fq == "1d":
         df_src = ds.get_daily_bars(ts_code, count=bar_count)
     else:
