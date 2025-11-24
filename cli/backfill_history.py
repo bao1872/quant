@@ -131,33 +131,7 @@ def main() -> None:
     empty = _is_db_empty(eng)
     mode = "full"
 
-    # If specific ts_codes provided, run targeted action and exit
-    if args.ts:
-        ts_list = [s.strip() for s in args.ts.split(",") if s.strip()]
-        if args.mode == "full":
-            from data.pytdx_source import PytdxDataSource
-            from data.tick_store import TickStore
-            store = TickStore()
-            print(f"[collect_full_day_ticks:selected] Start for {len(ts_list)} stocks, trade_date={today}")
-            with PytdxDataSource(enable_fallback=False) as ds:
-                for ts_code in tqdm(ts_list, desc="ticks_sel_full", unit="stk"):
-                    df_tick = ds.get_ticks_full_day(ts_code, today)
-                    if df_tick.empty:
-                        continue
-                    store.save_ticks(ts_code, today, df_tick, already_sorted=True)
-            print("[collect_full_day_ticks:selected] Done.")
-        else:
-            from data.updater import collect_intraday_ticks
-            print(f"[collect_intraday_ticks:selected] Start for {len(ts_list)} stocks, trade_date={today}")
-            collect_intraday_ticks(today, ts_codes=ts_list, count=args.count)
-            print("[collect_intraday_ticks:selected] Done.")
-        n, total = _count_tick_stats_for_date_fs(today)
-        tick_files = n
-        tick_records = total
-        print(
-            f"[backfill_history:selected] mode={args.mode} date={today} selected_count={len(ts_list)} today_tick_files={tick_files} today_records={tick_records} status=ok"
-        )
-        return
+    
 
     # 分离两种数据的获取范围：
     ohlc_start = today - timedelta(days=730)

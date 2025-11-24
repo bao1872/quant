@@ -13,7 +13,7 @@ from datetime import date as _date
 from datetime import timedelta as _timedelta
 from datetime import time as _time
 
-from .updater import update_daily_bars, update_minute_bars, collect_full_day_ticks, update_kline_for_universe
+from .updater import update_minute_bars, collect_full_day_ticks, update_kline_for_universe
 from .concepts_cache import update_concepts_cache, update_hk_industry_cache, validate_concepts_cache_count
 from factors.bollinger import compute_stock_bollinger_for_date, compute_concept_bollinger_for_date, _table_columns, compute_stock_bollinger_from_db_range, compute_concept_bollinger_from_db_range
 from db.connection import get_engine

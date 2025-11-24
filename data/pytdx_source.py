@@ -178,6 +178,54 @@ class PytdxDataSource(DataSource):
         df["freq"] = freq
         return df
 
+    def get_bars_range(
+        self,
+        ts_code: str,
+        freq: str,
+        start_date: date,
+        end_date: date,
+        page: int = 600,
+    ) -> pd.DataFrame:
+        self.connect()
+        market, code = self.ts_code_to_tdx(ts_code)
+        freq_map = {
+            "5m": 0,
+            "15m": 1,
+            "30m": 2,
+            "60m": 3,
+        }
+        cat = freq_map.get(freq)
+        if cat is None:
+            return pd.DataFrame(columns=["datetime","open","high","low","close","volume","amount"])[:0]
+        rows = []
+        start_idx = 0
+        while True:
+            raw = self.api.get_security_bars(category=cat, market=market, code=code, start=start_idx, count=page)
+            if not raw:
+                break
+            dft = PytdxDataSource._bars_to_df(raw)
+            if dft is None or dft.empty:
+                break
+            dft = dft.sort_values("datetime").reset_index(drop=True)
+            sdt = pd.to_datetime(dft["datetime"]).dt.date
+            mask = (sdt >= start_date) & (sdt <= end_date)
+            dft = dft.loc[mask]
+            if not dft.empty:
+                rows.append(dft[["datetime","open","high","low","close","volume","amount"]].copy())
+            earliest = pd.to_datetime(dft["datetime"]).min() if not dft.empty else None
+            if earliest is not None and earliest.date() <= start_date:
+                break
+            if len(raw) < page:
+                break
+            start_idx += page
+        out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["datetime","open","high","low","close","volume","amount"])[:0]
+        if out.empty:
+            return out
+        out = out.sort_values("datetime").reset_index(drop=True)
+        out["ts_code"] = ts_code
+        out["freq"] = freq
+        return out
+
     def get_ticks(
         self,
         ts_code: str,
@@ -186,20 +234,12 @@ class PytdxDataSource(DataSource):
     ) -> pd.DataFrame:
         self.connect()
         market, code = self.ts_code_to_tdx(ts_code)
-
-        raw = self.api.get_transaction_data(
-            market=market,
-            code=code,
-            start=0,
-            count=count,
-        )
+        raw = self.api.get_transaction_data(market=market, code=code, start=0, count=count)
         if not raw:
             return pd.DataFrame()
-
         df = pd.DataFrame(raw)
         if "vol" in df.columns:
             df = df.rename(columns={"vol": "volume"})
-
         if "buyorsell" in df.columns:
             s = pd.to_numeric(df["buyorsell"], errors="coerce")
             df["side"] = s.map({0: "B", 1: "S", 2: "N"}).fillna("N")
@@ -210,10 +250,8 @@ class PytdxDataSource(DataSource):
             )
         else:
             df["side"] = "N"
-
         if "amount" not in df.columns and {"price", "volume"}.issubset(df.columns):
             df["amount"] = df["price"] * df["volume"]
-
         base_date = trade_date or date.today()
         if "time" in df.columns:
             def _parse_time(t: str) -> datetime:
@@ -229,7 +267,6 @@ class PytdxDataSource(DataSource):
             df["datetime"] = df["time"].apply(_parse_time)
         else:
             df["datetime"] = datetime.combine(base_date, datetime.min.time())
-
         df["ts_code"] = ts_code
         wanted = ["ts_code", "datetime", "price", "volume", "amount", "time", "side"]
         cols = [c for c in wanted if c in df.columns or c in ["ts_code", "datetime"]]
@@ -389,6 +426,17 @@ class PytdxDataSource(DataSource):
         out = pd.concat(all_rows, ignore_index=True)
         out = out.sort_values("datetime").reset_index(drop=True)
         return out
+
+# 模块级统一封装：以后项目中统一通过此函数获取 pytdx 分页行情
+def get_bars_range(
+    ts_code: str,
+    freq: str,
+    start_date: date,
+    end_date: date,
+    page: int = 600,
+) -> pd.DataFrame:
+    with PytdxDataSource() as ds:
+        return ds.get_bars_range(ts_code, freq, start_date, end_date, page=page)
 
 
 if __name__ == "__main__":

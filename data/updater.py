@@ -25,6 +25,7 @@ from tqdm import tqdm
 from db.models import StockBasic
 from db.connection import get_session
 from .pytdx_source import PytdxDataSource
+from . import pytdx_source as tdx
 from . import repository
 from config import STOCK_POOL_LIMIT, TICK_COUNT_LIMIT, Settings
 
@@ -177,49 +178,55 @@ def update_kline_for_universe(trade_date: date, freqs: List[str], history_days: 
     with PytdxDataSource() as ds:
         bar = tqdm(total=len(ts_codes), desc="kline_universe", unit="stk")
         for ts in ts_codes:
-            df_day = ds.get_daily_bars(ts, count=max(history_days, 500))
-            if df_day is None or df_day.empty:
-                bar.update(1)
-                continue
-            df_day = df_day.tail(history_days).copy().reset_index(drop=True)
-            repository.upsert_stock_kline(ts, "1d", df_day)
-            start_date = pd.to_datetime(df_day["datetime"].iloc[0]).date()
-            end_date = pd.to_datetime(df_day["datetime"].iloc[-1]).date()
+            rng = repository.get_kline_date_range(ts, "1d")
+            df_day_new = None
+            if rng is None:
+                df_raw = ds.get_daily_bars(ts, count=max(history_days, 500))
+                if df_raw is None or df_raw.empty:
+                    bar.update(1)
+                    continue
+                df_raw = df_raw.copy()
+                df_raw["trade_date"] = pd.to_datetime(df_raw["datetime"]).dt.date
+                df_raw = df_raw[df_raw["trade_date"] <= trade_date]
+                if df_raw.empty:
+                    bar.update(1)
+                    continue
+                df_day = df_raw.sort_values("datetime").tail(max(history_days, 500)).reset_index(drop=True)
+                repository.upsert_stock_kline(ts, "1d", df_day)
+                start_date = pd.to_datetime(df_day["trade_date"]).min().date()
+                end_date = pd.to_datetime(df_day["trade_date"]).max().date()
+            else:
+                existing_start, existing_end = rng
+                if existing_end >= trade_date:
+                    start_date = existing_start
+                    end_date = existing_end
+                else:
+                    df_raw = ds.get_daily_bars(ts, count=max(history_days, 500))
+                    if df_raw is None or df_raw.empty:
+                        start_date = existing_start
+                        end_date = existing_end
+                    else:
+                        df_raw = df_raw.copy()
+                        df_raw["trade_date"] = pd.to_datetime(df_raw["datetime"]).dt.date
+                        df_new = df_raw[(df_raw["trade_date"] > existing_end) & (df_raw["trade_date"] <= trade_date)].sort_values("datetime").reset_index(drop=True)
+                        if not df_new.empty:
+                            repository.upsert_stock_kline(ts, "1d", df_new)
+                            existing_end = pd.to_datetime(df_new["trade_date"]).max().date()
+                        start_date = existing_start
+                        end_date = existing_end
             for fq in [f for f in freqs if f != "1d"]:
                 missing = repository.get_kline_missing_dates(ts, fq, start_date, end_date, trade_calendar=None)
                 if not missing:
                     continue
-                market, code = PytdxDataSource.ts_code_to_tdx(ts)
-                freq_map = {"5m": 1, "15m": 2, "30m": 3, "60m": 4}
-                cat = freq_map.get(fq)
-                if cat is None:
+                start_miss = min(missing)
+                end_miss = max(missing)
+                out = tdx.get_bars_range(ts, fq, start_miss, end_miss, page=600)
+                if out is None:
                     continue
-                rows = []
-                start_idx = 0
-                page = 600
-                while True:
-                    raw = ds.api.get_security_bars(category=cat, market=market, code=code, start=start_idx, count=page)
-                    if not raw:
-                        break
-                    df = PytdxDataSource._bars_to_df(raw)
-                    if df is None or df.empty:
-                        break
-                    df = df.sort_values("datetime").reset_index(drop=True)
-                    df = df[(pd.to_datetime(df["datetime"]).dt.date >= start_date) & (pd.to_datetime(df["datetime"]).dt.date <= end_date)]
-                    if not df.empty:
-                        df["ts_code"] = ts
-                        df["freq"] = fq
-                        rows.append(df[["datetime","open","high","low","close","volume","amount"]].copy())
-                    earliest = pd.to_datetime(df["datetime"]).min() if not df.empty else None
-                    if earliest is not None and earliest.date() <= start_date:
-                        break
-                    if len(raw) < page:
-                        break
-                    start_idx += page
-                if rows:
-                    out = pd.concat(rows, ignore_index=True)
-                    out = out.sort_values("datetime").reset_index(drop=True)
-                    repository.upsert_stock_kline(ts, fq, out)
+                if out.empty:
+                    continue
+                out = out.sort_values("datetime").reset_index(drop=True)
+                repository.upsert_stock_kline(ts, fq, out)
             bar.update(1)
         bar.close()
 

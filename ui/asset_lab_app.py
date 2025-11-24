@@ -15,6 +15,7 @@ import streamlit as st
 
 from data.repository import get_all_stock_basics
 from data.source_factory import get_data_source
+import data.pytdx_source as tdx
 from db.connection import get_engine
 from sqlalchemy import text
 from data.pytdx_source import PytdxDataSource
@@ -81,32 +82,9 @@ def _load_bars(asset_type: str, ts_code: str, freq_label: str, bar_count: int) -
         else:
             start_date = pd.to_datetime(df_day["datetime"]).dt.date.iloc[0]
             end_date = pd.to_datetime(df_day["datetime"]).dt.date.iloc[-1]
-            market, code = PytdxDataSource.ts_code_to_tdx(ts_code)
-            cat_map = {"5m": 0, "15m": 1, "30m": 2, "60m": 3}
-            category = cat_map.get(fq)
-            rows = []
-            start_idx = 0
-            page = 600
-            while True:
-                raw = ds.api.get_security_bars(category=category, market=market, code=code, start=start_idx, count=page)
-                if not raw:
-                    break
-                dft = PytdxDataSource._bars_to_df(raw)
-                if dft is None or dft.empty:
-                    break
-                dft = dft.sort_values("datetime").reset_index(drop=True)
-                sdt = pd.to_datetime(dft["datetime"]).dt.date
-                mask = (sdt >= start_date) & (sdt <= end_date)
-                dft = dft.loc[mask]
-                if not dft.empty:
-                    rows.append(dft[["datetime", "open", "high", "low", "close", "volume"]].copy())
-                earliest = pd.to_datetime(dft["datetime"]).min() if not dft.empty else None
-                if earliest is not None and earliest.date() <= start_date:
-                    break
-                if len(raw) < page:
-                    break
-                start_idx += page
-            df_src = (pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["datetime","open","high","low","close","volume"]))
+            df_src = ds.get_bars_range(ts_code, fq, start_date, end_date, page=600)
+            keep = [c for c in ["datetime","open","high","low","close","volume"] if c in df_src.columns]
+            df_src = df_src[keep].copy()
     if df_src is None or df_src.empty:
         return df_db.reset_index(drop=True)
     keep = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in df_src.columns]

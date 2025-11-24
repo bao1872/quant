@@ -245,6 +245,31 @@ def get_kline_missing_dates(ts_code: str, freq: str, start_date: date, end_date:
     missing = sorted(list(set(base_dates) - set(have_dates)))
     return missing
 
+def get_kline_date_range(ts_code: str, freq: str) -> Optional[tuple[date, date]]:
+    eng = get_engine()
+    if not _table_exists(eng, "stock_kline"):
+        return None
+    with eng.connect() as conn:
+        conn.rollback()
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        df = pd.read_sql(
+            text(
+                "select min(trade_date) as d1, max(trade_date) as d2 "
+                "from stock_kline where ts_code=:ts and freq=:fq"
+            ),
+            conn,
+            params={"ts": ts_code, "fq": freq},
+        )
+    if df.empty:
+        return None
+    d1 = df["d1"].iloc[0]
+    d2 = df["d2"].iloc[0]
+    if pd.isna(d1) or pd.isna(d2):
+        return None
+    d1 = d1.date() if hasattr(d1, "date") else d1
+    d2 = d2.date() if hasattr(d2, "date") else d2
+    return d1, d2
+
 
 if __name__ == "__main__":
     # 自测：构造虚拟 df 写入，再读取最后交易日
