@@ -9,6 +9,7 @@ if ROOT not in sys.path:
     sys.path.append(ROOT)
 
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -24,6 +25,9 @@ from backtest.bar_backtest import run_backtest_one_unit
 from strategy.ict_rr3_simple import generate_rr3_long_signals, backtest_fullsize_rr3
 import analysis.ob_swing_tuner as ob_swing_tuner
 from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest, attach_entry_signals, compute_daily_trend_with_fallback, TrendState
+from datetime import date
+from typing import Optional
+from analysis.multi_tf_key_levels import CompositeLevel, build_composite_levels_for_symbol
 
 
 ASSET_LABEL_TO_CODE: Dict[str, str] = {
@@ -32,17 +36,40 @@ ASSET_LABEL_TO_CODE: Dict[str, str] = {
     "国债期货 (占位)": "gov_bond",
 }
 
-SUPPORTED_FREQS = ["日线", "60分钟", "30分钟", "15分钟", "5分钟"]
+SUPPORTED_FREQS = ["周线", "日线", "60分钟", "30分钟", "15分钟", "5分钟"]
 
 
-def _load_stock_universe() -> Tuple[List[str], Dict[str, str]]:
-    basics = get_all_stock_basics()
-    if not basics:
-        return [], {}
-    ts_codes: List[str] = [b.ts_code for b in basics]
-    names: List[str] = [getattr(b, "name", b.ts_code) for b in basics]
-    code_to_name = dict(zip(ts_codes, names))
-    return ts_codes, code_to_name
+def _load_stock_universe() -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
+    eng = get_engine()
+    df = pd.read_sql_table("stock_basic", eng) if eng is not None else pd.DataFrame(columns=["ts_code","name"])[:0]
+    if not df.empty and ("ts_code" not in df.columns):
+        market_map = {0: "SZ", 1: "SH", "SZ": "SZ", "SH": "SH"}
+        if "market" in df.columns:
+            exch = df["market"].map(market_map).fillna("SZ").astype(str)
+        elif "exchange" in df.columns:
+            exch = df["exchange"].map(market_map).fillna("SZ").astype(str)
+        else:
+            exch = pd.Series(["SZ"] * len(df))
+        df["ts_code"] = df["code"].astype(str) + "." + exch
+    if df.empty or ("ts_code" not in df.columns):
+        basics = get_all_stock_basics()
+        if not basics:
+            return [], {}, {}
+        ts_codes: List[str] = [b.ts_code for b in basics]
+        names: List[str] = [getattr(b, "name", b.ts_code) for b in basics]
+        df = pd.DataFrame({"ts_code": ts_codes, "name": names})
+    import importlib, importlib.util
+    has_py = importlib.util.find_spec("pypinyin") is not None
+    if has_py:
+        from pypinyin import lazy_pinyin
+        clean = df["name"].astype(str).str.replace(r"\s+", "", regex=True)
+        df["abbr"] = clean.map(lambda x: "".join([(s[0] if s else "") for s in lazy_pinyin(str(x))]).upper())
+    else:
+        df["abbr"] = ""
+    df = df.sort_values(["abbr", "name"]).reset_index(drop=True)
+    code_to_name = dict(zip(df["ts_code"], df["name"]))
+    code_to_abbr = dict(zip(df["ts_code"], df["abbr"]))
+    return df["ts_code"].tolist(), code_to_name, code_to_abbr
 
 
 def _load_bars(asset_type: str, ts_code: str, freq_label: str, bar_count: int) -> pd.DataFrame:
@@ -68,8 +95,11 @@ def _load_bars(asset_type: str, ts_code: str, freq_label: str, bar_count: int) -
                 med = int(per_day.tail(10).median()) if len(per_day) > 0 else 0
                 if med != exp:
                     df_db = pd.DataFrame(columns=["datetime","open","high","low","close","volume"])[:0]
-        if not df_db.empty:
-            return df_db.tail(int(bar_count)).reset_index(drop=True)
+        else:
+            last_dt = pd.to_datetime(df_db["datetime"]).max() if not df_db.empty else None
+            last_day = last_dt.date() if hasattr(last_dt, "date") else None
+            if last_day is not None and last_day >= date.today():
+                return df_db.tail(int(bar_count)).reset_index(drop=True)
     ds = PytdxDataSource()
     if fq == "1d":
         df_src = ds.get_daily_bars(ts_code, count=bar_count)
@@ -141,7 +171,11 @@ def _daily_recent_high(df: pd.DataFrame) -> float:
     return float(close.iloc[-1]) if len(close) > 0 else float("nan")
 
 
-def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool):
+def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, composite_levels: Optional[List[CompositeLevel]] = None):
+    """
+    主图绘制（保留既有力度显示），并在任意周期上叠加同一套“全周期综合关键位”。
+    防回归说明：当前 UI 中关键位力度（S=total_strength）的显示已通过测试，请不要随意修改可视化格式和含义。
+    """
     if "datetime" in df.columns:
         x = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     else:
@@ -245,7 +279,63 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
     fig.update_yaxes(title_text="成交量", row=2, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1)
     fig.update_layout(xaxis_rangeslider_visible=False, height=900)
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(hovermode="x unified")
+    fig.update_layout(legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center", yanchor="bottom"))
+    fig.add_trace(go.Scatter(x=[x.iloc[0] if hasattr(x, "iloc") else (x[0] if len(x)>0 else "")], y=[df["close"].iloc[0] if "close" in df.columns else 0], name="周主导（粗实线）", mode="lines", line=dict(color="#1f77b4", width=3, dash="solid"), visible="legendonly"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[x.iloc[0] if hasattr(x, "iloc") else (x[0] if len(x)>0 else "")], y=[df["close"].iloc[0] if "close" in df.columns else 0], name="日主导（中虚线）", mode="lines", line=dict(color="#1f77b4", width=2, dash="dash"), visible="legendonly"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[x.iloc[0] if hasattr(x, "iloc") else (x[0] if len(x)>0 else "")], y=[df["close"].iloc[0] if "close" in df.columns else 0], name="60m主导（细点线）", mode="lines", line=dict(color="#1f77b4", width=1, dash="dot"), visible="legendonly"), row=1, col=1)
+    fig.update_xaxes(showspikes=True, spikemode="across")
+    fig.update_yaxes(showspikes=True)
+    if composite_levels:
+        y_min = float(pd.to_numeric(df.get("low", pd.Series(index=df.index)), errors="coerce").min()) if "low" in df.columns else float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").min())
+        y_max = float(pd.to_numeric(df.get("high", pd.Series(index=df.index)), errors="coerce").max()) if "high" in df.columns else float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").max())
+        strengths = [float(l.total_strength) for l in composite_levels]
+        levels_draw = list(composite_levels)
+        MAX_LEVELS_ON_CHART = 12
+        PERCENTILE_FILTER = 30
+        if strengths:
+            thr = float(np.percentile(strengths, PERCENTILE_FILTER))
+            levels_draw = [l for l in levels_draw if float(l.total_strength) >= thr]
+            levels_draw = sorted(levels_draw, key=lambda z: float(z.total_strength), reverse=True)[:MAX_LEVELS_ON_CHART]
+            s_min = float(min([float(l.total_strength) for l in levels_draw])) if levels_draw else 0.0
+            s_max = float(max([float(l.total_strength) for l in levels_draw])) if levels_draw else 1.0
+            s_span = float(max(s_max - s_min, 1e-6))
+        print("DEBUG composite levels on chart:", len(levels_draw), "S range:", (min(strengths) if strengths else None), "->", (max(strengths) if strengths else None))
+        if levels_draw:
+            in_view = []
+            for lvl in levels_draw:
+                y = float(lvl.price)
+                if (y < y_min * 0.9) or (y > y_max * 1.1):
+                    continue
+                in_view.append(lvl)
+            current_price = float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").iloc[-1])
+            in_view_sorted = sorted(in_view, key=lambda z: float(z.total_strength), reverse=True)[:MAX_LEVELS_ON_CHART]
+            labels_sorted = sorted(in_view_sorted, key=lambda z: abs(float(z.price) - current_price))[:5]
+            for lvl in in_view_sorted:
+                y = float(lvl.price)
+                s_norm = (float(lvl.total_strength) - s_min) / s_span if s_span > 0 else 0.0
+                base_map = {"W": 2.2, "D": 1.6, "60m": 1.2}
+                dash_map = {"W": "solid", "D": "dash", "60m": "dot"}
+                dom = getattr(lvl, "dominant_tf", None)
+                dom = dom if dom in base_map else "D"
+                base_w = float(base_map[dom])
+                width = base_w + 1.0 * s_norm
+                alpha = 0.3 + 0.4 * s_norm
+                dash = dash_map[dom]
+                fig.add_hline(y=y, line=dict(color="#1f77b4", width=width, dash=dash), opacity=alpha, row=1, col=1)
+            x_text = x.iloc[-1] if hasattr(x, "iloc") else (x[-1] if len(x) > 0 else None)
+            last_y = None
+            for lvl in labels_sorted:
+                y0 = float(lvl.price)
+                y = y0
+                if (last_y is not None) and (abs(y0 - last_y) < (y_max - y_min) * 0.02):
+                    y = y0 + (y_max - y_min) * 0.02
+                last_y = y
+                if x_text is not None:
+                    dom = getattr(lvl, "dominant_tf", None)
+                    tag = "W" if dom == "W" else ("60" if dom == "60m" else "D")
+                    fig.add_annotation(x=x_text, y=y, text=f"[{tag}] {y0:.2f} | S={float(lvl.total_strength):.1f}", showarrow=False, xanchor="right", xshift=-20, yanchor="middle", font=dict(size=8), opacity=0.8, row=1, col=1)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "modeBarButtonsToAdd": ["toggleSpikelines"], "scrollZoom": True})
 
 
 def _plot_equity_curve(equity: pd.Series):
@@ -270,6 +360,74 @@ def _auto_choose_swing_min(stats_map: Dict[int, object], target_width: float = 0
             best_min = mw
             best_L = int(L)
     return best_L
+def _to_weekly_bars_from_daily(daily_bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    仅在 UI 使用：将日线 bars 聚合为周线 bars。
+    规则：每周第一根 open、最高 high、最低 low、最后一根 close，volume 为一周之和。
+    不改 data 层和 DB。
+    """
+    if daily_bars is None or daily_bars.empty:
+        return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
+    df = daily_bars.copy()
+    if "datetime" not in df.columns:
+        return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    g = df.set_index("datetime").resample("W-FRI")
+    out = pd.DataFrame({
+        "open": g["open"].first(),
+        "high": g["high"].max(),
+        "low": g["low"].min(),
+        "close": g["close"].last(),
+        "volume": g["volume"].sum() if "volume" in df.columns else None,
+    }).dropna(subset=["open","high","low","close"]).reset_index()
+    return out
+
+def composite_levels_to_df(composite_levels: List[CompositeLevel]) -> pd.DataFrame:
+    """
+    把 CompositeLevel 列表转成 DataFrame 以展示周期贡献：
+    列：price, kind, total_strength, strength_W, strength_D, strength_60m, members。
+    """
+    if not composite_levels:
+        return pd.DataFrame(columns=["price","kind","total_strength","strength_W","strength_D","strength_60m","members"])[:0]
+    rows = []
+    for lvl in composite_levels:
+        contrib_W = float(getattr(lvl, "strength_W", 0.0))
+        contrib_D = float(getattr(lvl, "strength_D", 0.0))
+        contrib_60 = float(getattr(lvl, "strength_H1", 0.0))
+        dom_attr = getattr(lvl, "dominant_tf", None)
+        dom = dom_attr if dom_attr in ("W", "D", "60m") else max([("W", contrib_W), ("D", contrib_D), ("60m", contrib_60)], key=lambda x: x[1])[0]
+        rows.append({
+            "price": float(lvl.price),
+            "kind": str(lvl.kind),
+            "total_strength": float(lvl.total_strength),
+            "strength_W": float(contrib_W),
+            "strength_D": float(contrib_D),
+            "strength_H1": float(contrib_60),
+            "dominant_tf": dom,
+            "members": int(len(getattr(lvl, "members", []) or [])),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values("price").reset_index(drop=True)
+
+def get_composite_levels_for_ui(ts_code: str, ref_end_time: Optional[pd.Timestamp] = None) -> List[CompositeLevel]:
+    """
+    UI 层统一入口：对当前股票统一计算一次全周期综合关键位（W/D/60m），供所有周期复用。
+    代码级复现：设置环境变量 LAB_SELF_TEST=1 后运行 python -m ui.asset_lab_app 打印数量与表格样例。
+    UI 手动验证：选择股票后依次切换 周线/日线/60/30/15/5，观察同一套横线与 S 值保持一致；表格数据不随周期改变。
+    测试标的建议：000001.SZ、600519.SH。
+    """
+    import importlib.util
+    has_hdb = importlib.util.find_spec("hdbscan") is not None
+    if not has_hdb:
+        return []
+    daily_bars = _load_bars("stock", ts_code, "日线", 500)
+    h1_bars = _load_bars("stock", ts_code, "60分钟", 1000)
+    weekly_bars = _to_weekly_bars_from_daily(daily_bars)
+    comp_levels = build_composite_levels_for_symbol(weekly_bars=weekly_bars, daily_bars=daily_bars, h1_bars=h1_bars)
+    print("DEBUG get composite levels:", ts_code, len(comp_levels))
+    return comp_levels
+
 def main():
     st.set_page_config(page_title="单品种 ICT + 谐波 实验室", layout="wide")
     st.title("单品种 ICT + 谐波 实验室")
@@ -280,16 +438,30 @@ def main():
     if asset_type != "stock":
         st.sidebar.info("当前仅实现股票数据，期货/国债为占位")
         return
-    ts_codes, code_to_name = _load_stock_universe()
+    ts_codes, code_to_name, code_to_abbr = _load_stock_universe()
     if not ts_codes:
         st.error("stock_basic 为空")
         return
-    ts = st.sidebar.selectbox("选择股票", options=ts_codes, format_func=lambda x: code_to_name.get(x, x))
+    ts = st.sidebar.selectbox(
+        "选择股票",
+        options=ts_codes,
+        index=None,
+        placeholder="输入名称或拼音首字母",
+        format_func=lambda x: (f"{code_to_abbr.get(x, '')} {code_to_name.get(x, x)}").strip(),
+        key="ts_code_select",
+    )
+    if ts is None:
+        st.info("请选择股票")
+        return
     show_ict = st.sidebar.checkbox("叠加 ICT 结构", value=True)
     show_harm = st.sidebar.checkbox("叠加谐波形态", value=True)
     run_rr3_bt = st.sidebar.checkbox("运行 ICT R:R≥3 策略回测", value=False)
     with st.spinner("拉取K线..."):
-        df = _load_bars(asset_type, ts, freq_label, bar_count)
+        if freq_label == "周线":
+            df_day = _load_bars(asset_type, ts, "日线", max(500, bar_count))
+            df = _to_weekly_bars_from_daily(df_day)
+        else:
+            df = _load_bars(asset_type, ts, freq_label, bar_count)
     
     L_list = [3, 4, 5, 6, 8, 10, 12]
     stats_map = ob_swing_tuner.evaluate_swing_lengths(df, L_list)
@@ -318,7 +490,12 @@ def main():
         with st.spinner("检测谐波形态..."):
             pats = detect_harmonic_patterns(df, ts, interval)
             df.attrs["harmonic_patterns"] = pats
-    _plot_main_chart(df, ts, show_ict, show_harm)
+    comp_levels = get_composite_levels_for_ui(ts)
+    _plot_main_chart(df, ts, show_ict, show_harm, composite_levels=comp_levels)
+    if comp_levels:
+        st.subheader("多周期综合关键位（贡献拆解）")
+        df_comp = composite_levels_to_df(comp_levels)
+        st.dataframe(df_comp, use_container_width=True)
     
 
     if run_rr3_bt:
@@ -381,4 +558,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import os
+    if os.getenv("LAB_SELF_TEST") == "1":
+        ts_code = os.getenv("LAB_TEST_TS", "000001.SZ")
+        comp_levels = get_composite_levels_for_ui(ts_code)
+        print(f"Total composite levels: {len(comp_levels)}")
+        df_comp = composite_levels_to_df(comp_levels)
+        print(df_comp.head().to_string(index=False))
+    else:
+        main()
