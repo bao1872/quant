@@ -1,0 +1,465 @@
+一、总体要求（必须遵守）
+
+只有一套关键位：CompositeLevel 列表是全局唯一的。
+
+周线、日线、60 分钟（以及 30/15/5 分钟）图 全部共用这一套 综合关键位；
+
+各周期只能改变 K 线的数据，不允许改变关键位集合。
+
+画图时只使用 CompositeLevel。
+
+默认模式下 禁止 再画单周期 raw OB / BOS / swing level 等横线；
+
+只允许画 TopN 条综合关键位线。
+
+关键位线型极简：
+
+颜色统一为 OB 蓝色（你当前使用的蓝色即可）；
+
+只用线型区分“周主导 / 日主导 / 60m 主导”，不得再引入其它线型和颜色。
+
+Trae 必须自己做两层验证：
+
+分析层：检查 CompositeLevel 数据是否自洽（strength、dominant_tf、total_strength 公式正确）；
+
+UI 层：检查周 / 日 / 60m 三个周期使用的是完全同一套关键位，并且线条数量与 TopN 要求一致。
+
+二、分析层：统一关键位结构与计算
+
+若仓库中已存在类似结构和函数，可以在其基础上调整；如有命名差异，以本指令为准进行重构。
+
+2.1 数据结构（必须具备这些字段）
+
+在关键位计算模块中（例如 analysis/multi_tf_key_levels.py），确认或新增以下 dataclass：
+
+from dataclasses import dataclass
+from typing import List, Literal
+
+Freq = Literal["W", "D", "60m"]
+Kind = Literal["support", "resistance"]
+
+@dataclass
+class SingleTFLevel:
+    price: float
+    kind: Kind            # 该周期视角下支撑/压力
+    freq: Freq            # "W" / "D" / "60m"
+    strength_tf: float    # 单周期强度
+    touch_count: int
+    avg_reaction: float
+    span_bars: int
+    role_switch_count: int
+
+@dataclass
+class CompositeLevel:
+    price: float
+    kind: Kind            # 多周期综合后的支撑/压力
+    total_strength: float # 文档中的 total_strength(K)
+    strength_W: float
+    strength_D: float
+    strength_H1: float
+    dominant_tf: Freq     # "W" / "D" / "60m"，贡献最大的周期
+    members: List[SingleTFLevel]
+
+
+禁止 再额外维护第二套关键位结构（例如另一种“OBLevel”列表），所有综合关键位必须统一映射到 CompositeLevel。
+
+2.2 单周期关键位 与 strength_tf 计算
+
+实现统一函数（如已有，请调整成满足下列要求）：
+
+def compute_single_tf_levels(
+    bars: "pd.DataFrame",
+    freq: Freq,
+    *,
+    price_candidates: "Sequence[float]",
+    touch_eps_pct: float = 0.003,
+    reaction_window: int = 10,
+) -> list[SingleTFLevel]:
+    ...
+
+
+要求：
+
+四个维度都必须参与计算：
+
+对每个候选价位 price0：
+
+touch_count：
+统计 K 线在 abs(close-price0)/price0 <= touch_eps_pct（可同时考虑 high/low）内的触碰次数；
+
+avg_reaction：
+每次触碰后，在 reaction_window 根 K 内找到反向最大位移（用百分比或 ATR 标准化），求均值；
+
+span_bars：
+第一次触碰到最近一次触碰的 bar 数；
+
+role_switch_count：
+统计“价位上方交易→跌破后反抽被压制”或相反方向的有效次数。
+
+strength_tf 必须是上述四项的加权组合，形如：
+
+def _compute_strength_tf(
+    touch_count: int,
+    avg_reaction: float,
+    span_bars: int,
+    role_switch_count: int,
+) -> float:
+    # 具体权重使用常量配置，例如：
+    # W_TOUCH, W_REACT, W_SPAN, W_ROLE = ...
+    ...
+
+
+kind 的取值可以沿用当前 ICT 多空定义（demand -> support, supply -> resistance），逻辑必须落在代码中并注释清楚。
+
+函数结尾必须丢弃明显无效的关键位（例如 touch_count == 0 或 strength_tf 远低于均值）。
+
+自检（分析层-单周期）：
+
+在模块底部增加：
+
+if __name__ == "__main__":
+    # 简单调试脚本：随便取一只股票、一个周期，打印若干 SingleTFLevel
+    ...
+
+
+要求：
+
+实际运行时，控制台能打印少量 SingleTFLevel 对象，字段完整且数值合理；
+
+strength_tf 必须随 touch_count 与 avg_reaction 增加而增大。
+
+2.3 多周期聚类 + total_strength + dominant_tf
+
+实现统一聚类函数：
+
+def cluster_levels_with_hdbscan(
+    levels: list[SingleTFLevel],
+    *,
+    eps_pct: float = 0.005,
+    min_cluster_size: int = 2,
+    allow_noise_as_singleton: bool = True,
+) -> list[CompositeLevel]:
+    ...
+
+
+聚类与合成要求：
+
+聚类维度只使用价位：
+HDBSCAN 的输入特征必须以 price 为主，距离使用相对价差（受 eps_pct 控制）。
+
+对每个聚类簇 K，构造 CompositeLevel：
+
+price：簇内 price 的 strength_tf 加权平均；
+
+周 / 日 / 60m 贡献：
+
+strength_W  = sum(l.strength_tf for l in members if l.freq == "W")
+strength_D  = sum(l.strength_tf for l in members if l.freq == "D")
+strength_H1 = sum(l.strength_tf for l in members if l.freq == "60m")
+
+
+total_strength 必须按文档权重计算：
+
+W_W, W_D, W_H = 4.0, 3.0, 2.0
+total_strength = W_W*strength_W + W_D*strength_D + W_H*strength_H1
+
+
+dominant_tf：
+strength_W/D/H1 三者中数值最大的那个对应的周期；
+
+kind：
+按簇内 SingleTFLevel.kind 和 strength_tf 加权投票，合力偏向 support → support，否则 resistance。
+
+暴露统一入口：
+
+def build_composite_levels_for_symbol(
+    ts_code: str,
+    n_bars: int,
+) -> list[CompositeLevel]:
+    """
+    - 使用 n_bars 控制窗口长度（对应 UI 左侧“最近 N 根 K 线”滑块）。
+    - 统一加载：
+        * 日线 bars_1d
+        * 60m bars_60m
+      周线通过日线聚合得到 bars_w。
+    - 调用 compute_single_tf_levels + cluster_levels_with_hdbscan，
+      返回按 price 升序排序的综合关键位列表。
+    """
+    ...
+
+
+自检（分析层-多周期）：
+
+在同一模块的 __main__ 下添加调试逻辑，例如：
+
+if __name__ == "__main__":
+    ts_code = "XBCD 西部超导"  # 或实际 ts_code
+    n_bars = 240
+
+    # 加载 1d / 60m bars，并做周线聚合
+    ...
+    composite_levels = build_composite_levels_for_symbol(ts_code, n_bars)
+
+    print("composite count:", len(composite_levels))
+    for lvl in composite_levels[:10]:
+        print(
+            f"price={lvl.price:.2f}, kind={lvl.kind}, "
+            f"S={lvl.total_strength:.2f}, "
+            f"W/D/H=({lvl.strength_W:.1f}, {lvl.strength_D:.1f}, {lvl.strength_H1:.1f}), "
+            f"dom={lvl.dominant_tf}, members={len(lvl.members)}"
+        )
+
+
+Trae 必须确认：
+
+dominant_tf 对应的 strength 是三者中最大者；
+
+total_strength 准确等于 4*W + 3*D + 2*H1（数值误差极小）；
+
+members 数量与 strength 数值在数量级上基本匹配，没有明显异常。
+
+三、UI 层：统一使用 CompositeLevel，并极简可视化
+
+以下以 ui/asset_lab_app.py 为例，实际文件名请按仓库结构查找。
+
+3.1 统一获取关键位：禁止按周期分别计算
+
+新增或修改函数：
+
+from analysis.multi_tf_key_levels import build_composite_levels_for_symbol, CompositeLevel
+
+def get_composite_levels_for_ui(ts_code: str, n_bars: int) -> list[CompositeLevel]:
+    """
+    UI 调用的唯一入口：
+    - 对给定 ts_code 和 n_bars，调用 build_composite_levels_for_symbol；
+    - 缓存结果，供所有周期的图表共用。
+    """
+    ...
+
+
+在 UI 主逻辑中（选择股票和 N 根 K 线后）：
+
+ts_code = 当前选中的股票
+n_bars = 滑块数值
+composite_levels = get_composite_levels_for_ui(ts_code, n_bars)
+
+
+禁止 在任何绘图函数内部再根据当前周期重算关键位。
+
+周线 / 日线 / 60m / 30m / 15m / 5m 图的绘制函数签名必须改为：
+
+def plot_main_chart(
+    kline_df: "pd.DataFrame",     # 当前周期的 K 线
+    composite_levels: list[CompositeLevel],
+    ...
+):
+    ...
+
+
+所有周期调用时传入的 composite_levels 必须是同一个对象（或同一份列表拷贝）。
+
+自检（UI-一致性）：
+
+在 get_composite_levels_for_ui 中加入开发阶段日志：
+
+print("DEBUG composite_levels hash:",
+      ts_code, n_bars,
+      hash(tuple(round(l.price, 3) for l in composite_levels)))
+
+
+Trae 必须自己手动在 UI 中切换 周线→日线→60m，确认：
+
+在同一只股票、同一 n_bars 下，三次打印的 hash 值完全相同。
+
+3.2 关键位过滤：只画 TopN 条
+
+在绘制主图前，实现统一过滤函数：
+
+def filter_levels_for_plot(
+    composite_levels: list[CompositeLevel],
+    y_min: float,
+    y_max: float,
+    max_lines: int = 10,
+) -> list[CompositeLevel]:
+    # 1) 先按可见 Y 轴范围过滤
+    in_view = [
+        l for l in composite_levels
+        if (y_min * 0.9) <= l.price <= (y_max * 1.1)
+    ]
+    if not in_view:
+        return []
+
+    # 2) 按 total_strength 由高到低排序
+    in_view.sort(key=lambda l: l.total_strength, reverse=True)
+
+    # 3) 只取前 max_lines 条
+    return in_view[:max_lines]
+
+
+在 plot_main_chart 中 只能 使用该函数得到要画的线：
+
+levels_for_plot = filter_levels_for_plot(composite_levels, y_min, y_max, max_lines=10)
+
+
+禁止再按“周主导一组、日主导一组、60m 一组分别 TopN”之类的方式叠加多套线。
+
+自检：
+
+在 filter_levels_for_plot 中打印：
+
+print(f"DEBUG {ts_code} {period} composite_in_view={len(in_view)} used={len(levels_for_plot)}")
+
+
+Trae 必须确保：
+不论周线/日线/60m，used 始终 ≤ max_lines（默认 10）。
+
+3.3 线型编码：只保留三种线型 + 一种颜色
+
+绘制关键位横线时，按以下规则设置样式：
+
+BASE_WIDTH = 1.2
+
+for lvl in levels_for_plot:
+    # 线宽随 total_strength 略微变化
+    # strength 归一化
+    # 可以先在 filter_levels_for_plot 里算好 [s_min, s_max] 后传入
+    width = BASE_WIDTH  # 可在此基础上加减 0.5 以内
+
+    if lvl.dominant_tf == "W":
+        linestyle = "solid"   # 粗实线
+        linewidth = width + 1.0
+    elif lvl.dominant_tf == "D":
+        linestyle = "dash"    # 中虚线
+        linewidth = width
+    elif lvl.dominant_tf == "60m":
+        linestyle = "dot"     # 细点线
+        linewidth = max(width - 0.5, 0.5)
+
+    color = OB 蓝色（与当前 OB 保持一致）
+
+    # 绘制横线（根据你使用的绘图库 echart/mpl 选择对应 API）
+
+
+禁止：
+
+引入第四种或更多线型；
+
+为 CompositeLevel 使用除 OB 蓝色之外的其它颜色。
+
+在图例中，只保留三项说明：
+
+“周主导（粗实线）”
+
+“日主导（中虚线）”
+
+“60m 主导（细点线）”
+
+3.4 关闭所有 raw 关键位线（默认）
+
+全局搜索并处理如下逻辑（名字仅示意）：
+
+以 BOS、sw、单周期 OB 为基础绘制的水平线：
+
+_plot_bos_levels
+
+add_hline 中描述为 “BOS level”、“swing level”、“某某 ICT level” 等的部分。
+
+统一用一个开发开关包裹：
+
+DEBUG_SHOW_RAW_LEVELS = False  # 默认 False
+
+if DEBUG_SHOW_RAW_LEVELS:
+    # 原来画单周期 raw 线的代码放进这里
+    ...
+
+
+默认情况下（False）下，这些 raw 线一条也不画。
+只有 CompositeLevel 出来的 TopN 关键位线可以出现在图上。
+
+3.5 标签内容与防重叠（只标少数线）
+
+只给少量关键位加文字标签
+
+MAX_LABELS = 5
+
+# 取离当前价格最近的 MAX_LABELS 条线
+levels_for_label = sorted(
+    levels_for_plot,
+    key=lambda l: abs(l.price - current_price)
+)[:MAX_LABELS]
+
+
+标签内容格式固定：
+
+[W] 67.10 | S=35.2
+[D] 54.63 | S=15.5
+[60] 53.45 | S=5.7
+
+
+[] 内为周期缩写：W/D/60；
+
+数值分别为 price 和 total_strength，保留一位小数即可。
+
+防重叠：竖直方向错位
+
+根据当前轴范围：
+
+x_min, x_max = ax.get_xlim()
+y_min, y_max = ax.get_ylim()
+x_text = x_max - (x_max - x_min) * 0.02
+
+last_y = None
+min_dy = (y_max - y_min) * 0.02
+
+for lvl in levels_for_label_sorted_by_price_desc:
+    y = lvl.price
+    if last_y is not None and abs(y - last_y) < min_dy:
+        # 若太近，向上或向下错一点
+        y = last_y - min_dy
+    last_y = y
+
+    # 在 (x_text, y) 绘制文字
+
+
+保证右侧标签不会严重重叠。
+
+3.6 权重详情表（不挤到图上）
+
+实现 DataFrame 转换函数：
+
+def composite_levels_to_df(composite_levels: list[CompositeLevel]) -> "pd.DataFrame":
+    # 列包括：
+    # price, kind, total_strength,
+    # strength_W, strength_D, strength_H1,
+    # dominant_tf, members
+    ...
+
+
+在 UI 中：
+
+每次更新 composite_levels 后刷新这张表；
+
+切换周线/日线/60m/30m/15m/5m 时，表格内容保持不变（除非换股票或重新计算）。
+
+Trae 必须确认：
+任选一条有标签的线，在表格中找到对应的 price 行，total_strength 与标签 S 值一致，dominant_tf 与标签中的 [W/D/60] 一致。
+
+四、Trae 需要在代码注释中记录的自检结果
+
+Trae 实现完毕后，必须在以下位置添加注释，简单记录自检结论：
+
+analysis/multi_tf_key_levels.py 顶部或 __main__ 附近：
+
+使用的测试股票代码；
+
+单周期 / 多周期计算的调试命令；
+
+检查 dominant_tf 与 strength 最大值一致、total_strength 公式正确的结论。
+
+ui/asset_lab_app.py 顶部：
+
+使用的测试股票代码（至少包含你截图中的 XBCD 西部超导）；
+
+周线→日线→60m 切换时，关键位 hash/数量一致性的检查结果；
+
+确认图上关键位线 ≤ 10 条，线型只有三种，标签与表格一一对应的描述。

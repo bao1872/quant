@@ -27,7 +27,7 @@ import analysis.ob_swing_tuner as ob_swing_tuner
 from strategy.ict_mtf_lab import IctMtfConfig, run_ict_mtf_backtest, attach_entry_signals, compute_daily_trend_with_fallback, TrendState
 from datetime import date
 from typing import Optional
-from analysis.multi_tf_key_levels import CompositeLevel, build_composite_levels_for_symbol
+from analysis.multi_tf_key_levels import CompositeLevel, build_composite_levels_for_symbol, SingleTFLevel, detect_single_tf_levels, detect_tf_levels_ict_ob_liq, merge_levels_within_tf
 
 
 ASSET_LABEL_TO_CODE: Dict[str, str] = {
@@ -37,6 +37,9 @@ ASSET_LABEL_TO_CODE: Dict[str, str] = {
 }
 
 SUPPORTED_FREQS = ["周线", "日线", "60分钟", "30分钟", "15分钟", "5分钟"]
+
+_KEYLEVEL_CACHE: Dict[str, Dict[str, object]] = {}
+_KEYLEVEL_CACHE_TTL_MINUTES: int = 60
 
 
 def _load_stock_universe() -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
@@ -82,10 +85,17 @@ def _load_bars(asset_type: str, ts_code: str, freq_label: str, bar_count: int) -
     }
     fq = freq_map.get(freq_label, "1d")
     eng = get_engine()
-    q = text(f"select datetime, open, high, low, close, volume from stock_kline where ts_code=:ts and freq=:fq order by datetime desc limit {int(bar_count)}")
+    def _table_exists_local(eng, table_name: str) -> bool:
+        if eng is None:
+            return False
+        with eng.connect() as conn:
+            df = pd.read_sql(text("select 1 from information_schema.tables where table_schema='public' and table_name=:t"), conn, params={"t": table_name})
+            return not df.empty
     df_db = pd.DataFrame()
-    with eng.connect() as conn:
-        df_db = pd.read_sql(q, conn, params={"ts": ts_code, "fq": fq}, parse_dates=["datetime"]) if eng is not None else pd.DataFrame()
+    if _table_exists_local(eng, "stock_kline"):
+        q = text(f"select datetime, open, high, low, close, volume from stock_kline where ts_code=:ts and freq=:fq order by datetime desc limit {int(bar_count)}")
+        with eng.connect() as conn:
+            df_db = pd.read_sql(q, conn, params={"ts": ts_code, "fq": fq}, parse_dates=["datetime"]) if eng is not None else pd.DataFrame()
     df_db = df_db.sort_values("datetime").reset_index(drop=True) if not df_db.empty else pd.DataFrame(columns=["datetime","open","high","low","close","volume"])[:0]
     if len(df_db) >= int(bar_count):
         if fq != "1d" and "datetime" in df_db.columns:
@@ -171,7 +181,7 @@ def _daily_recent_high(df: pd.DataFrame) -> float:
     return float(close.iloc[-1]) if len(close) > 0 else float("nan")
 
 
-def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, composite_levels: Optional[List[CompositeLevel]] = None):
+def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmonics: bool, cycle_levels: Optional[List[SingleTFLevel]] = None):
     """
     主图绘制（保留既有力度显示），并在任意周期上叠加同一套“全周期综合关键位”。
     防回归说明：当前 UI 中关键位力度（S=total_strength）的显示已通过测试，请不要随意修改可视化格式和含义。
@@ -220,7 +230,6 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                     fig.add_hline(y=float(y), line_width=1, line_dash="dot", annotation_text="BOS", annotation_position="right", opacity=0.4, row=1, col=1)
         if "ict_ob_top" in df.columns and "ict_ob_flag" in df.columns:
             ob_idx = df.index[df["ict_ob_flag"].fillna(0) != 0]
-            ob_idx = list(ob_idx)[-5:]
             for i in ob_idx:
                 y_val = df.at[i, "ict_ob_top"]
                 fig.add_hline(y=y_val, line_width=2, line_color="blue", annotation_text="OB", annotation_position="top left", row=1, col=1)
@@ -286,21 +295,24 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
     fig.add_trace(go.Scatter(x=[x.iloc[0] if hasattr(x, "iloc") else (x[0] if len(x)>0 else "")], y=[df["close"].iloc[0] if "close" in df.columns else 0], name="60m主导（细点线）", mode="lines", line=dict(color="#1f77b4", width=1, dash="dot"), visible="legendonly"), row=1, col=1)
     fig.update_xaxes(showspikes=True, spikemode="across")
     fig.update_yaxes(showspikes=True)
-    if composite_levels:
+    if cycle_levels:
         y_min = float(pd.to_numeric(df.get("low", pd.Series(index=df.index)), errors="coerce").min()) if "low" in df.columns else float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").min())
         y_max = float(pd.to_numeric(df.get("high", pd.Series(index=df.index)), errors="coerce").max()) if "high" in df.columns else float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").max())
-        strengths = [float(l.total_strength) for l in composite_levels]
-        levels_draw = list(composite_levels)
-        MAX_LEVELS_ON_CHART = 12
+        strengths = [float(getattr(l, "strength_tf", 0.0)) for l in cycle_levels]
+        levels_draw = list(cycle_levels)
+        MAX_LEVELS_ON_CHART = 10
         PERCENTILE_FILTER = 30
         if strengths:
             thr = float(np.percentile(strengths, PERCENTILE_FILTER))
-            levels_draw = [l for l in levels_draw if float(l.total_strength) >= thr]
-            levels_draw = sorted(levels_draw, key=lambda z: float(z.total_strength), reverse=True)[:MAX_LEVELS_ON_CHART]
-            s_min = float(min([float(l.total_strength) for l in levels_draw])) if levels_draw else 0.0
-            s_max = float(max([float(l.total_strength) for l in levels_draw])) if levels_draw else 1.0
+            levels_draw = [l for l in levels_draw if float(getattr(l, "strength_tf", 0.0)) >= thr]
+            levels_draw = sorted(levels_draw, key=lambda z: float(getattr(z, "strength_tf", 0.0)), reverse=True)[:MAX_LEVELS_ON_CHART]
+            s_vals = [float(getattr(l, "strength_tf", 0.0)) for l in levels_draw]
+            s_min = float(min(s_vals)) if s_vals else 0.0
+            s_max = float(max(s_vals)) if s_vals else 1.0
             s_span = float(max(s_max - s_min, 1e-6))
-        print("DEBUG composite levels on chart:", len(levels_draw), "S range:", (min(strengths) if strengths else None), "->", (max(strengths) if strengths else None))
+        import os
+        if os.getenv("LAB_DEBUG") == "1":
+            print("DEBUG composite levels on chart:", len(levels_draw), "S range:", (min(strengths) if strengths else None), "->", (max(strengths) if strengths else None))
         if levels_draw:
             in_view = []
             for lvl in levels_draw:
@@ -309,15 +321,15 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                     continue
                 in_view.append(lvl)
             current_price = float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").iloc[-1])
-            in_view_sorted = sorted(in_view, key=lambda z: float(z.total_strength), reverse=True)[:MAX_LEVELS_ON_CHART]
+            in_view_sorted = sorted(in_view, key=lambda z: float(getattr(z, "strength_tf", 0.0)), reverse=True)[:MAX_LEVELS_ON_CHART]
             labels_sorted = sorted(in_view_sorted, key=lambda z: abs(float(z.price) - current_price))[:5]
             for lvl in in_view_sorted:
                 y = float(lvl.price)
-                s_norm = (float(lvl.total_strength) - s_min) / s_span if s_span > 0 else 0.0
-                base_map = {"W": 2.2, "D": 1.6, "60m": 1.2}
-                dash_map = {"W": "solid", "D": "dash", "60m": "dot"}
-                dom = getattr(lvl, "dominant_tf", None)
-                dom = dom if dom in base_map else "D"
+                s_norm = (float(getattr(lvl, "strength_tf", 0.0)) - s_min) / s_span if s_span > 0 else 0.0
+                base_map = {"OB": 2.2, "LIQ": 1.6, "FVG": 1.2}
+                dash_map = {"OB": "solid", "LIQ": "dash", "FVG": "dot"}
+                dom = str(getattr(lvl, "source", "")).upper()
+                dom = dom if dom in base_map else "OB"
                 base_w = float(base_map[dom])
                 width = base_w + 1.0 * s_norm
                 alpha = 0.3 + 0.4 * s_norm
@@ -332,9 +344,10 @@ def _plot_main_chart(df: pd.DataFrame, ts_code: str, show_ict: bool, show_harmon
                     y = y0 + (y_max - y_min) * 0.02
                 last_y = y
                 if x_text is not None:
-                    dom = getattr(lvl, "dominant_tf", None)
-                    tag = "W" if dom == "W" else ("60" if dom == "60m" else "D")
-                    fig.add_annotation(x=x_text, y=y, text=f"[{tag}] {y0:.2f} | S={float(lvl.total_strength):.1f}", showarrow=False, xanchor="right", xshift=-20, yanchor="middle", font=dict(size=8), opacity=0.8, row=1, col=1)
+                    src = str(getattr(lvl, "source", "")).upper()
+                    if src not in ("OB", "LIQ", "FVG"):
+                        src = "OB"
+                    fig.add_annotation(x=x_text, y=y, text=f"[{src}] {y0:.2f} | S={float(getattr(lvl,'strength_tf',0.0)):.1f}", showarrow=False, xanchor="right", xshift=-20, yanchor="middle", font=dict(size=8), opacity=0.8, row=1, col=1)
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "modeBarButtonsToAdd": ["toggleSpikelines"], "scrollZoom": True})
 
 
@@ -410,23 +423,105 @@ def composite_levels_to_df(composite_levels: List[CompositeLevel]) -> pd.DataFra
     df = pd.DataFrame(rows)
     return df.sort_values("price").reset_index(drop=True)
 
-def get_composite_levels_for_ui(ts_code: str, ref_end_time: Optional[pd.Timestamp] = None) -> List[CompositeLevel]:
+def single_levels_to_df(levels: List[SingleTFLevel]) -> pd.DataFrame:
+    if not levels:
+        return pd.DataFrame(columns=["price","kind","freq","strength_tf","touch_count","avg_reaction","span_bars","role_switch_count"])[:0]
+    rows = [
+        {
+            "price": float(getattr(l, "price", np.nan)),
+            "kind": str(getattr(l, "kind", "")),
+            "freq": str(getattr(l, "freq", "")),
+            "strength_tf": float(getattr(l, "strength_tf", 0.0)),
+            "touch_count": int(getattr(l, "touch_count", 0)),
+            "avg_reaction": float(getattr(l, "avg_reaction", 0.0)),
+            "span_bars": int(getattr(l, "span_bars", 0)),
+            "role_switch_count": int(getattr(l, "role_switch_count", 0)),
+            "source": str(getattr(l, "source", "")),
+        }
+        for l in levels
+    ]
+    df = pd.DataFrame(rows)
+    return df.sort_values(["strength_tf","price"], ascending=[False, True]).reset_index(drop=True)
+
+def _cache_valid(entry: Dict[str, object]) -> bool:
+    ts = entry.get("timestamp") if entry is not None else None
+    if ts is None:
+        return False
+    now = pd.Timestamp.utcnow()
+    dt = now - pd.Timestamp(ts)
+    return dt <= pd.Timedelta(minutes=int(_KEYLEVEL_CACHE_TTL_MINUTES))
+
+def get_single_tf_levels_for_ui(ts_code: str, n_bars: int) -> Tuple[List[SingleTFLevel], List[SingleTFLevel], List[SingleTFLevel]]:
+    entry = _KEYLEVEL_CACHE.get(ts_code)
+    if entry is not None and _cache_valid(entry):
+        lw = entry.get("single_W") or []
+        ld = entry.get("single_D") or []
+        lh = entry.get("single_60m") or []
+        return list(lw), list(ld), list(lh)
+    daily_bars = _load_bars("stock", ts_code, "日线", max(240, int(n_bars)))
+    h1_bars = _load_bars("stock", ts_code, "60分钟", max(480, int(n_bars) * 2))
+    weekly_bars = _to_weekly_bars_from_daily(daily_bars)
+    lw = detect_tf_levels_ict_ob_liq(weekly_bars, "W", swing_length=5)
+    ld = detect_tf_levels_ict_ob_liq(daily_bars, "D", swing_length=5)
+    lh = detect_single_tf_levels(h1_bars, "60m", 3)
+    _KEYLEVEL_CACHE[ts_code] = {
+        "timestamp": pd.Timestamp.utcnow(),
+        "single_W": lw,
+        "single_D": ld,
+        "single_60m": lh,
+        "bars_daily_len": len(daily_bars),
+        "bars_h1_len": len(h1_bars),
+    }
+    return lw, ld, lh
+
+def get_composite_levels_for_ui(ts_code: str, n_bars: int, ref_end_time: Optional[pd.Timestamp] = None) -> List[CompositeLevel]:
     """
     UI 层统一入口：对当前股票统一计算一次全周期综合关键位（W/D/60m），供所有周期复用。
     代码级复现：设置环境变量 LAB_SELF_TEST=1 后运行 python -m ui.asset_lab_app 打印数量与表格样例。
     UI 手动验证：选择股票后依次切换 周线/日线/60/30/15/5，观察同一套横线与 S 值保持一致；表格数据不随周期改变。
     测试标的建议：000001.SZ、600519.SH。
     """
-    import importlib.util
-    has_hdb = importlib.util.find_spec("hdbscan") is not None
-    if not has_hdb:
-        return []
-    daily_bars = _load_bars("stock", ts_code, "日线", 500)
-    h1_bars = _load_bars("stock", ts_code, "60分钟", 1000)
+    import os
+    entry = _KEYLEVEL_CACHE.get(ts_code)
+    if entry is not None and _cache_valid(entry) and (entry.get("composite") is not None):
+        return list(entry.get("composite") or [])
+    daily_bars = _load_bars("stock", ts_code, "日线", max(240, int(n_bars)))
+    h1_bars = _load_bars("stock", ts_code, "60分钟", max(480, int(n_bars) * 2))
     weekly_bars = _to_weekly_bars_from_daily(daily_bars)
     comp_levels = build_composite_levels_for_symbol(weekly_bars=weekly_bars, daily_bars=daily_bars, h1_bars=h1_bars)
-    print("DEBUG get composite levels:", ts_code, len(comp_levels))
+    _KEYLEVEL_CACHE[ts_code] = {
+        "timestamp": pd.Timestamp.utcnow(),
+        "single_W": detect_tf_levels_ict_ob_liq(weekly_bars, "W", swing_length=5),
+        "single_D": detect_tf_levels_ict_ob_liq(daily_bars, "D", swing_length=5),
+        "single_60m": detect_single_tf_levels(h1_bars, "60m", 3),
+        "composite": comp_levels,
+        "bars_daily_len": len(daily_bars),
+        "bars_h1_len": len(h1_bars),
+    }
+    if os.getenv("LAB_DEBUG") == "1":
+        hval = hash(tuple(round(float(l.price), 3) for l in comp_levels)) if comp_levels else 0
+        print("DEBUG composite_levels hash:", ts_code, int(n_bars), hval)
     return comp_levels
+
+def get_cycle_levels_for_ui(asset_type: str, ts_code: str, freq_label: str, n_bars: int) -> List[SingleTFLevel]:
+    key = f"{ts_code}:{freq_label}"
+    entry = _KEYLEVEL_CACHE.get(key)
+    if entry is not None and _cache_valid(entry):
+        return list(entry.get("cycle_levels", []) or [])
+    if freq_label == "周线":
+        df_day = _load_bars(asset_type, ts_code, "日线", max(500, n_bars))
+        df = _to_weekly_bars_from_daily(df_day)
+        lv = detect_tf_levels_ict_ob_liq(df, "W", swing_length=5, include_fvg=False)
+    elif freq_label == "日线":
+        df = _load_bars(asset_type, ts_code, "日线", max(500, n_bars))
+        lv = detect_tf_levels_ict_ob_liq(df, "D", swing_length=5, include_fvg=False)
+    else:
+        fq_map = {"60分钟": "60m", "30分钟": "30m", "15分钟": "15m", "5分钟": "5m"}
+        df = _load_bars(asset_type, ts_code, freq_label, max(800, n_bars))
+        lv = detect_tf_levels_ict_ob_liq(df, "60m", swing_length=5, include_fvg=True)
+    lv_m = merge_levels_within_tf(lv, pct=0.03)
+    _KEYLEVEL_CACHE[key] = {"timestamp": pd.Timestamp.utcnow(), "cycle_levels": lv_m}
+    return lv_m
 
 def main():
     st.set_page_config(page_title="单品种 ICT + 谐波 实验室", layout="wide")
@@ -490,12 +585,29 @@ def main():
         with st.spinner("检测谐波形态..."):
             pats = detect_harmonic_patterns(df, ts, interval)
             df.attrs["harmonic_patterns"] = pats
-    comp_levels = get_composite_levels_for_ui(ts)
-    _plot_main_chart(df, ts, show_ict, show_harm, composite_levels=comp_levels)
-    if comp_levels:
-        st.subheader("多周期综合关键位（贡献拆解）")
-        df_comp = composite_levels_to_df(comp_levels)
-        st.dataframe(df_comp, use_container_width=True)
+    cycle_levels = get_cycle_levels_for_ui(asset_type, ts, freq_label, bar_count)
+    _plot_main_chart(df, ts, show_ict, show_harm, cycle_levels=cycle_levels)
+    show_lv_debug = st.checkbox("显示关键位调试信息（周/日/60m）", value=True)
+    if show_lv_debug:
+        st.subheader("关键位调试信息（当前周期）")
+        levels_draw = list(cycle_levels or [])
+        strengths = [float(getattr(l, "strength_tf", 0.0)) for l in levels_draw]
+        MAX_LEVELS_ON_CHART = 10
+        PERCENTILE_FILTER = 30
+        if strengths:
+            thr = float(np.percentile(strengths, PERCENTILE_FILTER))
+            levels_draw = [l for l in levels_draw if float(getattr(l, "strength_tf", 0.0)) >= thr]
+            levels_draw = sorted(levels_draw, key=lambda z: float(getattr(z, "strength_tf", 0.0)), reverse=True)[:MAX_LEVELS_ON_CHART]
+        in_view = []
+        if len(df) > 0:
+            y_min = float(pd.to_numeric(df.get("low", pd.Series(index=df.index)), errors="coerce").min()) if "low" in df.columns else float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").min())
+            y_max = float(pd.to_numeric(df.get("high", pd.Series(index=df.index)), errors="coerce").max()) if "high" in df.columns else float(pd.to_numeric(df.get("close", pd.Series(index=df.index)), errors="coerce").max())
+            for lvl in levels_draw:
+                y = float(getattr(lvl, "price", 0.0))
+                if (y >= y_min * 0.9) and (y <= y_max * 1.1):
+                    in_view.append(lvl)
+        st.caption(f"当前图窗范围内关键位（与主图一致）：{len(in_view)} 条")
+        st.dataframe(single_levels_to_df(in_view), use_container_width=True)
     
 
     if run_rr3_bt:
@@ -561,9 +673,16 @@ if __name__ == "__main__":
     import os
     if os.getenv("LAB_SELF_TEST") == "1":
         ts_code = os.getenv("LAB_TEST_TS", "000001.SZ")
-        comp_levels = get_composite_levels_for_ui(ts_code)
+        comp_levels = get_composite_levels_for_ui(ts_code, 240)
         print(f"Total composite levels: {len(comp_levels)}")
         df_comp = composite_levels_to_df(comp_levels)
         print(df_comp.head().to_string(index=False))
+        df_day_dbg = _load_bars("stock", ts_code, "日线", 500)
+        df_h1_dbg = _load_bars("stock", ts_code, "60分钟", 1000)
+        df_w_dbg = _to_weekly_bars_from_daily(df_day_dbg)
+        lv_w_cnt = len(detect_single_tf_levels(df_w_dbg, "W", 3))
+        lv_d_cnt = len(detect_single_tf_levels(df_day_dbg, "D", 3))
+        lv_h_cnt = len(detect_single_tf_levels(df_h1_dbg, "60m", 3))
+        print("Single TF counts W/D/60m:", lv_w_cnt, lv_d_cnt, lv_h_cnt)
     else:
         main()
